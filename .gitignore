@@ -1,0 +1,30 @@
+# Node
+node_modules/
+.pnpm-store/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Logs
+*.log
+.npm
+.pnpm-debug.log*
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Turbo
+.turbo/
+
+# Changesets
+.changeset/*.md
+!.changeset/README.md
+!.changeset/config.json
