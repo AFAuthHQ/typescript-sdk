@@ -1,6 +1,6 @@
 # AFAuth — TypeScript
 
-> Reference TypeScript SDK for the [AFAuth Protocol](https://github.com/afauth/spec).
+> Reference TypeScript SDK for the [AFAuth Protocol](https://github.com/AFAuthHQ/spec).
 
 This monorepo contains the official TypeScript packages that implement AFAuth:
 
