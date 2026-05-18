@@ -25,7 +25,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/AFAuthHQ/typescript.git"
+    "url": "https://github.com/AFAuthHQ/typescript-sdk.git"
   },
   "license": "MIT"
 }
