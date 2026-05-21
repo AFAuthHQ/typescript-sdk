@@ -18,10 +18,16 @@ import {
   sha256ContentDigest,
   type CoveredComponent,
   type Did,
+  type DiscoveryDocument,
   type Ed25519PrivateKey,
   type Ed25519PublicKey,
   type Recipient,
 } from "@afauth/core";
+
+// Re-export DiscoveryDocument so existing `import { DiscoveryDocument }
+// from "@afauth/agent"` callsites keep working. The canonical
+// definition lives in `@afauth/core` (see L7 in the M0–M4 review).
+export type { DiscoveryDocument };
 
 export interface SignedRequest {
   method: string;
@@ -207,30 +213,11 @@ function trimTrailing(s: string): string {
 
 // ---------- Discovery (§4) ----------
 
-export interface DiscoveryDocument {
-  afauth_version: "0.1";
-  service_did: Did;
-  endpoints: {
-    accounts: string;
-    owner_invitation: string;
-    claim_page: string;
-    claim_completion: string;
-    key_rotation?: string;
-  };
-  signature_algorithms: readonly "ed25519"[];
-  features?: readonly ("attestation" | "key_rotation")[];
-  recipient_types?: readonly ("email" | "phone" | "oidc" | "did")[];
-  limits?: {
-    unclaimed_ttl_seconds?: number;
-    unclaimed_rate_limit_per_hour?: number;
-  };
-  billing?: {
-    unclaimed_mode?: string;
-    accepted_attestors?: readonly string[];
-  };
-}
-
-/** Unsigned GET of `/.well-known/afauth`. Validates `afauth_version === '0.1'`. */
+/**
+ * Unsigned GET of `/.well-known/afauth`. Validates the response shape
+ * per §4.1 and §4.3, and enforces the §4.5 agent obligation to honor
+ * the advertised `signature_algorithms` (requires `ed25519`).
+ */
 export async function fetchDiscovery(baseUrl: string): Promise<DiscoveryDocument> {
   const url = `${trimTrailing(baseUrl)}/.well-known/afauth`;
   const res = await fetch(url, { headers: { accept: "application/json" } });
@@ -241,13 +228,59 @@ export async function fetchDiscovery(baseUrl: string): Promise<DiscoveryDocument
       `discovery fetch failed: ${res.status} ${res.statusText}`,
     );
   }
-  const doc = (await res.json()) as DiscoveryDocument;
+  const ct = res.headers.get("content-type") ?? "";
+  if (!/^application\/json(\s*;.*)?$/i.test(ct)) {
+    throw new AFAuthError(
+      "malformed_request",
+      400,
+      `discovery response content-type is not application/json: "${ct}"`,
+    );
+  }
+  const raw = (await res.json()) as unknown;
+  return assertDiscoveryDocument(raw);
+}
+
+/**
+ * Validates that `value` is a v0.1 discovery document per §4.3
+ * (required fields) and §4.5 (agent algorithm-negotiation
+ * obligation). Returns the value as `DiscoveryDocument` on success;
+ * throws `AFAuthError` otherwise. Unknown fields are preserved
+ * verbatim per §4.2 forward-compatibility.
+ */
+export function assertDiscoveryDocument(value: unknown): DiscoveryDocument {
+  if (!value || typeof value !== "object") {
+    throw new AFAuthError("malformed_request", 400, "discovery document is not an object");
+  }
+  const doc = value as Record<string, unknown>;
   if (doc.afauth_version !== "0.1") {
     throw new AFAuthError(
       "malformed_request",
       400,
-      `unsupported afauth_version: ${doc.afauth_version}`,
+      `unsupported afauth_version: ${String(doc.afauth_version)}`,
     );
   }
-  return doc;
+  if (typeof doc.service_did !== "string" || doc.service_did.length === 0) {
+    throw new AFAuthError("malformed_request", 400, "discovery: missing or invalid service_did");
+  }
+  if (!doc.endpoints || typeof doc.endpoints !== "object") {
+    throw new AFAuthError("malformed_request", 400, "discovery: missing endpoints object");
+  }
+  const eps = doc.endpoints as Record<string, unknown>;
+  for (const k of ["accounts", "owner_invitation", "claim_page", "claim_completion"] as const) {
+    if (typeof eps[k] !== "string" || (eps[k] as string).length === 0) {
+      throw new AFAuthError("malformed_request", 400, `discovery: endpoints.${k} missing or invalid`);
+    }
+  }
+  if (!Array.isArray(doc.signature_algorithms)) {
+    throw new AFAuthError("malformed_request", 400, "discovery: signature_algorithms must be an array");
+  }
+  if (!(doc.signature_algorithms as unknown[]).includes("ed25519")) {
+    // §4.5: agents MUST honor signature_algorithms. v0.1 requires ed25519.
+    throw new AFAuthError(
+      "malformed_request",
+      400,
+      "discovery: service does not advertise ed25519; v0.1 requires it",
+    );
+  }
+  return value as DiscoveryDocument;
 }

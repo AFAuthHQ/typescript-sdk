@@ -121,10 +121,16 @@ export function decodeDidKey(did: Did): Ed25519PublicKey {
 
 // ---------- Recipient registry (§7.7) ----------
 
+/**
+ * Wire format for each recipient type. The shape matches spec §7.7
+ * exactly — the SDK does not translate between an internal type and
+ * the wire format. See vendored vectors under
+ * `vendor/spec-vectors/signatures/post-owner-invitation-*.json`.
+ */
 export type Recipient =
   | { type: "email"; value: string }
   | { type: "phone"; value: string }
-  | { type: "oidc"; issuer: string; subject: string }
+  | { type: "oidc"; value: { issuer: string; sub: string } }
   | { type: "did"; value: Did };
 
 // ---------- Signature parameters (§5.2) ----------
@@ -199,6 +205,58 @@ export function sha256ContentDigest(body: string | Uint8Array): string {
   const bytes = typeof body === "string" ? new TextEncoder().encode(body) : body;
   const hash = sha256(bytes);
   return `sha-256=:${bytesToBase64(hash)}:`;
+}
+
+// ---------- Discovery document (§4) ----------
+
+/**
+ * v0.1 `/.well-known/afauth` document shape. Lives in `core` so the
+ * agent (which fetches it) and the server (which serves and consults
+ * it) share the same definition — duplicate types previously lived in
+ * both packages and risked drift.
+ */
+export interface DiscoveryDocument {
+  afauth_version: "0.1";
+  service_did: Did;
+  endpoints: {
+    accounts: string;
+    owner_invitation: string;
+    claim_page: string;
+    claim_completion: string;
+    key_rotation?: string;
+  };
+  signature_algorithms: readonly "ed25519"[];
+  features?: readonly ("attestation" | "key_rotation")[];
+  recipient_types?: readonly ("email" | "phone" | "oidc" | "did")[];
+  limits?: {
+    unclaimed_ttl_seconds?: number;
+    unclaimed_rate_limit_per_hour?: number;
+  };
+  billing?: {
+    unclaimed_mode?: string;
+    accepted_attestors?: readonly string[];
+  };
+}
+
+// ---------- Invitation IDs (§7.2) ----------
+
+function bytesToBase64Url(bytes: Uint8Array): string {
+  return bytesToBase64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/**
+ * Derives the public `invitation_id` from the secret claim token.
+ * The id is `"inv_" + base64url(sha256(token)[0:12])`. The forward
+ * direction is deterministic; the reverse direction requires
+ * inverting SHA-256, so leaking the id does not leak the token.
+ *
+ * Use this whenever the service returns an `invitation_id` to the
+ * agent — never return the raw token, which is the secret carried
+ * by the magic link.
+ */
+export function deriveInvitationId(token: string): string {
+  const hash = sha256(new TextEncoder().encode(token));
+  return `inv_${bytesToBase64Url(hash.slice(0, 12))}`;
 }
 
 // ---------- Error envelope (§11) ----------

@@ -26,12 +26,18 @@ import {
   AFAuthError,
   buildCanonicalInput,
   decodeDidKey,
+  deriveInvitationId,
   sha256ContentDigest,
   type CoveredComponent,
   type Did,
+  type DiscoveryDocument,
   type Recipient,
   type SignatureParams,
 } from "@afauth/core";
+
+// Re-export DiscoveryDocument so server consumers don't need to also
+// import from @afauth/core for this type.
+export type { DiscoveryDocument };
 
 // ---------- Nonce store (§5.6) ----------
 
@@ -532,34 +538,34 @@ export interface OwnerSession {
   userId: string;
 }
 
-export interface DiscoveryDocument {
-  afauth_version: "0.1";
-  service_did: Did;
-  endpoints: {
-    accounts: string;
-    owner_invitation: string;
-    claim_page: string;
-    claim_completion: string;
-    key_rotation?: string;
-  };
-  signature_algorithms: readonly "ed25519"[];
-  features?: readonly ("attestation" | "key_rotation")[];
-  recipient_types?: readonly ("email" | "phone" | "oidc" | "did")[];
-  limits?: {
-    unclaimed_ttl_seconds?: number;
-    unclaimed_rate_limit_per_hour?: number;
-  };
-  billing?: {
-    unclaimed_mode?: string;
-    accepted_attestors?: readonly string[];
-  };
-}
+// DiscoveryDocument is defined in @afauth/core (single source of truth)
+// and re-exported at the top of this module.
 
 export interface ServerOptions extends VerifierOptions {
   accounts: AccountStore;
   recipients: Partial<Record<"email" | "phone" | "oidc" | "did", RecipientHandler>>;
   discovery: DiscoveryDocument | (() => Promise<DiscoveryDocument>);
   baseUrl: string;
+  /**
+   * Allow-list of hosts that may appear in `redirect_url` on owner
+   * invitation requests, per §7.2 ("Services MUST validate it against
+   * an allow-list of service-controlled hosts and MUST NOT honour
+   * redirects to hosts outside that list").
+   *
+   * - Undefined or `[]` → `redirect_url` is forbidden (any value
+   *   produces 400 malformed_request). This is the safe default.
+   * - Non-empty list → only URLs whose host matches an entry are
+   *   passed through to the recipient handler.
+   */
+  redirectAllowList?: readonly string[];
+  /**
+   * Whether to permit implicit signup (§6.3) — creating an UNCLAIMED
+   * account on the first authenticated operation. Default `true`.
+   * When `false`, operations against an unknown account return
+   * `404 unknown_account`, matching the spec's §11.3 use of that code
+   * for "only when implicit signup is disabled".
+   */
+  implicitSignup?: boolean;
 }
 
 // Default invitation TTL: 24 hours (§7.3 says "service-defined";
@@ -590,6 +596,8 @@ export class Server {
   private readonly baseUrl: string;
   private readonly revocationList: RevocationList | undefined;
   private readonly invitationTtlSeconds: number;
+  private readonly redirectAllowList: ReadonlySet<string>;
+  private readonly implicitSignup: boolean;
 
   constructor(opts: ServerOptions) {
     this.verifier = new Verifier(opts);
@@ -599,6 +607,8 @@ export class Server {
     this.baseUrl = opts.baseUrl;
     this.revocationList = opts.revocationList;
     this.invitationTtlSeconds = DEFAULT_INVITATION_TTL_SECONDS;
+    this.redirectAllowList = new Set(opts.redirectAllowList ?? []);
+    this.implicitSignup = opts.implicitSignup ?? true;
   }
 
   // The Verifier is shared with handlers — exposed so the Worker layer
@@ -617,6 +627,45 @@ export class Server {
 
   private async resolveDiscovery(): Promise<DiscoveryDocument> {
     return typeof this.discovery === "function" ? this.discovery() : this.discovery;
+  }
+
+  /**
+   * §7.2 redirect_url validation. Throws `400 malformed_request` if:
+   *   - the value is not a parseable URL,
+   *   - the URL's scheme is not http/https,
+   *   - the URL's host is not in the configured `redirectAllowList`.
+   * Throws if `redirectAllowList` is undefined or empty — failing
+   * closed matches the spec's intent that unvalidated redirects are
+   * rejected at the protocol's wire surface.
+   */
+  private validateRedirectUrl(value: string): void {
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(value);
+    } catch {
+      throw new AFAuthError("malformed_request", 400, "redirect_url is not a valid URL");
+    }
+    if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+      throw new AFAuthError(
+        "malformed_request",
+        400,
+        `redirect_url scheme "${parsedUrl.protocol}" is not http/https`,
+      );
+    }
+    if (this.redirectAllowList.size === 0) {
+      throw new AFAuthError(
+        "malformed_request",
+        400,
+        "redirect_url is not permitted: no redirectAllowList configured",
+      );
+    }
+    if (!this.redirectAllowList.has(parsedUrl.host)) {
+      throw new AFAuthError(
+        "malformed_request",
+        400,
+        `redirect_url host "${parsedUrl.host}" is not in redirectAllowList`,
+      );
+    }
   }
 
   // ----- Owner invitation (§7.2) -----
@@ -657,6 +706,14 @@ export class Server {
       throw new AFAuthError("malformed_request", 400, "request body missing `recipient`");
     }
 
+    // §7.2: redirect_url MUST be validated against an allow-list of
+    // service-controlled hosts. Failing closed when no list is
+    // configured matches the spec's intent — an unvalidated redirect
+    // is "rejected from the protocol's wire surface".
+    if (parsed.redirect_url !== undefined) {
+      this.validateRedirectUrl(parsed.redirect_url);
+    }
+
     // §4.4: reject types not in the service's declared list.
     const disc = await this.resolveDiscovery();
     const declared = disc.recipient_types ?? ["email"];
@@ -676,9 +733,11 @@ export class Server {
       );
     }
 
-    // Implicit signup if the account doesn't yet exist (§6.3).
     let account = await this.accounts.get(verified.agentDid);
     if (!account) {
+      if (!this.implicitSignup) {
+        throw new AFAuthError("unknown_account", 404, "account does not exist (implicit signup disabled)");
+      }
       account = await this.accounts.createUnclaimed(verified.agentDid);
     }
     if (account.revoked) {
@@ -709,7 +768,10 @@ export class Server {
 
     return jsonResponse(
       {
-        invitation_id: `inv_${token}`,
+        // §7.2: returns a non-secret `invitation_id` derived from the
+        // token via SHA-256. The raw token is the secret carried by
+        // the magic link and MUST NOT be returned to the agent.
+        invitation_id: deriveInvitationId(token),
         expires_at: expiresAt,
         state: "INVITED",
       },
@@ -906,9 +968,11 @@ export class Server {
       body: null,
     });
 
-    // Implicit signup on first touch (§6.3).
     let account = await this.accounts.get(verified.agentDid);
     if (!account) {
+      if (!this.implicitSignup) {
+        throw new AFAuthError("unknown_account", 404, "account does not exist (implicit signup disabled)");
+      }
       account = await this.accounts.createUnclaimed(verified.agentDid);
     }
 
