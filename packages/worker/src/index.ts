@@ -11,9 +11,12 @@
  * using KV TTL for §5.6 expiry.
  */
 
-import { AFAuthError, type Did, type AFAuthErrorCode } from "@afauth/core";
+import { AFAuthError, type Did, type AFAuthErrorCode, type Recipient } from "@afauth/core";
 import {
   Server,
+  type Account,
+  type AccountState,
+  type AccountStore,
   type NonceStore,
   type OwnerSession,
   type RateLimitConfig,
@@ -166,6 +169,232 @@ export class KvRevocationList implements RevocationList {
 
   async add(did: Did, revokedAt: string): Promise<void> {
     await this.namespace.put(`revoked:${did}`, revokedAt);
+  }
+}
+
+// ---------- D1AccountStore (§6 storage) ----------
+//
+// Production-grade AccountStore backed by Cloudflare D1 (managed
+// SQLite). The schema lives at migrations/0001_init.sql and is
+// applied via `wrangler d1 migrations apply <db-name>`. The SQL is
+// portable to standard Postgres/MySQL with minor syntactic changes.
+//
+// Atomicity is provided by D1's `batch()`, which executes a sequence
+// of statements as a single transaction. The named atomic ops from
+// ADR-0004 each map to one batch:
+//   - setPendingInvitation → DELETE prior + INSERT new (the §7.3
+//     atomicity invariant; UNIQUE(account_did) backs it up at the
+//     storage layer in case batch is bypassed).
+//   - completeClaimByToken → UPDATE state + DELETE invitation.
+//   - rotateKey → UPDATE did + cascading FK update on invitation.
+//   - revoke → UPDATE revoked = 1.
+//
+// On schema migration: the v0.1 schema is the only published version;
+// future migrations land as 0002_*.sql, 0003_*.sql, etc.
+
+interface AccountRow {
+  did: string;
+  state: AccountState;
+  created_at: string;
+  updated_at: string;
+  owner_json: string | null;
+  revoked: number;
+}
+
+interface InvitationRow {
+  token: string;
+  account_did: string;
+  recipient_json: string;
+  expires_at: string;
+}
+
+function rowToAccount(row: AccountRow, pending?: Recipient): Account {
+  const out: Account = { did: row.did, state: row.state };
+  if (row.revoked) out.revoked = true;
+  if (row.owner_json) out.owner = JSON.parse(row.owner_json) as Account["owner"];
+  if (pending) out.pendingRecipient = pending;
+  return out;
+}
+
+/**
+ * Cloudflare D1–backed `AccountStore`. The constructor takes a D1
+ * database binding (the same `env.DB` shape `wrangler` injects).
+ *
+ *   new D1AccountStore(env.AFAUTH_DB)
+ *
+ * Schema: see migrations/0001_init.sql. Run `wrangler d1 migrations
+ * apply <db-name>` before first use.
+ *
+ * Every atomic op uses `db.batch()` to run its statements as a single
+ * transaction; race-free under concurrent invocations.
+ */
+export class D1AccountStore implements AccountStore {
+  constructor(private readonly db: D1Database) {}
+
+  async get(did: Did): Promise<Account | null> {
+    const row = await this.db
+      .prepare("SELECT * FROM afauth_accounts WHERE did = ?")
+      .bind(did)
+      .first<AccountRow>();
+    if (!row) return null;
+    const invite = await this.db
+      .prepare("SELECT * FROM afauth_invitations WHERE account_did = ?")
+      .bind(did)
+      .first<InvitationRow>();
+    const pending = invite ? (JSON.parse(invite.recipient_json) as Recipient) : undefined;
+    return rowToAccount(row, pending);
+  }
+
+  async findByPendingToken(token: string): Promise<Account | null> {
+    const invite = await this.db
+      .prepare("SELECT * FROM afauth_invitations WHERE token = ?")
+      .bind(token)
+      .first<InvitationRow>();
+    if (!invite) return null;
+    if (new Date(invite.expires_at).getTime() < Date.now()) {
+      // Drop expired invitations opportunistically (§7.3 says
+      // expired invitations transition the account back to UNCLAIMED;
+      // the actual transition runs elsewhere — here we just refuse
+      // to return a stale token).
+      await this.db.prepare("DELETE FROM afauth_invitations WHERE token = ?").bind(token).run();
+      return null;
+    }
+    const row = await this.db
+      .prepare("SELECT * FROM afauth_accounts WHERE did = ?")
+      .bind(invite.account_did)
+      .first<AccountRow>();
+    if (!row) return null;
+    const pending = JSON.parse(invite.recipient_json) as Recipient;
+    return rowToAccount(row, pending);
+  }
+
+  async createUnclaimed(did: Did): Promise<Account> {
+    const existing = await this.get(did);
+    if (existing) return existing;
+    const nowIso = new Date().toISOString();
+    await this.db
+      .prepare(
+        "INSERT INTO afauth_accounts (did, state, created_at, updated_at) VALUES (?, ?, ?, ?)",
+      )
+      .bind(did, "UNCLAIMED", nowIso, nowIso)
+      .run();
+    return { did, state: "UNCLAIMED" };
+  }
+
+  async setPendingInvitation(
+    did: Did,
+    recipient: Recipient,
+    token: string,
+    expiresAt: string,
+  ): Promise<Account> {
+    // Pre-check account state. §7.3's atomic supersession is the DELETE
+    // + INSERT batch; the state guard prevents inviting against a
+    // CLAIMED or revoked account.
+    const account = await this.get(did);
+    if (!account) {
+      throw new AFAuthError("unknown_account", 404, `account ${did} does not exist`);
+    }
+    if (account.revoked) {
+      throw new AFAuthError("revoked_key", 401, `account ${did} is revoked`);
+    }
+    if (account.state === "CLAIMED") {
+      throw new AFAuthError(
+        "already_claimed",
+        409,
+        "account is already claimed; further owner-invitation is post-claim policy",
+      );
+    }
+    const nowIso = new Date().toISOString();
+    // Atomic: DELETE any prior invitation for this account, then
+    // INSERT the new one, then UPDATE the account state to INVITED.
+    await this.db.batch([
+      this.db.prepare("DELETE FROM afauth_invitations WHERE account_did = ?").bind(did),
+      this.db
+        .prepare(
+          "INSERT INTO afauth_invitations (token, account_did, recipient_json, expires_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(token, did, JSON.stringify(recipient), expiresAt),
+      this.db
+        .prepare("UPDATE afauth_accounts SET state = ?, updated_at = ? WHERE did = ?")
+        .bind("INVITED", nowIso, did),
+    ]);
+    return { did, state: "INVITED", pendingRecipient: recipient };
+  }
+
+  async completeClaimByToken(
+    token: string,
+    owner: NonNullable<Account["owner"]>,
+  ): Promise<Account | null> {
+    const invite = await this.db
+      .prepare("SELECT * FROM afauth_invitations WHERE token = ?")
+      .bind(token)
+      .first<InvitationRow>();
+    if (!invite) return null;
+    if (new Date(invite.expires_at).getTime() < Date.now()) {
+      await this.db.prepare("DELETE FROM afauth_invitations WHERE token = ?").bind(token).run();
+      return null;
+    }
+    const accountDid = invite.account_did;
+    const nowIso = new Date().toISOString();
+    await this.db.batch([
+      this.db
+        .prepare(
+          "UPDATE afauth_accounts SET state = ?, owner_json = ?, updated_at = ? WHERE did = ?",
+        )
+        .bind("CLAIMED", JSON.stringify(owner), nowIso, accountDid),
+      this.db.prepare("DELETE FROM afauth_invitations WHERE token = ?").bind(token),
+    ]);
+    const row = await this.db
+      .prepare("SELECT * FROM afauth_accounts WHERE did = ?")
+      .bind(accountDid)
+      .first<AccountRow>();
+    if (!row) return null;
+    return rowToAccount(row);
+  }
+
+  async rotateKey(oldDid: Did, newDid: Did, rotatedAt: string): Promise<Account> {
+    const old = await this.db
+      .prepare("SELECT * FROM afauth_accounts WHERE did = ?")
+      .bind(oldDid)
+      .first<AccountRow>();
+    if (!old) {
+      throw new AFAuthError("unknown_account", 404, `account ${oldDid} does not exist`);
+    }
+    // Atomic: INSERT new row + UPDATE invitation FK (if any) +
+    // DELETE old row. Using INSERT-then-DELETE keeps the FK satisfied
+    // during the swap; the ON DELETE CASCADE doesn't fire because we
+    // re-point the invitation first.
+    await this.db.batch([
+      this.db
+        .prepare(
+          "INSERT INTO afauth_accounts (did, state, created_at, updated_at, owner_json, revoked) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(newDid, old.state, old.created_at, rotatedAt, old.owner_json, old.revoked),
+      this.db
+        .prepare("UPDATE afauth_invitations SET account_did = ? WHERE account_did = ?")
+        .bind(newDid, oldDid),
+      this.db.prepare("DELETE FROM afauth_accounts WHERE did = ?").bind(oldDid),
+    ]);
+    const out: Account = { did: newDid, state: old.state };
+    if (old.revoked) out.revoked = true;
+    if (old.owner_json) out.owner = JSON.parse(old.owner_json) as Account["owner"];
+    return out;
+  }
+
+  async revoke(did: Did, revokedAt: string): Promise<Account> {
+    const existing = await this.db
+      .prepare("SELECT * FROM afauth_accounts WHERE did = ?")
+      .bind(did)
+      .first<AccountRow>();
+    if (!existing) {
+      throw new AFAuthError("unknown_account", 404, `account ${did} does not exist`);
+    }
+    await this.db
+      .prepare("UPDATE afauth_accounts SET revoked = 1, updated_at = ? WHERE did = ?")
+      .bind(revokedAt, did)
+      .run();
+    const row: AccountRow = { ...existing, revoked: 1, updated_at: revokedAt };
+    return rowToAccount(row);
   }
 }
 

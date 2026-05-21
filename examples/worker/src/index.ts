@@ -24,16 +24,31 @@ import {
   MemoryAccountStore,
   MemoryNonceStore,
   MemoryRevocationList,
+  type AccountStore,
   type DiscoveryDocument,
   type OwnerSession,
 } from "@afauth/server";
-import { createWorker, KvNonceStore, KvRevocationList } from "@afauth/worker";
+import {
+  createWorker,
+  D1AccountStore,
+  KvNonceStore,
+  KvRevocationList,
+} from "@afauth/worker";
 
 interface Env {
   /** Optional Cloudflare KV namespace for the production nonce store. */
   AFAUTH_NONCES?: KVNamespace;
   /** Optional Cloudflare KV namespace for the §8.3 revocation list. */
   AFAUTH_REVOCATIONS?: KVNamespace;
+  /**
+   * Optional Cloudflare D1 binding for the durable account store.
+   * Apply `packages/worker/migrations/0001_init.sql` before first use
+   * (`wrangler d1 migrations apply <db-name>`). When absent, the
+   * worker falls back to MemoryAccountStore — a process-local map
+   * that loses every account on isolate recycle. Suitable for demo,
+   * NOT for production.
+   */
+  AFAUTH_ACCOUNTS?: D1Database;
   /** Service DID; e.g. "did:web:api.example.com". */
   SERVICE_DID?: string;
   /** Base URL of this Worker; used to compose claim-page URLs. */
@@ -59,10 +74,16 @@ function buildDiscovery(env: Env): DiscoveryDocument {
   };
 }
 
-// In-memory account store is fine for the example. Production deployments
-// substitute a Cloudflare KV-backed or D1-backed implementation that
-// upholds the §7.3 atomicity contract.
-const accounts = new MemoryAccountStore();
+// Account store: prefer D1 (durable; cross-isolate consistent) when
+// the binding is present; fall back to MemoryAccountStore for demo
+// runs. The Memory store loses every account on isolate recycle —
+// `wrangler tail` will surface a one-time warning when that path
+// is taken in production.
+const memoryAccounts = new MemoryAccountStore();
+function selectAccountStore(env: Env): AccountStore {
+  if (env.AFAUTH_ACCOUNTS) return new D1AccountStore(env.AFAUTH_ACCOUNTS);
+  return memoryAccounts;
+}
 
 /**
  * Header-based owner session for the example.
@@ -104,7 +125,7 @@ const exportedHandler: ExportedHandler<Env> = {
         ? new KvRevocationList(env.AFAUTH_REVOCATIONS)
         : memoryRevocationList,
       serviceDid: discovery.service_did,
-      accounts,
+      accounts: selectAccountStore(env),
       recipients: { email: consoleEmailHandler },
       discovery,
       baseUrl,

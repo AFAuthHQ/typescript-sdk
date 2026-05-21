@@ -779,7 +779,7 @@ interface BaseAttestorOpts {
  */
 export class HmacAttestor implements Attestor {
   private readonly key: Uint8Array;
-  private readonly iss: string;
+  readonly iss: string;
   private readonly now: () => number;
 
   constructor(opts: BaseAttestorOpts & { secret: Uint8Array | string }) {
@@ -817,7 +817,7 @@ export class HmacAttestor implements Attestor {
  */
 export class JwksAttestor implements Attestor {
   private readonly jwks: ReturnType<typeof createRemoteJWKSet>;
-  private readonly iss: string;
+  readonly iss: string;
   private readonly now: () => number;
   private readonly algorithms: readonly string[];
 
@@ -869,16 +869,13 @@ export class JwksAttestor implements Attestor {
 export class MultiAttestor implements Attestor {
   private readonly byIss: Map<string, Attestor>;
 
-  constructor(attestors: ReadonlyArray<Attestor & { readonly iss?: string }>) {
+  constructor(attestors: ReadonlyArray<Attestor & { readonly iss: string }>) {
     this.byIss = new Map();
     for (const a of attestors) {
-      // Each attestor exposes its `iss` via the constructor; track
-      // it on the instance with a private convention.
-      const iss = (a as unknown as { iss: string }).iss;
-      if (!iss) {
+      if (!a.iss) {
         throw new Error("MultiAttestor: each attestor must carry an iss field");
       }
-      this.byIss.set(iss, a);
+      this.byIss.set(a.iss, a);
     }
   }
 
