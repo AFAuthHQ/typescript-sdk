@@ -12,29 +12,37 @@ example Worker.
 
 | Package | Purpose |
 |---|---|
-| [`@afauth/core`](packages/core) | Shared primitives: `did:key` codec, RFC 9421 canonicalisation, SHA-256 content-digest, `Recipient` types, `AFAuthError` envelope, `deriveInvitationId`, `normaliseRecipient` |
+| [`@afauth/core`](packages/core) | Shared primitives: `did:key` codec, `DidResolver` + `DidKeyResolver` + `CompositeDidResolver`, RFC 9421 canonicalisation, SHA-256 content-digest, `Recipient` types, `AFAuthError` envelope, `deriveInvitationId`, `normaliseRecipient` |
 | [`@afauth/agent`](packages/agent) | `Agent.generate()` / `fromPrivateKey()`, `signRequest`, protocol-aware builders (owner invitation, key rotation, account introspection), `fetchDiscovery` + `assertDiscoveryDocument` |
-| [`@afauth/server`](packages/server) | `Verifier` (§5.5/§5.6), `Server` (five endpoint handlers + `revoke`), `MemoryNonceStore` / `MemoryAccountStore` / `MemoryRevocationList`, reference `consoleEmailHandler` |
-| [`@afauth/worker`](packages/worker) | Cloudflare Workers bindings: `createWorker`, `KvNonceStore`, `KvRevocationList` |
+| [`@afauth/server`](packages/server) | `Verifier` (§5.5/§5.6), `Server` (five endpoint handlers + `revoke`), `DidWebResolver` (§3.1.2), `RateLimiter` + `MemoryRateLimiter` (§11.3), `Attestor` + `HmacAttestor`/`JwksAttestor`/`MultiAttestor` (§10), `assertFreshOwnerSession` (§7.5), Memory stores, reference `consoleEmailHandler` |
+| [`@afauth/worker`](packages/worker) | Cloudflare Workers bindings: `createWorker`, `KvNonceStore`, `KvRevocationList`, `KvRateLimiter`, `D1AccountStore` (+ `migrations/0001_init.sql`) |
 | [`examples/worker`](examples/worker) | Reference Cloudflare Worker composing the above |
 
 ## Status
 
-**v0.1 conformance complete; awaiting first npm publish.**
+**v0.1 conformance complete; beta hardening pass complete; awaiting first npm publish.**
 
-The SDK implements milestones M0–M4 of the v0.1 spec — the full
+The SDK implements milestones M0–M5 of the v0.1 spec — the full
 ceremony surface plus rotation, revocation, and full §11 error envelope
-coverage. Conformance is verified against the spec's test vectors
-(Appendix C.1–C.6) — see [`vendor/spec-vectors/`](vendor/spec-vectors/),
-which is a snapshot of the vectors from
+coverage — and the four beta-hardening additions on top of that:
+
+- **`did:web` resolver** (§3.1.2) with TLS-only fetch, schema validation, positive + negative caching.
+- **Rate-limit helper** (§11.3 `rate_limit_exceeded`) — per-route configs, `Retry-After` on the 429.
+- **Attestation JWT verifier** (§10) — `HmacAttestor`, `JwksAttestor`, `MultiAttestor`; §9.2 `attested_only` enforcement.
+- **`D1AccountStore`** — durable AccountStore on Cloudflare D1 with ADR-0004 atomic ops via `D1.batch()`.
+
+Conformance is verified against the spec's test vectors (Appendix
+C.1–C.6) — see [`vendor/spec-vectors/`](vendor/spec-vectors/), which
+is a snapshot of the vectors from
 [`AFAuthHQ/spec`](https://github.com/AFAuthHQ/spec).
 
 | Test surface | Count |
 |---|---|
-| `@afauth/core` | 61 (codec roundtrips, canonical input vs §C.1, content-digest, §C.4 recipient normalisation, §C.5 envelopes) |
+| `@afauth/core` | 62 (codec roundtrips, canonical input vs §C.1, content-digest, §C.4 recipient normalisation, §C.5 envelopes) |
 | `@afauth/agent` | 29 (discovery validation, §C.3 corpus) |
-| `@afauth/server` | 63 (nonce store, conformance vectors via `Verifier.verify`, owner-invitation ceremony, claim completion, rotation, replay-window §C.6, owner-invitation body shapes, verifier edge cases) |
-| **Total** | **153 tests, all green in CI** |
+| `@afauth/server` | 110 (nonce store, conformance vectors via `Verifier.verify`, ceremony, claim completion, rotation, replay-window §C.6, body shapes, verifier edge cases, did:web resolver, rate-limit gates, attestation, owner-session freshness) |
+| `@afauth/worker` | 12 (D1AccountStore: §7.3 atomic supersession, claim, rotate, revoke via in-process miniflare D1) |
+| **Total** | **213 tests, all green in CI** |
 
 The first publish is staged as `0.1.0-alpha.0` (see
 [`.changeset/initial-alpha.md`](.changeset/initial-alpha.md)).
@@ -134,8 +142,12 @@ The headline decisions for v0.1 are:
   pluggable; the SDK ships `MemoryNonceStore` and `KvNonceStore`.
 - **No router framework** (ADR-0002) — `createWorker` uses a small
   in-house router; no Hono, no itty-router in the runtime dep tree.
-- **`did:key` only in v0.1** (ADR-0003) — the verifier exposes a
-  resolver hook so `did:web` can be added in v0.2.
+- **DID resolver in v0.1** (ADR-0003, amended) — the SDK ships both
+  `DidKeyResolver` (in `@afauth/core`) and `DidWebResolver` (in
+  `@afauth/server`). `Verifier`'s default is `did:key`-only for
+  backward compat; pass
+  `didResolver: new CompositeDidResolver({ key: new DidKeyResolver(), web: new DidWebResolver({}) })`
+  to also accept `did:web` keyids.
 - **SDK API shape** (ADR-0004) — `AccountStore` exposes named atomic
   operations (not generic CRUD); `Server.handleClaimCompletion` takes
   an explicit `session` parameter; `Agent.signRequest` is public with

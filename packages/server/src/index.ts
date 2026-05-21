@@ -1218,32 +1218,70 @@ export interface OwnerSession {
   userId: string;
   /**
    * ISO-8601 timestamp of the most recent authentication event this
-   * session evidences. Required by §7.5's freshness floor for
-   * owner-binding operations; optional on the type for backward
-   * compatibility with claim-completion sessions, which are
-   * exempt (§7.5 applies post-claim only).
+   * session evidences.
    *
-   * Use `assertFreshOwnerSession` to enforce the freshness window
-   * before authorising an owner-binding operation.
+   * Required by `assertFreshOwnerSession` (§7.5 freshness floor for
+   * post-claim owner-binding operations).
+   *
+   * NOT read by `handleClaimCompletion`: §7.5 applies post-claim
+   * only, so the claim ceremony itself has no freshness requirement.
+   * That's why the field is optional on the type — sessions used
+   * solely for claim completion don't need it.
+   *
+   * Recommendation: populate this on every session your auth layer
+   * issues. Any owner-binding route your service exposes (rotate
+   * key, revoke key, change bound email, add recovery contact)
+   * MUST call `assertFreshOwnerSession`, and that helper requires
+   * this field.
    */
   authenticatedAt?: string;
 }
 
 /**
- * §7.5 freshness check. Throws `AFAuthError("owner_session_too_stale",
- * 403, …)` if `session.authenticatedAt` is missing or older than
- * `maxAgeSeconds` relative to `now`.
+ * §7.5 freshness check for post-claim owner-binding operations.
  *
- * Use in service-defined owner-binding routes (revoke owner credential,
- * link federated identity, add recovery contact, etc.) before invoking
- * the underlying storage mutation. §7.5 mandates 60–300s as the
- * recommended window; the SDK does not pin a default — callers must
- * pick the freshness their threat model warrants.
+ * Throws `AFAuthError("owner_session_too_stale", 403, …)` if
+ * `session.authenticatedAt` is missing or older than `maxAgeSeconds`
+ * relative to `now`.
+ *
+ * WHERE TO CALL THIS
+ *
+ * Only from service-defined routes that perform §7.5 "owner-binding
+ * operations" — operations that modify which credentials can
+ * authenticate as the owner. The protocol's enumerated list:
+ *
+ *   - revoking the agent's key (§8.4)
+ *   - changing the bound owner identity
+ *   - enrolling additional authentication credentials
+ *   - adding or modifying recovery contacts
+ *   - linking federated identities
+ *   - adding additional principals to the account
+ *
+ * The mapping from this category to your concrete service routes is
+ * a service policy decision — `Verifier` cannot know which of your
+ * routes are owner-binding, so this helper is yours to call.
+ *
+ * WHERE NOT TO CALL THIS
+ *
+ * NOT from inside `handleClaimCompletion`. §7.5 explicitly applies
+ * post-claim only; the claim ceremony's freshness requirement is
+ * the §7.4 match relation, which `handleClaimCompletion` already
+ * enforces against `session.authenticated`. The SDK does not call
+ * `assertFreshOwnerSession` automatically anywhere.
+ *
+ * NOT from agent-signed routes. The §7.5 freshness floor is about
+ * the *human* re-proving recent authentication, not the agent
+ * re-signing the request. An agent-signed request's freshness is
+ * already covered by §5.6 (signature `expires` + nonce).
+ *
+ * §7.5 mandates 60–300s as the recommended window; the SDK does
+ * not pin a default — pick the freshness your threat model warrants.
  *
  * Example:
  *
- *   // POST /admin/revoke (service route — not signed by an agent)
+ *   // POST /me/revoke (service route — owner-authenticated, not agent-signed)
  *   const session = await myAuthLayer.extractOwnerSession(req);
+ *   if (!session) throw new AFAuthError("owner_authentication_required", 401, "...");
  *   assertFreshOwnerSession(session, { maxAgeSeconds: 300 });
  *   await server.revoke(targetDid);
  */

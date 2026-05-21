@@ -48,6 +48,17 @@ export default {
   Uses KV `expirationTtl`; floored to KV's 60s minimum.
 - **`KvRevocationList`** — `RevocationList` backed by Cloudflare KV
   (§8.3). Durable; no TTL.
+- **`KvRateLimiter`** — `RateLimiter` backed by Cloudflare KV
+  (§11.3). Fixed-window counter per key; eventually-consistent
+  reads mean racing isolates may over-count (fail-safe per §11.3),
+  never under-count.
+- **`D1AccountStore`** — `AccountStore` backed by Cloudflare D1
+  (§6 + §7.3). Every ADR-0004 named atomic op uses `D1.batch()`
+  for transactional grouping. The schema lives at
+  [`migrations/0001_init.sql`](migrations/0001_init.sql); apply
+  via `wrangler d1 migrations apply <db-name>` before first use.
+  Schema is portable to standard Postgres/MySQL with minor
+  syntactic changes.
 - **`WorkerOptions`** — extends `ServerOptions` with the required
   `extractOwnerSession` callback for the claim-completion route.
 
