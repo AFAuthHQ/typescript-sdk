@@ -26,7 +26,8 @@
   },
   "dependencies": {
     "@afauth/core": "workspace:*",
-    "@noble/curves": "^2.2.0"
+    "@noble/curves": "^2.2.0",
+    "jose": "^6.2.3"
   },
   "devDependencies": {
     "@afauth/agent": "workspace:^",

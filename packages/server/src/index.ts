@@ -23,6 +23,11 @@
 
 import { ed25519 } from "@noble/curves/ed25519.js";
 import {
+  createRemoteJWKSet,
+  jwtVerify,
+  type JWTVerifyResult,
+} from "jose";
+import {
   AFAuthError,
   buildCanonicalInput,
   CompositeDidResolver,
@@ -719,6 +724,218 @@ function extractEd25519FromDidDocument(doc: unknown, did: Did): Ed25519PublicKey
   );
 }
 
+// ---------- Attestation (§10) ----------
+//
+// §10 defines `AFAuth-Attestation: <JWT>` as the wire surface for
+// attestors. §9.2 makes attestation MANDATORY when the service
+// advertises `billing.unclaimed_mode = "attested_only"`. The SDK
+// ships two reference attestors:
+//
+//   - HmacAttestor — HS256 with a service-operator shared secret.
+//   - JwksAttestor — generic asymmetric verification against the
+//                    attestor's published JWKS endpoint (ES256, RS256,
+//                    EdDSA supported via `jose`).
+//
+// MultiAttestor dispatches by JWT `iss` so a single service can
+// accept tokens from multiple attestors.
+//
+// Named attestors (microsoft-entra-agent-id, stripe-projects, etc.)
+// are vendor-specific configurations of JwksAttestor; they ship as
+// satellite packages outside `@afauth/server` to keep core lean.
+
+export interface AttestationClaims {
+  /** §10.2: attestor identifier (e.g. "stripe-projects", "microsoft-entra-agent-id"). */
+  iss: string;
+  /** §10.2: requesting agent's account DID. */
+  sub: string;
+  /** §10.2: token expiry (unix seconds). */
+  exp: number;
+  /** Attestor-specific extra claims (raw). */
+  [key: string]: unknown;
+}
+
+export interface Attestor {
+  /**
+   * Verifies an attestation JWT for `agentDid`. Returns the parsed
+   * claims on success. Throws `AFAuthError("invalid_attestation", …)`
+   * on signature/claim violation; throws `unsupported_attestor` if
+   * this attestor does not handle the token's `iss`.
+   */
+  verify(jwt: string, agentDid: Did): Promise<AttestationClaims>;
+}
+
+interface BaseAttestorOpts {
+  /** Attestor identifier — must match the JWT's `iss`. */
+  iss: string;
+  /** Function returning current unix-second time. Overridable for tests. */
+  now?: () => number;
+}
+
+/**
+ * Verifies HS256 attestation JWTs against a shared secret. Suitable
+ * for first-party service-operator attestors per §10.3. The secret
+ * MUST be at least 32 bytes; we do not enforce length here because
+ * production deployments may bring their own validation.
+ */
+export class HmacAttestor implements Attestor {
+  private readonly key: Uint8Array;
+  private readonly iss: string;
+  private readonly now: () => number;
+
+  constructor(opts: BaseAttestorOpts & { secret: Uint8Array | string }) {
+    this.iss = opts.iss;
+    this.key = typeof opts.secret === "string" ? new TextEncoder().encode(opts.secret) : opts.secret;
+    this.now = opts.now ?? (() => Math.floor(Date.now() / 1000));
+  }
+
+  async verify(jwt: string, agentDid: Did): Promise<AttestationClaims> {
+    let result: JWTVerifyResult;
+    try {
+      result = await jwtVerify(jwt, this.key, {
+        algorithms: ["HS256"],
+        issuer: this.iss,
+        currentDate: new Date(this.now() * 1000),
+      });
+    } catch (err) {
+      throw new AFAuthError(
+        "invalid_attestation",
+        401,
+        `HmacAttestor: ${(err as Error).message}`,
+      );
+    }
+    return validateClaims(result.payload, this.iss, agentDid);
+  }
+}
+
+/**
+ * Verifies attestation JWTs signed by an asymmetric attestor whose
+ * keys are published at a JWKS URL. Supports ES256, RS256, and EdDSA
+ * via `jose`'s key resolver.
+ *
+ * The JWKS is cached internally by `jose`'s `createRemoteJWKSet` with
+ * its default behaviour (caches valid keys; respects rotation).
+ */
+export class JwksAttestor implements Attestor {
+  private readonly jwks: ReturnType<typeof createRemoteJWKSet>;
+  private readonly iss: string;
+  private readonly now: () => number;
+  private readonly algorithms: readonly string[];
+
+  constructor(opts: BaseAttestorOpts & {
+    /** URL of the attestor's JWKS document. MUST be https. */
+    jwksUrl: string;
+    /** Default: ["ES256", "RS256", "EdDSA"]. Constrain per attestor for tighter alg pinning. */
+    algorithms?: readonly string[];
+  }) {
+    if (!opts.jwksUrl.startsWith("https://")) {
+      throw new Error(`JwksAttestor: jwksUrl MUST be https; got ${opts.jwksUrl}`);
+    }
+    this.iss = opts.iss;
+    this.jwks = createRemoteJWKSet(new URL(opts.jwksUrl));
+    this.algorithms = opts.algorithms ?? ["ES256", "RS256", "EdDSA"];
+    this.now = opts.now ?? (() => Math.floor(Date.now() / 1000));
+  }
+
+  async verify(jwt: string, agentDid: Did): Promise<AttestationClaims> {
+    let result: JWTVerifyResult;
+    try {
+      result = await jwtVerify(jwt, this.jwks, {
+        algorithms: this.algorithms as string[],
+        issuer: this.iss,
+        currentDate: new Date(this.now() * 1000),
+      });
+    } catch (err) {
+      throw new AFAuthError(
+        "invalid_attestation",
+        401,
+        `JwksAttestor: ${(err as Error).message}`,
+      );
+    }
+    return validateClaims(result.payload, this.iss, agentDid);
+  }
+}
+
+/**
+ * Dispatches to per-issuer attestors. Construct one per service with
+ * every accepted attestor pre-configured:
+ *
+ *   const multi = new MultiAttestor([
+ *     new HmacAttestor({ iss: "my-service", secret: env.ATTESTATION_SECRET }),
+ *     new JwksAttestor({ iss: "stripe-projects", jwksUrl: "https://.../jwks.json" }),
+ *   ]);
+ *
+ * Unknown issuers throw `invalid_attestation` per §10.3.
+ */
+export class MultiAttestor implements Attestor {
+  private readonly byIss: Map<string, Attestor>;
+
+  constructor(attestors: ReadonlyArray<Attestor & { readonly iss?: string }>) {
+    this.byIss = new Map();
+    for (const a of attestors) {
+      // Each attestor exposes its `iss` via the constructor; track
+      // it on the instance with a private convention.
+      const iss = (a as unknown as { iss: string }).iss;
+      if (!iss) {
+        throw new Error("MultiAttestor: each attestor must carry an iss field");
+      }
+      this.byIss.set(iss, a);
+    }
+  }
+
+  async verify(jwt: string, agentDid: Did): Promise<AttestationClaims> {
+    // Peek at the iss claim without verifying the signature first.
+    // jose's `decodeJwt` does this safely; we just split + base64 the
+    // payload to avoid pulling another export in.
+    const parts = jwt.split(".");
+    if (parts.length !== 3) {
+      throw new AFAuthError("invalid_attestation", 401, "JWT must have three parts");
+    }
+    let payload: { iss?: string };
+    try {
+      const decoded = atob(parts[1]!.replace(/-/g, "+").replace(/_/g, "/"));
+      payload = JSON.parse(decoded) as { iss?: string };
+    } catch {
+      throw new AFAuthError("invalid_attestation", 401, "JWT payload is not valid base64url JSON");
+    }
+    if (typeof payload.iss !== "string") {
+      throw new AFAuthError("invalid_attestation", 401, "JWT missing iss claim");
+    }
+    const attestor = this.byIss.get(payload.iss);
+    if (!attestor) {
+      throw new AFAuthError(
+        "invalid_attestation",
+        401,
+        `attestor ${payload.iss} not accepted by this service`,
+      );
+    }
+    return attestor.verify(jwt, agentDid);
+  }
+}
+
+function validateClaims(payload: unknown, iss: string, agentDid: Did): AttestationClaims {
+  if (!payload || typeof payload !== "object") {
+    throw new AFAuthError("invalid_attestation", 401, "JWT payload is not an object");
+  }
+  const p = payload as Record<string, unknown>;
+  if (p.iss !== iss) {
+    throw new AFAuthError("invalid_attestation", 401, `iss mismatch: want ${iss}, got ${String(p.iss)}`);
+  }
+  if (typeof p.sub !== "string") {
+    throw new AFAuthError("invalid_attestation", 401, "JWT missing sub claim");
+  }
+  if (p.sub !== agentDid) {
+    throw new AFAuthError(
+      "invalid_attestation",
+      401,
+      `sub mismatch: token sub=${p.sub} does not match request agent ${agentDid}`,
+    );
+  }
+  if (typeof p.exp !== "number") {
+    throw new AFAuthError("invalid_attestation", 401, "JWT missing exp claim");
+  }
+  return p as AttestationClaims;
+}
+
 // ---------- Rate limiter (§11.3 rate_limit_exceeded) ----------
 //
 // The protocol reserves `rate_limit_exceeded` (429) in §11.3 but takes
@@ -1109,6 +1326,18 @@ export interface ServerOptions extends VerifierOptions {
    * 60/hour for key rotation.
    */
   rateLimits?: ServerRateLimits;
+  /**
+   * §10: optional attestation verifier. When the discovery doc
+   * declares `billing.unclaimed_mode = "attested_only"` (§9.2), the
+   * Server REQUIRES this to be set — implicit signup paths reject
+   * with `attestation_required` until a valid AFAuth-Attestation
+   * header is presented.
+   *
+   * When the discovery mode is anything else, the attestor is consulted
+   * only when an attestation header IS present (lax mode for upgrade
+   * paths and audit logging).
+   */
+  attestor?: Attestor;
 }
 
 // Default invitation TTL: 24 hours (§7.3 says "service-defined";
@@ -1143,6 +1372,7 @@ export class Server {
   private readonly implicitSignup: boolean;
   private readonly rateLimiter?: RateLimiter;
   private readonly rateLimits: ServerRateLimits;
+  private readonly attestor?: Attestor;
 
   constructor(opts: ServerOptions) {
     // Verifier already defaults a missing revocationList to
@@ -1161,6 +1391,51 @@ export class Server {
     this.implicitSignup = opts.implicitSignup ?? true;
     this.rateLimiter = opts.rateLimiter;
     this.rateLimits = opts.rateLimits ?? {};
+    this.attestor = opts.attestor;
+  }
+
+  /**
+   * §9.2 + §10 enforcement at signup. Called from the implicit-signup
+   * branch in `handleAccountIntrospection` and any future explicit
+   * signup handler.
+   *
+   * Behaviour:
+   *   - discovery.billing.unclaimed_mode === "attested_only":
+   *     * header MUST be present and valid; otherwise 401 attestation_required
+   *       (no attestor configured → 503 — operator misconfiguration)
+   *   - other modes:
+   *     * if header present, validate; reject on invalid (`401 invalid_attestation`)
+   *     * if header absent, silently allow
+   */
+  private async enforceAttestationOnSignup(
+    req: Request,
+    agentDid: Did,
+  ): Promise<void> {
+    const disc = await this.resolveDiscovery();
+    const required = disc.billing?.unclaimed_mode === "attested_only";
+    const header = req.headers.get("afauth-attestation");
+
+    if (required && !header) {
+      throw new AFAuthError(
+        "attestation_required",
+        401,
+        "service declares attested_only mode; AFAuth-Attestation header is required",
+        { accepted_attestors: disc.billing?.accepted_attestors },
+      );
+    }
+    if (required && !this.attestor) {
+      // Misconfiguration: service ADVERTISED attested_only but supplied
+      // no attestor to verify against. 503 because it's a server fault,
+      // not a client fault.
+      throw new AFAuthError(
+        "attestation_required",
+        503,
+        "service is misconfigured: attested_only declared but no attestor supplied",
+      );
+    }
+    if (header && this.attestor) {
+      await this.attestor.verify(header, agentDid);
+    }
   }
 
   /**
@@ -1568,6 +1843,10 @@ export class Server {
       if (!this.implicitSignup) {
         throw new AFAuthError("unknown_account", 404, "account does not exist (implicit signup disabled)");
       }
+      // §9.2: enforce attested_only mode (and validate any present
+      // header in lax mode) BEFORE creating the account row. A
+      // rejected attestation MUST NOT leave a side-effect.
+      await this.enforceAttestationOnSignup(req, verified.agentDid);
       // Implicit signup also goes through the `accounts` rate-limit
       // bucket since it creates an account row.
       await this.enforceRateLimit("accounts", verified.agentDid);
