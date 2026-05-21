@@ -1,96 +1,100 @@
 /**
  * Reference AFAuth Cloudflare Worker.
  *
- * Composes `@afauth/server` (Verifier, Server, named-op AccountStore)
- * with `@afauth/worker` (createWorker, KvNonceStore). M0 placeholder:
- * once the underlying packages implement their stubs, this Worker will
- * route the five AFAuth endpoints end-to-end against a KV-backed
- * account store and an email RecipientHandler that logs the magic
- * link to console.
+ * Wires `@afauth/server` (Verifier, Server, MemoryAccountStore,
+ * consoleEmailHandler) together with `@afauth/worker` (createWorker,
+ * KvNonceStore) into a deployable Worker.
  *
- * For now, the Worker boots and returns the discovery document — that
- * is the M0 deliverable for the reference Worker.
+ * M2 capability:
+ *   - Serves /.well-known/afauth.
+ *   - Accepts agent-signed owner-invitation; the email handler logs
+ *     the magic link to the Worker's console (visible in `wrangler
+ *     tail`).
+ *   - Accepts POSTs to /afauth/v1/claim/<token> with an
+ *     X-Owner-Session header carrying a JSON-encoded session blob —
+ *     a stand-in for whatever auth your real claim page uses.
+ *   - Returns the account record from GET /afauth/v1/accounts/me.
+ *
+ * The session-extraction strategy is intentionally trivial; production
+ * deployments replace `extractOwnerSession` with their real auth.
  */
 
 import {
+  consoleEmailHandler,
+  MemoryAccountStore,
   MemoryNonceStore,
-  Server,
-  type AccountStore,
   type DiscoveryDocument,
-  type RecipientHandler,
+  type OwnerSession,
 } from "@afauth/server";
+import { createWorker, KvNonceStore } from "@afauth/worker";
 
 interface Env {
-  /** Cloudflare KV namespace for the production nonce store. */
+  /** Optional Cloudflare KV namespace for the production nonce store. */
   AFAUTH_NONCES?: KVNamespace;
-  /** Service did:web identifier, e.g. "did:web:api.example.com". */
+  /** Service DID; e.g. "did:web:api.example.com". */
   SERVICE_DID?: string;
-  /** Base URL of this Worker, used to compose endpoint URLs. */
+  /** Base URL of this Worker; used to compose claim-page URLs. */
   BASE_URL?: string;
 }
 
-const DISCOVERY: DiscoveryDocument = {
-  afauth_version: "0.1",
-  service_did: "did:web:example.com",
-  endpoints: {
-    accounts: "/afauth/v1/accounts",
-    owner_invitation: "/afauth/v1/accounts/me/owner-invitation",
-    claim_page: "/claim",
-    claim_completion: "/afauth/v1/claim",
-    key_rotation: "/afauth/v1/accounts/me/keys/rotate",
-  },
-  signature_algorithms: ["ed25519"],
-  features: ["key_rotation"],
-  recipient_types: ["email"],
-};
+const DEFAULT_BASE_URL = "https://example.com";
 
-// Placeholder AccountStore — replaced with a KV-backed implementation in M2.
-const accountStore: AccountStore = {
-  async get() { return null; },
-  async createUnclaimed() { throw new Error("not_implemented: createUnclaimed"); },
-  async setPendingInvitation() { throw new Error("not_implemented: setPendingInvitation"); },
-  async completeClaimByToken() { return null; },
-  async rotateKey() { throw new Error("not_implemented: rotateKey"); },
-  async revoke() { throw new Error("not_implemented: revoke"); },
-};
+function buildDiscovery(env: Env): DiscoveryDocument {
+  return {
+    afauth_version: "0.1",
+    service_did: env.SERVICE_DID ?? "did:web:example.com",
+    endpoints: {
+      accounts: "/afauth/v1/accounts",
+      owner_invitation: "/afauth/v1/accounts/me/owner-invitation",
+      claim_page: "/claim",
+      claim_completion: "/afauth/v1/claim",
+      key_rotation: "/afauth/v1/accounts/me/keys/rotate",
+    },
+    signature_algorithms: ["ed25519"],
+    features: ["key_rotation"],
+    recipient_types: ["email"],
+  };
+}
 
-// Placeholder email recipient handler — replaced in M2 with one that
-// logs the magic link to console.
-const emailHandler: RecipientHandler = {
-  async initiate() {
-    throw new Error("not_implemented: emailHandler.initiate");
-  },
-  matches({ pending, authenticated }) {
-    if (pending.type !== "email" || authenticated.type !== "email") return false;
-    return pending.value.toLowerCase() === authenticated.value.toLowerCase();
-  },
-};
+// In-memory account store is fine for the example. Production deployments
+// substitute a Cloudflare KV-backed or D1-backed implementation that
+// upholds the §7.3 atomicity contract.
+const accounts = new MemoryAccountStore();
 
-export default {
-  async fetch(req: Request, _env: Env): Promise<Response> {
-    const url = new URL(req.url);
+/**
+ * Header-based owner session for the example. The claim page passes the
+ * authenticated identity as JSON in an `X-Owner-Session` header:
+ *
+ *   X-Owner-Session: {"authenticated":{"type":"email","value":"alice@example.com"},"userId":"usr_alice"}
+ *
+ * A real deployment replaces this with the session shape its own auth
+ * system produces — typically a parsed cookie or IdP-issued JWT.
+ */
+async function extractOwnerSession(req: Request): Promise<OwnerSession | null> {
+  const raw = req.headers.get("x-owner-session");
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as OwnerSession;
+  } catch {
+    return null;
+  }
+}
 
-    if (url.pathname === "/.well-known/afauth") {
-      // M0 deliverable: discovery boots and serves a valid document.
-      return new Response(JSON.stringify(DISCOVERY), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
-    }
-
-    // The Server class below is constructed but not yet dispatched to —
-    // wiring up the router happens in M1. This call exists to make sure
-    // ServerOptions stays type-compatible with the placeholder values.
-    const _server = new Server({
-      nonceStore: new MemoryNonceStore(),
-      serviceDid: DISCOVERY.service_did,
-      accounts: accountStore,
-      recipients: { email: emailHandler },
-      discovery: DISCOVERY,
-      baseUrl: "https://example.com",
+const exportedHandler: ExportedHandler<Env> = {
+  fetch(req, env, ctx) {
+    const discovery = buildDiscovery(env);
+    const baseUrl = env.BASE_URL ?? DEFAULT_BASE_URL;
+    const handler = createWorker({
+      nonceStore: env.AFAUTH_NONCES ? new KvNonceStore(env.AFAUTH_NONCES) : new MemoryNonceStore(),
+      serviceDid: discovery.service_did,
+      accounts,
+      recipients: { email: consoleEmailHandler },
+      discovery,
+      baseUrl,
+      extractOwnerSession,
     });
-    void _server;
-
-    return new Response("Not Found", { status: 404 });
+    return handler.fetch!(req, env, ctx);
   },
-} satisfies ExportedHandler<Env>;
+};
+
+export default exportedHandler;

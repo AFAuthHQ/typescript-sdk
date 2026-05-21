@@ -74,7 +74,19 @@ export interface Account {
  * Storage contract for AFAuth accounts. See ADR-0004.
  */
 export interface AccountStore {
+  // ----- Reads -----
   get(did: Did): Promise<Account | null>;
+
+  /**
+   * Read-only lookup by pending invitation token. Returns the account
+   * iff the token is currently associated with a pending invitation
+   * that has not yet expired. Returns null otherwise. Used by
+   * Server.handleClaimCompletion to inspect pendingRecipient and apply
+   * the §7.7 match relation before the atomic commit.
+   */
+  findByPendingToken(token: string): Promise<Account | null>;
+
+  // ----- Atomic mutations -----
   createUnclaimed(did: Did): Promise<Account>;
   setPendingInvitation(
     did: Did,
@@ -90,6 +102,121 @@ export interface AccountStore {
   revoke(did: Did, revokedAt: string): Promise<Account>;
 }
 
+/**
+ * Single-process in-memory implementation of `AccountStore`. Suitable
+ * for tests and small examples; production deployments should use a
+ * durable backend (e.g. a KV-backed implementation).
+ */
+export class MemoryAccountStore implements AccountStore {
+  private readonly accounts = new Map<Did, Account>();
+  private readonly tokens = new Map<string, { did: Did; expiresAt: string }>();
+
+  async get(did: Did): Promise<Account | null> {
+    return this.accounts.get(did) ?? null;
+  }
+
+  async findByPendingToken(token: string): Promise<Account | null> {
+    const entry = this.tokens.get(token);
+    if (!entry) return null;
+    if (new Date(entry.expiresAt).getTime() < Date.now()) {
+      this.tokens.delete(token);
+      return null;
+    }
+    return this.accounts.get(entry.did) ?? null;
+  }
+
+  async createUnclaimed(did: Did): Promise<Account> {
+    const existing = this.accounts.get(did);
+    if (existing) return existing;
+    const fresh: Account = { did, state: "UNCLAIMED" };
+    this.accounts.set(did, fresh);
+    return fresh;
+  }
+
+  async setPendingInvitation(
+    did: Did,
+    recipient: Recipient,
+    token: string,
+    expiresAt: string,
+  ): Promise<Account> {
+    const account = this.accounts.get(did);
+    if (!account) {
+      throw new AFAuthError("unknown_account", 404, `account ${did} does not exist`);
+    }
+    if (account.revoked) {
+      throw new AFAuthError("revoked_key", 401, `account ${did} is revoked`);
+    }
+    if (account.state === "CLAIMED") {
+      throw new AFAuthError(
+        "already_claimed",
+        409,
+        `account ${did} is already claimed`,
+      );
+    }
+
+    // §7.3 atomic replacement: invalidate any prior pending invitation
+    // for this DID before installing the new one.
+    for (const [existingToken, entry] of this.tokens) {
+      if (entry.did === did) this.tokens.delete(existingToken);
+    }
+
+    this.tokens.set(token, { did, expiresAt });
+    account.state = "INVITED";
+    account.pendingRecipient = recipient;
+    this.accounts.set(did, account);
+    return { ...account };
+  }
+
+  async completeClaimByToken(
+    token: string,
+    owner: NonNullable<Account["owner"]>,
+  ): Promise<Account | null> {
+    const entry = this.tokens.get(token);
+    if (!entry) return null;
+    if (new Date(entry.expiresAt).getTime() < Date.now()) {
+      this.tokens.delete(token);
+      return null;
+    }
+    const account = this.accounts.get(entry.did);
+    if (!account) return null;
+
+    const claimed: Account = {
+      did: account.did,
+      state: "CLAIMED",
+      owner,
+      ...(account.revoked ? { revoked: account.revoked } : {}),
+    };
+    this.accounts.set(entry.did, claimed);
+    this.tokens.delete(token);
+    return claimed;
+  }
+
+  async rotateKey(oldDid: Did, newDid: Did, _rotatedAt: string): Promise<Account> {
+    const account = this.accounts.get(oldDid);
+    if (!account) {
+      throw new AFAuthError("unknown_account", 404, `account ${oldDid} does not exist`);
+    }
+    const rotated: Account = { ...account, did: newDid };
+    this.accounts.delete(oldDid);
+    this.accounts.set(newDid, rotated);
+    // Migrate any pending token references.
+    for (const entry of this.tokens.values()) {
+      if (entry.did === oldDid) entry.did = newDid;
+    }
+    return rotated;
+  }
+
+  async revoke(did: Did, _revokedAt: string): Promise<Account> {
+    const account = this.accounts.get(did);
+    if (!account) {
+      throw new AFAuthError("unknown_account", 404, `account ${did} does not exist`);
+    }
+    account.revoked = true;
+    this.accounts.set(did, account);
+    return { ...account };
+  }
+}
+
 // ---------- Recipient handlers (§7.7) ----------
 
 export interface RecipientHandler<R extends Recipient = Recipient> {
@@ -101,6 +228,37 @@ export interface RecipientHandler<R extends Recipient = Recipient> {
   }): Promise<void>;
   matches(opts: { pending: R; authenticated: R }): boolean;
 }
+
+/**
+ * Reference `email` `RecipientHandler` for local development and
+ * tests. `initiate` logs the magic link to `console.error` (stderr, so
+ * it doesn't pollute stdout) with a recognisable prefix; `matches`
+ * applies case-insensitive equality per §7.7.1.
+ *
+ * Production deployments substitute their own implementation that
+ * sends a real email through a mail provider.
+ */
+export const consoleEmailHandler: RecipientHandler = {
+  async initiate({ recipient, claimToken, claimPageUrl, redirectUrl }) {
+    if (recipient.type !== "email") {
+      throw new AFAuthError(
+        "unsupported_recipient_type",
+        400,
+        `consoleEmailHandler received non-email recipient: ${recipient.type}`,
+      );
+    }
+    const url = new URL(claimPageUrl);
+    url.searchParams.set("token", claimToken);
+    if (redirectUrl) url.searchParams.set("redirect_url", redirectUrl);
+    // eslint-disable-next-line no-console
+    console.error(`[afauth] magic link for ${recipient.value}: ${url.toString()}`);
+  },
+  matches({ pending, authenticated }) {
+    if (pending.type !== "email" || authenticated.type !== "email") return false;
+    // §7.7.1: case-insensitive equality per RFC 5321 §2.4.
+    return pending.value.toLowerCase() === authenticated.value.toLowerCase();
+  },
+};
 
 // ---------- Header parsing (RFC 9421) ----------
 
@@ -367,28 +525,275 @@ export interface ServerOptions extends VerifierOptions {
   baseUrl: string;
 }
 
+// Default invitation TTL: 24 hours (§7.3 says "service-defined";
+// 24-72h is typical for consumer accounts).
+const DEFAULT_INVITATION_TTL_SECONDS = 24 * 60 * 60;
+
+function generateInvitationToken(): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  // base64url, no padding
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function jsonResponse(body: unknown, status: number, extraHeaders: Record<string, string> = {}): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json", ...extraHeaders },
+  });
+}
+
 export class Server {
-  constructor(_opts: ServerOptions) {
-    // M1: skeleton — endpoint handlers land in M2/M3.
+  private readonly verifier: Verifier;
+  private readonly accounts: AccountStore;
+  private readonly recipients: ServerOptions["recipients"];
+  private readonly discovery: ServerOptions["discovery"];
+  private readonly baseUrl: string;
+  private readonly invitationTtlSeconds: number;
+
+  constructor(opts: ServerOptions) {
+    this.verifier = new Verifier(opts);
+    this.accounts = opts.accounts;
+    this.recipients = opts.recipients;
+    this.discovery = opts.discovery;
+    this.baseUrl = opts.baseUrl;
+    this.invitationTtlSeconds = DEFAULT_INVITATION_TTL_SECONDS;
   }
+
+  // The Verifier is shared with handlers — exposed so the Worker layer
+  // can use it directly for endpoints that just need the verified DID
+  // (e.g. account-introspection on GET).
+  get verifierInstance(): Verifier {
+    return this.verifier;
+  }
+
+  // ----- Discovery (§4) -----
 
   async handleDiscovery(_req: Request): Promise<Response> {
-    throw new AFAuthError("malformed_request", 500, "Server.handleDiscovery not implemented");
+    const doc = await this.resolveDiscovery();
+    return jsonResponse(doc, 200, { "cache-control": "max-age=300" });
   }
 
-  async handleOwnerInvitation(_req: Request): Promise<Response> {
-    throw new AFAuthError("malformed_request", 500, "Server.handleOwnerInvitation not implemented");
+  private async resolveDiscovery(): Promise<DiscoveryDocument> {
+    return typeof this.discovery === "function" ? this.discovery() : this.discovery;
   }
 
-  async handleClaimCompletion(_req: Request, _session: OwnerSession): Promise<Response> {
-    throw new AFAuthError("malformed_request", 500, "Server.handleClaimCompletion not implemented");
+  // ----- Owner invitation (§7.2) -----
+
+  async handleOwnerInvitation(req: Request): Promise<Response> {
+    if (req.method !== "POST") {
+      throw new AFAuthError("malformed_request", 405, `method ${req.method} not allowed`);
+    }
+    const body = await req.text();
+    const verified = await this.verifier.verify({
+      method: req.method,
+      url: req.url,
+      headers: req.headers,
+      body: body === "" ? null : body,
+    });
+
+    let parsed: { recipient?: Recipient; email?: string; redirect_url?: string };
+    try {
+      parsed = JSON.parse(body) as typeof parsed;
+    } catch {
+      throw new AFAuthError("malformed_request", 400, "request body is not valid JSON");
+    }
+
+    // §7.2 backward-compat: bare `email` → typed recipient. Both
+    // forms together is an error (§7.2 normative).
+    let recipient: Recipient;
+    if (parsed.recipient && parsed.email) {
+      throw new AFAuthError(
+        "malformed_request",
+        400,
+        "request body MUST NOT contain both `recipient` and bare `email`",
+      );
+    } else if (parsed.recipient) {
+      recipient = parsed.recipient;
+    } else if (parsed.email) {
+      recipient = { type: "email", value: parsed.email };
+    } else {
+      throw new AFAuthError("malformed_request", 400, "request body missing `recipient`");
+    }
+
+    // §4.4: reject types not in the service's declared list.
+    const disc = await this.resolveDiscovery();
+    const declared = disc.recipient_types ?? ["email"];
+    if (!declared.includes(recipient.type)) {
+      throw new AFAuthError(
+        "unsupported_recipient_type",
+        400,
+        `recipient type "${recipient.type}" not in declared recipient_types`,
+      );
+    }
+    const handler = this.recipients[recipient.type];
+    if (!handler) {
+      throw new AFAuthError(
+        "unsupported_recipient_type",
+        400,
+        `no handler configured for recipient type "${recipient.type}"`,
+      );
+    }
+
+    // Implicit signup if the account doesn't yet exist (§6.3).
+    let account = await this.accounts.get(verified.agentDid);
+    if (!account) {
+      account = await this.accounts.createUnclaimed(verified.agentDid);
+    }
+    if (account.revoked) {
+      throw new AFAuthError("revoked_key", 401, "account key has been revoked");
+    }
+    if (account.state === "CLAIMED") {
+      throw new AFAuthError(
+        "already_claimed",
+        409,
+        "account is already claimed; further owner-invitation is post-claim policy",
+      );
+    }
+
+    const token = generateInvitationToken();
+    const expiresAt = new Date(Date.now() + this.invitationTtlSeconds * 1000).toISOString();
+    await this.accounts.setPendingInvitation(verified.agentDid, recipient, token, expiresAt);
+
+    // Compose the claim-page URL the recipient will be directed to.
+    const claimPageUrl = new URL(disc.endpoints.claim_page, this.baseUrl).toString();
+
+    // Fire the ceremony — the handler chooses how (email, SMS, OIDC, etc.).
+    await handler.initiate({
+      recipient,
+      claimToken: token,
+      claimPageUrl,
+      ...(parsed.redirect_url ? { redirectUrl: parsed.redirect_url } : {}),
+    });
+
+    return jsonResponse(
+      {
+        invitation_id: `inv_${token}`,
+        expires_at: expiresAt,
+        state: "INVITED",
+      },
+      202,
+    );
   }
+
+  // ----- Claim completion (§7.4) -----
+
+  async handleClaimCompletion(req: Request, session: OwnerSession): Promise<Response> {
+    if (req.method !== "POST") {
+      throw new AFAuthError("malformed_request", 405, `method ${req.method} not allowed`);
+    }
+    const url = new URL(req.url);
+    const segments = url.pathname.split("/").filter(Boolean);
+    const token = segments[segments.length - 1];
+    if (!token) {
+      throw new AFAuthError("malformed_request", 400, "claim token missing from URL path");
+    }
+
+    const account = await this.accounts.findByPendingToken(token);
+    if (!account || account.state !== "INVITED" || !account.pendingRecipient) {
+      // §11.3: invitation_not_found / invitation_expired use 410.
+      throw new AFAuthError(
+        "invitation_not_found",
+        410,
+        "invitation not found, expired, or already consumed",
+      );
+    }
+
+    const pending = account.pendingRecipient;
+    const handler = this.recipients[pending.type];
+    if (!handler) {
+      throw new AFAuthError(
+        "owner_authentication_required",
+        403,
+        `no handler configured for recipient type "${pending.type}"`,
+      );
+    }
+
+    // §7.7 match relation — the only place where service policy meets
+    // the §7.5 invariant. If this returns false the invitation stays
+    // pending (per §7.4) so the human can retry with a different IdP.
+    if (!handler.matches({ pending, authenticated: session.authenticated })) {
+      throw new AFAuthError(
+        "owner_authentication_required",
+        403,
+        "authenticated identity does not match pending recipient",
+      );
+    }
+
+    const claimedAt = new Date().toISOString();
+    const owner: NonNullable<Account["owner"]> = {
+      identity: pending,
+      userId: session.userId,
+      claimedAt,
+    };
+    const updated = await this.accounts.completeClaimByToken(token, owner);
+    if (!updated) {
+      // The token was consumed in the gap between findByPendingToken
+      // and completeClaimByToken — a benign race; report as expired.
+      throw new AFAuthError(
+        "invitation_expired",
+        410,
+        "invitation was consumed by another claim attempt",
+      );
+    }
+
+    return jsonResponse(
+      {
+        account_did: updated.did,
+        state: updated.state,
+        owner: {
+          identity: updated.owner!.identity,
+          user_id: updated.owner!.userId,
+          claimed_at: updated.owner!.claimedAt,
+        },
+      },
+      200,
+    );
+  }
+
+  // ----- Key rotation (§8.1) — M3 -----
 
   async handleKeyRotation(_req: Request): Promise<Response> {
-    throw new AFAuthError("malformed_request", 500, "Server.handleKeyRotation not implemented");
+    throw new AFAuthError("malformed_request", 501, "Server.handleKeyRotation lands in M3");
   }
 
-  async handleAccountIntrospection(_req: Request): Promise<Response> {
-    throw new AFAuthError("malformed_request", 500, "Server.handleAccountIntrospection not implemented");
+  // ----- Account introspection (§6.5) -----
+
+  async handleAccountIntrospection(req: Request): Promise<Response> {
+    if (req.method !== "GET") {
+      throw new AFAuthError("malformed_request", 405, `method ${req.method} not allowed`);
+    }
+    const verified = await this.verifier.verify({
+      method: req.method,
+      url: req.url,
+      headers: req.headers,
+      body: null,
+    });
+
+    // Implicit signup on first touch (§6.3).
+    let account = await this.accounts.get(verified.agentDid);
+    if (!account) {
+      account = await this.accounts.createUnclaimed(verified.agentDid);
+    }
+
+    // §7.2 / §13.2: agent-signed responses MUST NOT expose pending fields.
+    const body: Record<string, unknown> = {
+      account_did: account.did,
+      state: account.state,
+    };
+    if (account.owner) {
+      body.owner = {
+        identity: account.owner.identity,
+        user_id: account.owner.userId,
+        claimed_at: account.owner.claimedAt,
+      };
+    }
+    if (account.revoked) {
+      body.revoked = true;
+    }
+
+    return jsonResponse(body, 200);
   }
 }
