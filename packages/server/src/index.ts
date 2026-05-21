@@ -719,6 +719,106 @@ function extractEd25519FromDidDocument(doc: unknown, did: Did): Ed25519PublicKey
   );
 }
 
+// ---------- Rate limiter (§11.3 rate_limit_exceeded) ----------
+//
+// The protocol reserves `rate_limit_exceeded` (429) in §11.3 but takes
+// no position on policy. The interface below is intentionally minimal
+// — one `take(key, config)` returning a decision — so operators can
+// plug in production rate limiters (Redis token bucket, Durable
+// Object actor, Cloudflare Rate Limiting binding) without changing
+// the Server's call sites.
+//
+// Two reference impls land in v0.1: `MemoryRateLimiter` (single-process,
+// for tests + small examples) and `KvRateLimiter` in `@afauth/worker`
+// (fixed-window counter backed by Workers KV; best-effort across
+// isolates, sufficient for §11.3 enforcement).
+
+export interface RateLimitConfig {
+  /** Maximum events permitted per `windowSeconds`. */
+  limit: number;
+  /** Window length in seconds. */
+  windowSeconds: number;
+}
+
+export interface RateLimitDecision {
+  ok: boolean;
+  /**
+   * Seconds until the next slot becomes available. Populated when
+   * `ok` is false; the value drives the `Retry-After` header on the
+   * 429 response.
+   */
+  retryAfter?: number;
+  /** Slots remaining in the current window. */
+  remaining?: number;
+  /** Unix-second when the current window resets. */
+  resetAt?: number;
+}
+
+export interface RateLimiter {
+  /**
+   * Atomically consume one slot for `key` against `config`. Returns
+   * `{ ok: true }` when consumed; `{ ok: false, retryAfter }` when
+   * the limit has been hit.
+   *
+   * Implementations MAY over-count under racing isolates (fail-safe)
+   * but MUST NOT under-count — skipping takes during a race breaks
+   * the §11.3 contract.
+   */
+  take(key: string, config: RateLimitConfig): Promise<RateLimitDecision>;
+}
+
+/**
+ * Single-process fixed-window rate limiter. Suitable for tests and
+ * small single-instance deployments; horizontally-scaled deployments
+ * need a shared backend (e.g. `KvRateLimiter` in `@afauth/worker`).
+ */
+export class MemoryRateLimiter implements RateLimiter {
+  private readonly windows = new Map<string, { windowStart: number; count: number }>();
+  private readonly now: () => number;
+
+  constructor(opts: { now?: () => number } = {}) {
+    this.now = opts.now ?? (() => Math.floor(Date.now() / 1000));
+  }
+
+  async take(key: string, config: RateLimitConfig): Promise<RateLimitDecision> {
+    const nowSec = this.now();
+    let w = this.windows.get(key);
+    if (!w || w.windowStart + config.windowSeconds <= nowSec) {
+      w = { windowStart: nowSec, count: 0 };
+      this.windows.set(key, w);
+    }
+    const resetAt = w.windowStart + config.windowSeconds;
+    if (w.count >= config.limit) {
+      return {
+        ok: false,
+        retryAfter: Math.max(1, resetAt - nowSec),
+        remaining: 0,
+        resetAt,
+      };
+    }
+    w.count++;
+    return { ok: true, remaining: config.limit - w.count, resetAt };
+  }
+}
+
+/**
+ * Per-route rate-limit configuration on `ServerOptions.rateLimits`.
+ * Each route's key is the agent DID extracted from `keyid`. Routes
+ * without a config skip rate limiting.
+ */
+export interface ServerRateLimits {
+  /** §6.4 explicit signup (POST /accounts). Keyed by agent DID. */
+  accounts?: RateLimitConfig;
+  /** §6.5 account introspection (GET /accounts/me). Keyed by agent DID. */
+  account_introspection?: RateLimitConfig;
+  /** §7.2 owner invitation. Keyed by agent DID. */
+  owner_invitation?: RateLimitConfig;
+  /** §7.4 claim completion. Keyed by token (one shot per token). */
+  claim_completion?: RateLimitConfig;
+  /** §8.1 / §8.2 key rotation. Keyed by agent DID. */
+  key_rotation?: RateLimitConfig;
+}
+
 // ---------- Verifier (§5.5) ----------
 
 export interface VerifierOptions {
@@ -991,6 +1091,24 @@ export interface ServerOptions extends VerifierOptions {
    * for "only when implicit signup is disabled".
    */
   implicitSignup?: boolean;
+  /**
+   * Optional rate limiter. When supplied alongside `rateLimits`, each
+   * named route enforces its limit and returns `429 rate_limit_exceeded`
+   * (§11.3) with `Retry-After` when the limit is hit.
+   *
+   * The limiter check fires AFTER signature verification so unauthenticated
+   * traffic cannot burn budget, but BEFORE any account-state mutation
+   * so over-limit calls don't pollute the §6 state machine.
+   */
+  rateLimiter?: RateLimiter;
+  /**
+   * Per-route limit configs. Routes without an entry skip the check.
+   * The reference defaults (used if a config is supplied but no
+   * windowSeconds/limit is provided) are 60/hour for owner-invitation,
+   * 1000/hour for account introspection, 10/hour for explicit signup,
+   * 60/hour for key rotation.
+   */
+  rateLimits?: ServerRateLimits;
 }
 
 // Default invitation TTL: 24 hours (§7.3 says "service-defined";
@@ -1023,6 +1141,8 @@ export class Server {
   private readonly invitationTtlSeconds: number;
   private readonly redirectAllowList: ReadonlySet<string>;
   private readonly implicitSignup: boolean;
+  private readonly rateLimiter?: RateLimiter;
+  private readonly rateLimits: ServerRateLimits;
 
   constructor(opts: ServerOptions) {
     // Verifier already defaults a missing revocationList to
@@ -1039,6 +1159,33 @@ export class Server {
     this.invitationTtlSeconds = DEFAULT_INVITATION_TTL_SECONDS;
     this.redirectAllowList = new Set(opts.redirectAllowList ?? []);
     this.implicitSignup = opts.implicitSignup ?? true;
+    this.rateLimiter = opts.rateLimiter;
+    this.rateLimits = opts.rateLimits ?? {};
+  }
+
+  /**
+   * Per-route rate-limit gate. No-op when no limiter is configured or
+   * the route has no config. Throws `429 rate_limit_exceeded` (with
+   * `Retry-After`) when the limit is hit.
+   */
+  private async enforceRateLimit(
+    route: keyof ServerRateLimits,
+    key: string,
+  ): Promise<void> {
+    if (!this.rateLimiter) return;
+    const config = this.rateLimits[route];
+    if (!config) return;
+    const decision = await this.rateLimiter.take(`${route}:${key}`, config);
+    if (!decision.ok) {
+      const retryAfter = decision.retryAfter ?? config.windowSeconds;
+      throw new AFAuthError(
+        "rate_limit_exceeded",
+        429,
+        `rate limit for ${route} hit; retry in ${retryAfter}s`,
+        { retry_after: retryAfter, reset_at: decision.resetAt },
+        { "retry-after": String(retryAfter) },
+      );
+    }
   }
 
   // The Verifier is shared with handlers — exposed so the Worker layer
@@ -1111,6 +1258,7 @@ export class Server {
       headers: req.headers,
       body: body === "" ? null : body,
     });
+    await this.enforceRateLimit("owner_invitation", verified.agentDid);
 
     let parsed: { recipient?: Recipient; email?: string; redirect_url?: string };
     try {
@@ -1228,6 +1376,11 @@ export class Server {
     if (!token) {
       throw new AFAuthError("malformed_request", 400, "claim token missing from URL path");
     }
+    // §7.4: claim completion is one-shot per token. Rate-limit on the
+    // token itself to throttle brute-force token guessing (the token
+    // is 128 random bits so guessing is already infeasible, but this
+    // adds defense-in-depth against pathological retry loops).
+    await this.enforceRateLimit("claim_completion", token);
 
     const account = await this.accounts.findByPendingToken(token);
     if (!account || account.state !== "INVITED" || !account.pendingRecipient) {
@@ -1306,6 +1459,7 @@ export class Server {
       headers: req.headers,
       body: body === "" ? null : body,
     });
+    await this.enforceRateLimit("key_rotation", verified.agentDid);
 
     let parsed: { new_account_did?: string };
     try {
@@ -1407,12 +1561,16 @@ export class Server {
       headers: req.headers,
       body: null,
     });
+    await this.enforceRateLimit("account_introspection", verified.agentDid);
 
     let account = await this.accounts.get(verified.agentDid);
     if (!account) {
       if (!this.implicitSignup) {
         throw new AFAuthError("unknown_account", 404, "account does not exist (implicit signup disabled)");
       }
+      // Implicit signup also goes through the `accounts` rate-limit
+      // bucket since it creates an account row.
+      await this.enforceRateLimit("accounts", verified.agentDid);
       account = await this.accounts.createUnclaimed(verified.agentDid);
     }
 

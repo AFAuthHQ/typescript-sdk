@@ -16,6 +16,9 @@ import {
   Server,
   type NonceStore,
   type OwnerSession,
+  type RateLimitConfig,
+  type RateLimitDecision,
+  type RateLimiter,
   type RevocationList,
   type ServerOptions,
 } from "@afauth/server";
@@ -163,6 +166,61 @@ export class KvRevocationList implements RevocationList {
 
   async add(did: Did, revokedAt: string): Promise<void> {
     await this.namespace.put(`revoked:${did}`, revokedAt);
+  }
+}
+
+/**
+ * Cloudflare KV–backed rate limiter (§11.3). Fixed-window counter per
+ * key; KV's eventually-consistent reads mean racing isolates may
+ * over-count (fail-safe), never under-count.
+ *
+ * Storage layout: `ratelimit:<key>` → JSON `{ windowStart, count }`,
+ * with KV `expirationTtl = windowSeconds + 60` so old buckets evict
+ * automatically. The 60-second buffer absorbs clock skew between
+ * isolates without leaking stale buckets.
+ */
+export class KvRateLimiter implements RateLimiter {
+  constructor(
+    private readonly namespace: KVNamespace,
+    private readonly opts: { now?: () => number } = {},
+  ) {}
+
+  private now(): number {
+    return this.opts.now ? this.opts.now() : Math.floor(Date.now() / 1000);
+  }
+
+  async take(key: string, config: RateLimitConfig): Promise<RateLimitDecision> {
+    const storageKey = `ratelimit:${key}`;
+    const nowSec = this.now();
+    const existing = await this.namespace.get(storageKey, "json") as
+      | { windowStart: number; count: number }
+      | null;
+
+    let windowStart: number;
+    let count: number;
+    if (!existing || existing.windowStart + config.windowSeconds <= nowSec) {
+      windowStart = nowSec;
+      count = 0;
+    } else {
+      windowStart = existing.windowStart;
+      count = existing.count;
+    }
+    const resetAt = windowStart + config.windowSeconds;
+    if (count >= config.limit) {
+      return {
+        ok: false,
+        retryAfter: Math.max(1, resetAt - nowSec),
+        remaining: 0,
+        resetAt,
+      };
+    }
+    count++;
+    // KV expirationTtl MUST be ≥ 60s; clamp accordingly.
+    const ttl = Math.max(60, config.windowSeconds + 60);
+    await this.namespace.put(storageKey, JSON.stringify({ windowStart, count }), {
+      expirationTtl: ttl,
+    });
+    return { ok: true, remaining: config.limit - count, resetAt };
   }
 }
 

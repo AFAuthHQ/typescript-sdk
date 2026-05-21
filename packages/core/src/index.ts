@@ -460,13 +460,25 @@ export class AFAuthError extends Error {
   readonly code: AFAuthErrorCode;
   readonly status: number;
   readonly details?: unknown;
+  /**
+   * Additional headers to attach when serialising via `toResponse()`.
+   * Used by rate-limit rejections to surface `Retry-After`. Optional.
+   */
+  readonly extraHeaders?: Record<string, string>;
 
-  constructor(code: AFAuthErrorCode, status: number, message: string, details?: unknown) {
+  constructor(
+    code: AFAuthErrorCode,
+    status: number,
+    message: string,
+    details?: unknown,
+    extraHeaders?: Record<string, string>,
+  ) {
     super(message);
     this.name = "AFAuthError";
     this.code = code;
     this.status = status;
     this.details = details;
+    this.extraHeaders = extraHeaders;
   }
 
   /** Serialises to a §11.1 error envelope Response. */
@@ -475,9 +487,11 @@ export class AFAuthError extends Error {
       error: { code: this.code, message: this.message },
     };
     if (this.details !== undefined) body.error.details = this.details;
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    if (this.extraHeaders) Object.assign(headers, this.extraHeaders);
     return new Response(JSON.stringify(body), {
       status: this.status,
-      headers: { "content-type": "application/json" },
+      headers,
     });
   }
 }
