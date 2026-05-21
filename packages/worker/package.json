@@ -1,7 +1,7 @@
 {
   "name": "@afauthhq/worker",
-  "version": "0.1.0-alpha.0",
-  "description": "AFAuth Cloudflare Workers bindings — createWorker, KvNonceStore",
+  "version": "0.1.0",
+  "description": "AFAuth Cloudflare Workers bindings — createWorker, DurableObjectNonceStore, KvNonceStore, D1AccountStore",
   "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",

@@ -137,7 +137,36 @@ export function createWorker(opts: WorkerOptions): ExportedHandler {
   } satisfies ExportedHandler;
 }
 
-/** Cloudflare KV–backed nonce store; uses KV TTL for §5.6 expiry. */
+/**
+ * Cloudflare KV–backed nonce store; uses KV TTL for §5.6 expiry.
+ *
+ * !!! KNOWN LIMITATION — eventual consistency.
+ *
+ * KV does not expose an atomic check-and-set primitive. This impl
+ * performs `get` then `put`; under racing isolates two concurrent
+ * verifications of the same `(keyid, nonce)` tuple within the
+ * freshness window can both observe `existing === null`, both write,
+ * and both return `true`. §5.6 normatively requires the seen-nonce
+ * set be shared across instances *with* atomic insertion; KV only
+ * satisfies the first half.
+ *
+ * Practical effect: an attacker who can fan out the same signed
+ * request to multiple Cloudflare edge regions in &lt; ~10 seconds may
+ * be able to replay once. This window is bounded by the signature's
+ * `expires` parameter (≤ 300s per §5.2; the SDK's default is 60s),
+ * and by Cloudflare KV's typical cross-region propagation time.
+ *
+ * For deployments where this risk matters — anything with real value
+ * behind the signature — use {@link DurableObjectNonceStore} instead.
+ * A Durable Object actor serializes all `seen()` calls for a given
+ * partition key and gives spec-compliant atomic check-and-set.
+ *
+ * `KvNonceStore` ships for use cases where the trade-off is
+ * acceptable: low-value endpoints, dev-only deployments, or
+ * deployments behind a single Cloudflare region. The default
+ * reference Worker (`examples/worker`) prefers DO when its binding
+ * is configured.
+ */
 export class KvNonceStore implements NonceStore {
   constructor(private readonly namespace: KVNamespace) {}
 
@@ -150,6 +179,139 @@ export class KvNonceStore implements NonceStore {
     await this.namespace.put(key, "1", { expirationTtl: ttl });
     return true;
   }
+}
+
+/**
+ * Durable Object–backed nonce store. Spec-compliant atomic insert.
+ *
+ * Architecture: the caller has a single Durable Object namespace
+ * binding (e.g. `env.AFAUTH_NONCE_DO`). For each request, the store
+ * picks a partition key — by default the agent's `keyid` — and looks
+ * up the corresponding DO actor via `idFromName(partition)`. The DO
+ * serializes all `seen()` calls for its partition, performing the
+ * check-and-set against its private DO storage atomically.
+ *
+ *   import { createNonceDurableObject } from "@afauthhq/worker";
+ *   export class AFAuthNonceDO extends createNonceDurableObject() {}
+ *
+ *   const store = new DurableObjectNonceStore(env.AFAUTH_NONCE_DO);
+ *
+ * Wire up in `wrangler.toml`:
+ *
+ *   [[durable_objects.bindings]]
+ *   name = "AFAUTH_NONCE_DO"
+ *   class_name = "AFAuthNonceDO"
+ *
+ *   [[migrations]]
+ *   tag = "v1"
+ *   new_classes = ["AFAuthNonceDO"]
+ *
+ * Per-keyid partitioning bounds DO actor scope and lets the request
+ * path fan out across multiple actors for unrelated agents. Sticky
+ * routing on a single agent's nonces ensures serialization.
+ */
+export class DurableObjectNonceStore implements NonceStore {
+  constructor(private readonly namespace: DurableObjectNamespace) {}
+
+  async seen(keyid: Did, nonce: string, ttlSeconds: number): Promise<boolean> {
+    const id = this.namespace.idFromName(`nonce:${keyid}`);
+    const stub = this.namespace.get(id);
+    const url = `https://nonce.invalid/seen?nonce=${encodeURIComponent(nonce)}&ttl=${Math.max(1, Math.ceil(ttlSeconds))}`;
+    const resp = await stub.fetch(url, { method: "POST" });
+    if (!resp.ok) {
+      throw new Error(`DurableObjectNonceStore: actor returned HTTP ${resp.status}`);
+    }
+    const body = (await resp.json()) as { fresh?: boolean };
+    return body.fresh === true;
+  }
+}
+
+/**
+ * Returns a base class for the AFAuth nonce Durable Object. Users
+ * declare their concrete class by extending it; the runtime provides
+ * the persistent storage and serializes `fetch` calls for the actor.
+ *
+ *   export class AFAuthNonceDO extends createNonceDurableObject() {}
+ *
+ * The DO answers a single internal request shape used by
+ * {@link DurableObjectNonceStore}:
+ *
+ *   POST https://nonce.invalid/seen?nonce=&lt;value&gt;&ttl=&lt;seconds&gt;
+ *
+ * It performs an atomic check-and-set against its private storage
+ * and returns `{ fresh: boolean }`. Storage entries auto-expire via
+ * the DO's `alarm()` callback, which sweeps any nonces whose stored
+ * `expiresAt` has elapsed.
+ */
+export function createNonceDurableObject(): new (
+  state: DurableObjectState,
+  env: unknown,
+) => DurableObject {
+  return class AFAuthNonceDOBase implements DurableObject {
+    constructor(private readonly state: DurableObjectState) {}
+
+    async fetch(req: Request): Promise<Response> {
+      const url = new URL(req.url);
+      if (url.pathname !== "/seen" || req.method !== "POST") {
+        return new Response("not found", { status: 404 });
+      }
+      const nonce = url.searchParams.get("nonce");
+      const ttlRaw = url.searchParams.get("ttl");
+      if (!nonce || !ttlRaw) {
+        return new Response(JSON.stringify({ error: "missing nonce or ttl" }), {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      const ttl = Math.max(1, Number.parseInt(ttlRaw, 10) || 0);
+      const nowSec = Math.floor(Date.now() / 1000);
+      const key = `n:${nonce}`;
+      // blockConcurrencyWhile serializes against other actor work;
+      // since the DO is single-threaded per partition, this is the
+      // §5.6 atomic check-and-set guarantee.
+      return this.state.blockConcurrencyWhile(async () => {
+        const existing = await this.state.storage.get<number>(key);
+        if (existing !== undefined && existing > nowSec) {
+          return new Response(JSON.stringify({ fresh: false }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        await this.state.storage.put(key, nowSec + ttl);
+        await this.scheduleSweep(nowSec + ttl);
+        return new Response(JSON.stringify({ fresh: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      });
+    }
+
+    /** alarm() handler — sweeps expired entries opportunistically. */
+    async alarm(): Promise<void> {
+      const nowSec = Math.floor(Date.now() / 1000);
+      const all = await this.state.storage.list<number>();
+      const toDelete: string[] = [];
+      let nextAlarm = Number.POSITIVE_INFINITY;
+      for (const [k, expiresAt] of all) {
+        if (typeof expiresAt !== "number") continue;
+        if (expiresAt <= nowSec) toDelete.push(k);
+        else if (expiresAt < nextAlarm) nextAlarm = expiresAt;
+      }
+      if (toDelete.length > 0) await this.state.storage.delete(toDelete);
+      if (Number.isFinite(nextAlarm)) {
+        await this.state.storage.setAlarm(nextAlarm * 1000);
+      }
+    }
+
+    private async scheduleSweep(expiresAtSec: number): Promise<void> {
+      const current = await this.state.storage.getAlarm();
+      // Only set if no alarm is pending or the new alarm is sooner.
+      const targetMs = expiresAtSec * 1000;
+      if (current === null || targetMs < current) {
+        await this.state.storage.setAlarm(targetMs);
+      }
+    }
+  };
 }
 
 /**

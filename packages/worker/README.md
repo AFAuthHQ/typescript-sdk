@@ -1,21 +1,31 @@
 # `@afauthhq/worker`
 
 Cloudflare Workers bindings for the AFAuth Protocol. Wraps
-`@afauthhq/server` in a Worker-native router and provides KV-backed
-storage implementations.
+`@afauthhq/server` in a Worker-native router and provides storage
+implementations backed by Durable Objects, KV, and D1.
 
 ## Quickstart
 
 ```typescript
-import { createWorker, KvNonceStore, KvRevocationList } from "@afauthhq/worker";
+import {
+  AFAuthNonceDO,
+  createNonceDurableObject,
+  createWorker,
+  DurableObjectNonceStore,
+  KvRevocationList,
+} from "@afauthhq/worker";
 import {
   consoleEmailHandler,
   MemoryAccountStore,
   type DiscoveryDocument,
 } from "@afauthhq/server";
 
+// Re-export the nonce DO base class under whatever class_name your
+// wrangler.toml binding declares (default: `AFAuthNonceDO`).
+export class AFAuthNonceDO extends createNonceDurableObject() {}
+
 interface Env {
-  AFAUTH_NONCES: KVNamespace;
+  AFAUTH_NONCE_DO: DurableObjectNamespace;
   AFAUTH_REVOCATIONS: KVNamespace;
 }
 
@@ -25,7 +35,7 @@ const accounts = new MemoryAccountStore(); // replace with durable impl
 export default {
   fetch(req, env: Env, ctx) {
     const handler = createWorker({
-      nonceStore: new KvNonceStore(env.AFAUTH_NONCES),
+      nonceStore: new DurableObjectNonceStore(env.AFAUTH_NONCE_DO),
       revocationList: new KvRevocationList(env.AFAUTH_REVOCATIONS),
       serviceDid: discovery.service_did,
       accounts,
@@ -39,13 +49,49 @@ export default {
 };
 ```
 
+`wrangler.toml` binding for the DO:
+
+```toml
+[[durable_objects.bindings]]
+name       = "AFAUTH_NONCE_DO"
+class_name = "AFAuthNonceDO"
+
+[[migrations]]
+tag         = "v1"
+new_classes = ["AFAuthNonceDO"]
+```
+
+## Nonce store: pick DO, not KV
+
+§5.6 requires the seen-nonce set be **shared and atomic** across
+verifier instances. Cloudflare KV is shared but offers no atomic
+check-and-set: a `get`-then-`put` window admits cross-isolate
+replay during the freshness window.
+
+| Store | Atomic? | Shared? | When to use |
+|---|---|---|---|
+| `DurableObjectNonceStore` | **yes** | yes | **recommended for production** |
+| `KvNonceStore` | no | yes | dev only, or single-region low-value deployments where the trade-off is documented |
+| `MemoryNonceStore` (from `@afauthhq/server`) | yes | no | tests only |
+
+`DurableObjectNonceStore` partitions by `keyid` so unrelated agents
+fan out across distinct actor instances; only requests from the same
+agent share an actor and serialize against each other.
+
 ## Exports
 
-- **`createWorker(opts)`** — returns an `ExportedHandler` routing
-  the five AFAuth endpoints to `@afauthhq/server` handlers. Routing is
+- **`createWorker(opts)`** — returns an `ExportedHandler` routing the
+  five AFAuth endpoints to `@afauthhq/server` handlers. Routing is
   done with a small in-house router (ADR-0002).
-- **`KvNonceStore`** — `NonceStore` backed by Cloudflare KV (§5.6).
-  Uses KV `expirationTtl`; floored to KV's 60s minimum.
+- **`createNonceDurableObject()`** — factory that returns a
+  Durable-Object base class implementing the §5.6 atomic
+  check-and-set protocol. Subclass it in your Worker module and
+  register the subclass in `wrangler.toml`.
+- **`DurableObjectNonceStore`** — `NonceStore` that delegates to the
+  DO above. Spec-compliant atomic insert; recommended for production.
+- **`KvNonceStore`** — `NonceStore` backed by Cloudflare KV. Has a
+  known eventual-consistency replay window; see the JSDoc on the
+  class. Suitable for dev/low-value deployments only.
 - **`KvRevocationList`** — `RevocationList` backed by Cloudflare KV
   (§8.3). Durable; no TTL.
 - **`KvRateLimiter`** — `RateLimiter` backed by Cloudflare KV
@@ -68,4 +114,5 @@ export default {
 - [`@afauthhq/server`](../server/) — the handlers `createWorker`
   dispatches to.
 - [`examples/worker/`](../../examples/worker/) — runnable reference
-  Worker.
+  Worker that prefers DO when its binding is configured and falls
+  back to KV (with a warning) otherwise.

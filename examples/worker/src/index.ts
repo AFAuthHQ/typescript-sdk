@@ -29,14 +29,31 @@ import {
   type OwnerSession,
 } from "@afauthhq/server";
 import {
+  createNonceDurableObject,
   createWorker,
   D1AccountStore,
+  DurableObjectNonceStore,
   KvNonceStore,
   KvRevocationList,
 } from "@afauthhq/worker";
 
+// The §5.6 atomic nonce store is the Durable Object actor below.
+// Export it so wrangler can register the class under the binding name
+// declared in `wrangler.toml` ([[durable_objects.bindings]]).
+export class AFAuthNonceDO extends createNonceDurableObject() {}
+
 interface Env {
-  /** Optional Cloudflare KV namespace for the production nonce store. */
+  /**
+   * Recommended: Durable Object binding for the §5.6 atomic nonce
+   * store. When set, the worker uses `DurableObjectNonceStore` which
+   * provides spec-compliant atomic check-and-set for replay defence.
+   */
+  AFAUTH_NONCE_DO?: DurableObjectNamespace;
+  /**
+   * Fallback: Cloudflare KV namespace for the nonce store. KV is
+   * eventually consistent — see the `KvNonceStore` JSDoc for the
+   * known replay window. Prefer `AFAUTH_NONCE_DO` for production.
+   */
   AFAUTH_NONCES?: KVNamespace;
   /** Optional Cloudflare KV namespace for the §8.3 revocation list. */
   AFAUTH_REVOCATIONS?: KVNamespace;
@@ -53,6 +70,13 @@ interface Env {
   SERVICE_DID?: string;
   /** Base URL of this Worker; used to compose claim-page URLs. */
   BASE_URL?: string;
+  /**
+   * Opt-in toggle for the demo-only X-Owner-Session extractor below.
+   * MUST be left undefined in production; setting it to "true" enables
+   * a trivially forgeable header path that should ONLY be used while
+   * developing the claim page locally. See `extractOwnerSession`.
+   */
+  AFAUTH_DEV_TRUST_HEADER?: string;
 }
 
 const DEFAULT_BASE_URL = "https://example.com";
@@ -86,28 +110,34 @@ function selectAccountStore(env: Env): AccountStore {
 }
 
 /**
- * Header-based owner session for the example.
+ * Owner-session extractor for the reference Worker.
  *
- * !!! SECURITY: DEMO-ONLY. The X-Owner-Session header is trivially
- * !!! forgeable by anyone who can reach this Worker. A real deployment
- * !!! MUST replace this function with one that verifies an
- * !!! authenticated session (signed cookie, IdP-issued JWT with
- * !!! signature check, etc.). Treat this stub as the contract surface,
- * !!! not the implementation.
+ * DEFAULT BEHAVIOUR: returns `null` so the §7.4 claim-completion path
+ * fails closed with `401 owner_authentication_required`. A real
+ * deployment replaces this function with one that verifies an
+ * authenticated session (signed cookie, IdP-issued JWT, etc.).
  *
- * The claim page passes the authenticated identity as JSON in an
- * `X-Owner-Session` header:
+ * DEMO ESCAPE HATCH (gated): when the env var `AFAUTH_DEV_TRUST_HEADER`
+ * is set to the literal string `"true"`, this function will accept an
+ * `X-Owner-Session` header carrying a JSON-encoded `OwnerSession`. The
+ * header is trivially forgeable by anyone who can reach the Worker, so
+ * the gate exists only to make local end-to-end testing possible
+ * without a real auth layer. NEVER set this var in production.
  *
  *   X-Owner-Session: {"authenticated":{"type":"email","value":"alice@example.com"},"userId":"usr_alice"}
  */
-async function extractOwnerSession(req: Request): Promise<OwnerSession | null> {
-  const raw = req.headers.get("x-owner-session");
-  if (!raw) return null;
-  try {
-    return JSON.parse(raw) as OwnerSession;
-  } catch {
-    return null;
-  }
+function makeExtractOwnerSession(env: Env) {
+  const trustHeader = env.AFAUTH_DEV_TRUST_HEADER === "true";
+  return async function extractOwnerSession(req: Request): Promise<OwnerSession | null> {
+    if (!trustHeader) return null;
+    const raw = req.headers.get("x-owner-session");
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as OwnerSession;
+    } catch {
+      return null;
+    }
+  };
 }
 
 // Process-wide revocation list (in-memory) used when no KV binding is
@@ -115,12 +145,19 @@ async function extractOwnerSession(req: Request): Promise<OwnerSession | null> {
 // list survives isolate recycling.
 const memoryRevocationList = new MemoryRevocationList();
 
+function selectNonceStore(env: Env) {
+  // Prefer DO (atomic) → KV (eventually consistent) → Memory (dev).
+  if (env.AFAUTH_NONCE_DO) return new DurableObjectNonceStore(env.AFAUTH_NONCE_DO);
+  if (env.AFAUTH_NONCES) return new KvNonceStore(env.AFAUTH_NONCES);
+  return new MemoryNonceStore();
+}
+
 const exportedHandler: ExportedHandler<Env> = {
   fetch(req, env, ctx) {
     const discovery = buildDiscovery(env);
     const baseUrl = env.BASE_URL ?? DEFAULT_BASE_URL;
     const handler = createWorker({
-      nonceStore: env.AFAUTH_NONCES ? new KvNonceStore(env.AFAUTH_NONCES) : new MemoryNonceStore(),
+      nonceStore: selectNonceStore(env),
       revocationList: env.AFAUTH_REVOCATIONS
         ? new KvRevocationList(env.AFAUTH_REVOCATIONS)
         : memoryRevocationList,
@@ -129,7 +166,7 @@ const exportedHandler: ExportedHandler<Env> = {
       recipients: { email: consoleEmailHandler },
       discovery,
       baseUrl,
-      extractOwnerSession,
+      extractOwnerSession: makeExtractOwnerSession(env),
     });
     return handler.fetch!(req, env, ctx);
   },

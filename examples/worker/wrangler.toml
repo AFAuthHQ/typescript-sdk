@@ -2,11 +2,22 @@ name = "afauth-example-worker"
 main = "src/index.ts"
 compatibility_date = "2024-09-01"
 
-# Uncomment to provision a KV namespace for the production nonce store.
+# RECOMMENDED: Durable Object binding for the §5.6 atomic nonce store.
+# The class `AFAuthNonceDO` is exported from src/index.ts.
+# [[durable_objects.bindings]]
+# name       = "AFAUTH_NONCE_DO"
+# class_name = "AFAuthNonceDO"
+#
+# [[migrations]]
+# tag         = "v1"
+# new_classes = ["AFAuthNonceDO"]
+
+# Fallback: KV-backed nonce store (eventually consistent — see
+# KvNonceStore JSDoc for the known replay window).
 # Run `wrangler kv namespace create AFAUTH_NONCES` first.
 # [[kv_namespaces]]
 # binding = "AFAUTH_NONCES"
-# id = "<paste the namespace id here>"
+# id      = "<paste the namespace id here>"
 
 [vars]
 SERVICE_DID = "did:web:example.com"
