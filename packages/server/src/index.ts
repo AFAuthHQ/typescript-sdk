@@ -450,16 +450,33 @@ export interface VerifiedRequest {
   body: string | null;
 }
 
+let warnedAboutDefaultRevocationList = false;
+
 export class Verifier {
   private readonly nonceStore: NonceStore;
-  private readonly revocationList: RevocationList | undefined;
+  private readonly revocationList: RevocationList;
   private readonly clockSkew: number;
   private readonly maxLifetime: number;
   private readonly now: () => number;
 
   constructor(opts: VerifierOptions) {
     this.nonceStore = opts.nonceStore;
-    this.revocationList = opts.revocationList;
+    if (opts.revocationList) {
+      this.revocationList = opts.revocationList;
+    } else {
+      // §8.3 requires services to maintain a local revocation list.
+      // Default to an in-memory list so the Verifier always honours
+      // revocation; warn once so production deployments without a
+      // durable list don't silently rely on the in-process default.
+      this.revocationList = new MemoryRevocationList();
+      if (!warnedAboutDefaultRevocationList) {
+        warnedAboutDefaultRevocationList = true;
+        // eslint-disable-next-line no-console
+        console.warn(
+          "[afauth] No revocationList configured on Verifier/Server. Defaulting to MemoryRevocationList (process-local; lost on restart). Configure VerifierOptions.revocationList for production deployments.",
+        );
+      }
+    }
     this.clockSkew = opts.clockSkewSeconds ?? 5;
     this.maxLifetime = opts.maxSignatureLifetimeSeconds ?? 300;
     this.now = opts.now ?? (() => Math.floor(Date.now() / 1000));
@@ -488,7 +505,7 @@ export class Verifier {
     // verification cycles. Revocation status is not secret —
     // services may publish their lists per §8.3 — so the timing
     // signal is acceptable.
-    if (this.revocationList && (await this.revocationList.isRevoked(params.keyid))) {
+    if (await this.revocationList.isRevoked(params.keyid)) {
       throw new AFAuthError("revoked_key", 401, "account key has been revoked");
     }
 
@@ -634,18 +651,23 @@ export class Server {
   private readonly recipients: ServerOptions["recipients"];
   private readonly discovery: ServerOptions["discovery"];
   private readonly baseUrl: string;
-  private readonly revocationList: RevocationList | undefined;
+  private readonly revocationList: RevocationList;
   private readonly invitationTtlSeconds: number;
   private readonly redirectAllowList: ReadonlySet<string>;
   private readonly implicitSignup: boolean;
 
   constructor(opts: ServerOptions) {
-    this.verifier = new Verifier(opts);
+    // Verifier already defaults a missing revocationList to
+    // MemoryRevocationList (with a one-time warning); reuse the same
+    // instance here so handleKeyRotation and revoke() write into the
+    // list the Verifier reads from.
+    const revocationList = opts.revocationList ?? new MemoryRevocationList();
+    this.verifier = new Verifier({ ...opts, revocationList });
     this.accounts = opts.accounts;
     this.recipients = opts.recipients;
     this.discovery = opts.discovery;
     this.baseUrl = opts.baseUrl;
-    this.revocationList = opts.revocationList;
+    this.revocationList = revocationList;
     this.invitationTtlSeconds = DEFAULT_INVITATION_TTL_SECONDS;
     this.redirectAllowList = new Set(opts.redirectAllowList ?? []);
     this.implicitSignup = opts.implicitSignup ?? true;
@@ -961,7 +983,7 @@ export class Server {
     await this.accounts.rotateKey(verified.agentDid, newDid, rotatedAt);
     // §8.3: register the old DID on the local revocation list so
     // subsequent requests signed by the old key are rejected.
-    await this.revocationList?.add(verified.agentDid, rotatedAt);
+    await this.revocationList.add(verified.agentDid, rotatedAt);
 
     return jsonResponse(
       {
@@ -981,9 +1003,12 @@ export class Server {
    * the owner is authenticated; this method performs the storage-level
    * mutation and updates the revocation list.
    *
-   * §8.4 scopes owner-initiated revocation to CLAIMED accounts; this
-   * method also accepts pre-claim revocations for service-driven
-   * abuse handling (the spec does not forbid this).
+   * Note: §8.4 ("The owner of a CLAIMED account MAY revoke …")
+   * describes the owner-driven use case. This method intentionally
+   * accepts any account state so services can also use it for
+   * abuse-driven revocation. Production services should restrict
+   * access to this method to owner-authenticated callers (for §8.4)
+   * or to abuse-handling staff (for service-driven revocation).
    */
   async revoke(did: Did): Promise<void> {
     const account = await this.accounts.get(did);
@@ -992,7 +1017,7 @@ export class Server {
     }
     const revokedAt = new Date().toISOString();
     await this.accounts.revoke(did, revokedAt);
-    await this.revocationList?.add(did, revokedAt);
+    await this.revocationList.add(did, revokedAt);
   }
 
   // ----- Account introspection (§6.5) -----

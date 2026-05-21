@@ -65,13 +65,19 @@ function buildDiscovery(env: Env): DiscoveryDocument {
 const accounts = new MemoryAccountStore();
 
 /**
- * Header-based owner session for the example. The claim page passes the
- * authenticated identity as JSON in an `X-Owner-Session` header:
+ * Header-based owner session for the example.
+ *
+ * !!! SECURITY: DEMO-ONLY. The X-Owner-Session header is trivially
+ * !!! forgeable by anyone who can reach this Worker. A real deployment
+ * !!! MUST replace this function with one that verifies an
+ * !!! authenticated session (signed cookie, IdP-issued JWT with
+ * !!! signature check, etc.). Treat this stub as the contract surface,
+ * !!! not the implementation.
+ *
+ * The claim page passes the authenticated identity as JSON in an
+ * `X-Owner-Session` header:
  *
  *   X-Owner-Session: {"authenticated":{"type":"email","value":"alice@example.com"},"userId":"usr_alice"}
- *
- * A real deployment replaces this with the session shape its own auth
- * system produces — typically a parsed cookie or IdP-issued JWT.
  */
 async function extractOwnerSession(req: Request): Promise<OwnerSession | null> {
   const raw = req.headers.get("x-owner-session");

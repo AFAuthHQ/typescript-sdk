@@ -16,6 +16,7 @@
   "scripts": {
     "build": "tsup src/index.ts --format esm --dts --clean",
     "test": "vitest run --passWithNoTests",
+    "coverage": "vitest run --coverage --passWithNoTests",
     "lint": "echo TODO: configure lint",
     "typecheck": "tsc --noEmit"
   },
