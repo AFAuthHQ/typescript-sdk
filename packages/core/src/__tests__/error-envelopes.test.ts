@@ -38,8 +38,8 @@ function loadErrorVectors(): ErrorVector[] {
 describe("§C.5 error-envelope vectors", () => {
   const vectors = loadErrorVectors();
 
-  it("covers all 17 §11.3 reserved codes", () => {
-    expect(vectors.length).toBe(17);
+  it("covers all 18 §11.3 reserved codes (17 normative + AFAP-0002 reservation)", () => {
+    expect(vectors.length).toBe(18);
   });
 
   for (const v of vectors) {

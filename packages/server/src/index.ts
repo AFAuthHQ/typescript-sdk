@@ -598,6 +598,15 @@ export class Verifier {
 export interface OwnerSession {
   authenticated: Recipient;
   userId: string;
+  /**
+   * ISO-8601 timestamp of the most recent authentication event this
+   * session evidences. Optional for backward compatibility; required
+   * by AFAP-0002's §7.5 freshness floor — handlers that gate
+   * owner-binding operations on freshness MUST reject sessions
+   * whose `authenticatedAt` is older than the configured window
+   * with `owner_session_too_stale` (403).
+   */
+  authenticatedAt?: string;
 }
 
 // DiscoveryDocument is defined in @afauth/core (single source of truth)
