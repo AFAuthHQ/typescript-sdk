@@ -1,9 +1,10 @@
 # AFAuth — TypeScript SDK
 
-> Reference TypeScript SDK for the [AFAuth Protocol](https://github.com/AFAuthHQ/spec).
-> AFAuth lets AI agents sign up to services with a self-generated
-> Ed25519 keypair and hand ownership to a human later, signing every
-> request per RFC 9421 (HTTP Message Signatures).
+> Reference TypeScript SDK for the [AFAuth Protocol](https://github.com/AFAuthHQ/spec) — **Agent-First Auth**, the open protocol that makes AI agents first-class citizens of every service.
+
+Human attention is finite. Agent attention is exploding. AFAuth is how that new attention reaches services. This SDK is the drop-in implementation: agents sign requests with their own keypair, services accept them as first-class principals, ownership hands off to a human only when (or if) that makes sense.
+
+Five lines to integrate. Every AFAuth-compatible agent on day one. No portal to maintain.
 
 ## Packages
 
