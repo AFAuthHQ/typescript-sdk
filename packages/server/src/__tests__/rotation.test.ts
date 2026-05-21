@@ -1,0 +1,307 @@
+/**
+ * M3 conformance: pre-claim key rotation + revocation.
+ *
+ * Conformance gate (per scope doc):
+ *   "regression test: post-rotation signature with old key returns
+ *    401 revoked_key"
+ *
+ * Plus §8.4 owner-initiated revocation and the storage invariants
+ * around rotation while INVITED / CLAIMED.
+ */
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Agent } from "@afauth/agent";
+import type { Recipient } from "@afauth/core";
+import {
+  consoleEmailHandler,
+  MemoryAccountStore,
+  MemoryNonceStore,
+  MemoryRevocationList,
+  Server,
+  type DiscoveryDocument,
+} from "../index.js";
+
+const BASE_URL = "https://api.example.com";
+
+const DISCOVERY: DiscoveryDocument = {
+  afauth_version: "0.1",
+  service_did: "did:web:api.example.com",
+  endpoints: {
+    accounts: "/afauth/v1/accounts",
+    owner_invitation: "/afauth/v1/accounts/me/owner-invitation",
+    claim_page: "/claim",
+    claim_completion: "/afauth/v1/claim",
+    key_rotation: "/afauth/v1/accounts/me/keys/rotate",
+  },
+  signature_algorithms: ["ed25519"],
+  features: ["key_rotation"],
+  recipient_types: ["email"],
+};
+
+function buildServer() {
+  const accounts = new MemoryAccountStore();
+  const revocationList = new MemoryRevocationList();
+  const server = new Server({
+    nonceStore: new MemoryNonceStore(),
+    serviceDid: DISCOVERY.service_did,
+    accounts,
+    revocationList,
+    recipients: { email: consoleEmailHandler },
+    discovery: DISCOVERY,
+    baseUrl: BASE_URL,
+  });
+  return { server, accounts, revocationList };
+}
+
+async function toRequest(signed: {
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  body: string | null;
+}): Promise<Request> {
+  const init: RequestInit = { method: signed.method, headers: signed.headers };
+  if (signed.body !== null) init.body = signed.body;
+  return new Request(signed.url, init);
+}
+
+describe("M3 pre-claim key rotation (§8.1)", () => {
+  it("agent rotates from old DID to new DID; account uses new DID afterward", async () => {
+    const { server, accounts } = buildServer();
+    const oldAgent = await Agent.generate();
+    const newAgent = await Agent.generate();
+
+    // Implicit signup via introspection so an account exists.
+    const introspection = await oldAgent.buildAccountIntrospection({ baseUrl: BASE_URL });
+    await server.handleAccountIntrospection(await toRequest(introspection));
+
+    // Rotate.
+    const rotation = await oldAgent.buildKeyRotation({ baseUrl: BASE_URL, newDid: newAgent.did });
+    const resp = await server.handleKeyRotation(await toRequest(rotation));
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as { account_did: string; old_revoked_at: string };
+    expect(body.account_did).toBe(newAgent.did);
+    expect(body.old_revoked_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+
+    // Account is now under the new DID; old DID is gone.
+    expect(await accounts.get(oldAgent.did)).toBeNull();
+    const updated = await accounts.get(newAgent.did);
+    expect(updated?.state).toBe("UNCLAIMED");
+  });
+
+  it("conformance gate: old key signed request after rotation → 401 revoked_key", async () => {
+    const { server } = buildServer();
+    const oldAgent = await Agent.generate();
+    const newAgent = await Agent.generate();
+
+    // Sign up + rotate.
+    await server.handleAccountIntrospection(
+      await toRequest(await oldAgent.buildAccountIntrospection({ baseUrl: BASE_URL })),
+    );
+    await server.handleKeyRotation(
+      await toRequest(await oldAgent.buildKeyRotation({ baseUrl: BASE_URL, newDid: newAgent.did })),
+    );
+
+    // Sign a fresh request with the OLD key — should be rejected.
+    const stale = await oldAgent.buildAccountIntrospection({ baseUrl: BASE_URL });
+    await expect(server.handleAccountIntrospection(await toRequest(stale))).rejects.toMatchObject({
+      code: "revoked_key",
+      status: 401,
+    });
+  });
+
+  it("post-rotation: new key signed request succeeds and returns new account", async () => {
+    const { server } = buildServer();
+    const oldAgent = await Agent.generate();
+    const newAgent = await Agent.generate();
+
+    await server.handleAccountIntrospection(
+      await toRequest(await oldAgent.buildAccountIntrospection({ baseUrl: BASE_URL })),
+    );
+    await server.handleKeyRotation(
+      await toRequest(await oldAgent.buildKeyRotation({ baseUrl: BASE_URL, newDid: newAgent.did })),
+    );
+
+    const fresh = await newAgent.buildAccountIntrospection({ baseUrl: BASE_URL });
+    const resp = await server.handleAccountIntrospection(await toRequest(fresh));
+    const body = (await resp.json()) as { account_did: string; state: string };
+    expect(body.account_did).toBe(newAgent.did);
+    expect(body.state).toBe("UNCLAIMED");
+  });
+
+  it("rotation while INVITED preserves pending invitation under the new DID", async () => {
+    const { server, accounts } = buildServer();
+    const oldAgent = await Agent.generate();
+    const newAgent = await Agent.generate();
+    const recipient: Recipient = { type: "email", value: "alice@example.com" };
+
+    // Sign up + invite.
+    const spy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await server.handleOwnerInvitation(
+      await toRequest(await oldAgent.buildOwnerInvitation({ baseUrl: BASE_URL, recipient })),
+    );
+
+    const preRotate = await accounts.get(oldAgent.did);
+    expect(preRotate?.state).toBe("INVITED");
+
+    // Rotate while INVITED.
+    await server.handleKeyRotation(
+      await toRequest(await oldAgent.buildKeyRotation({ baseUrl: BASE_URL, newDid: newAgent.did })),
+    );
+
+    const postRotate = await accounts.get(newAgent.did);
+    expect(postRotate?.state).toBe("INVITED");
+    expect(postRotate?.pendingRecipient).toEqual(recipient);
+
+    // Magic-link token still resolves; the human can still claim.
+    const link = spy.mock.calls[0]![0] as string;
+    const token = new URL(/https?:\/\/\S+/.exec(link)![0]).searchParams.get("token")!;
+    const claimReq = new Request(`${BASE_URL}/afauth/v1/claim/${token}`, { method: "POST" });
+    const claimResp = await server.handleClaimCompletion(claimReq, {
+      authenticated: recipient,
+      userId: "usr_alice",
+    });
+    expect(claimResp.status).toBe(200);
+    const final = await accounts.get(newAgent.did);
+    expect(final?.state).toBe("CLAIMED");
+
+    spy.mockRestore();
+  });
+
+  it("rotation while CLAIMED rejected — §8.2 post-claim is out of v0.1 scope", async () => {
+    const { server } = buildServer();
+    const agent = await Agent.generate();
+    const recipient: Recipient = { type: "email", value: "alice@example.com" };
+    const newAgent = await Agent.generate();
+
+    // Walk the agent to CLAIMED.
+    const spy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await server.handleOwnerInvitation(
+      await toRequest(await agent.buildOwnerInvitation({ baseUrl: BASE_URL, recipient })),
+    );
+    const link = spy.mock.calls[0]![0] as string;
+    const token = new URL(/https?:\/\/\S+/.exec(link)![0]).searchParams.get("token")!;
+    await server.handleClaimCompletion(
+      new Request(`${BASE_URL}/afauth/v1/claim/${token}`, { method: "POST" }),
+      { authenticated: recipient, userId: "usr_alice" },
+    );
+    spy.mockRestore();
+
+    // Attempt rotation post-claim.
+    await expect(
+      server.handleKeyRotation(
+        await toRequest(await agent.buildKeyRotation({ baseUrl: BASE_URL, newDid: newAgent.did })),
+      ),
+    ).rejects.toMatchObject({ code: "owner_authentication_required", status: 403 });
+  });
+
+  it("invalid new_account_did rejected with 400 malformed_request", async () => {
+    const { server } = buildServer();
+    const agent = await Agent.generate();
+    await server.handleAccountIntrospection(
+      await toRequest(await agent.buildAccountIntrospection({ baseUrl: BASE_URL })),
+    );
+
+    // The Agent builder takes a Did string, so we use signRequest with a bad body.
+    const badRotation = await agent.signRequest({
+      method: "POST",
+      url: `${BASE_URL}/afauth/v1/accounts/me/keys/rotate`,
+      body: JSON.stringify({ new_account_did: "did:key:zINVALID" }),
+    });
+    await expect(server.handleKeyRotation(await toRequest(badRotation))).rejects.toMatchObject({
+      code: "malformed_request",
+      status: 400,
+    });
+  });
+
+  it("rotating to the same DID rejected", async () => {
+    const { server } = buildServer();
+    const agent = await Agent.generate();
+    await server.handleAccountIntrospection(
+      await toRequest(await agent.buildAccountIntrospection({ baseUrl: BASE_URL })),
+    );
+    const selfRotation = await agent.buildKeyRotation({ baseUrl: BASE_URL, newDid: agent.did });
+    await expect(server.handleKeyRotation(await toRequest(selfRotation))).rejects.toMatchObject({
+      code: "malformed_request",
+      status: 400,
+    });
+  });
+});
+
+describe("M3 owner-initiated revocation (§8.4)", () => {
+  let spy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    spy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  });
+  afterEach(() => {
+    spy.mockRestore();
+  });
+
+  it("revoke() marks account revoked AND adds DID to revocation list", async () => {
+    const { server, accounts, revocationList } = buildServer();
+    const agent = await Agent.generate();
+    const recipient: Recipient = { type: "email", value: "alice@example.com" };
+
+    // Walk to CLAIMED.
+    await server.handleOwnerInvitation(
+      await toRequest(await agent.buildOwnerInvitation({ baseUrl: BASE_URL, recipient })),
+    );
+    const token = new URL(
+      /https?:\/\/\S+/.exec(spy.mock.calls[0]![0] as string)![0],
+    ).searchParams.get("token")!;
+    await server.handleClaimCompletion(
+      new Request(`${BASE_URL}/afauth/v1/claim/${token}`, { method: "POST" }),
+      { authenticated: recipient, userId: "usr_alice" },
+    );
+
+    // Owner revokes.
+    await server.revoke(agent.did);
+
+    expect((await accounts.get(agent.did))?.revoked).toBe(true);
+    expect(await revocationList.isRevoked(agent.did)).toBe(true);
+  });
+
+  it("post-revocation request returns 401 revoked_key", async () => {
+    const { server } = buildServer();
+    const agent = await Agent.generate();
+    await server.handleAccountIntrospection(
+      await toRequest(await agent.buildAccountIntrospection({ baseUrl: BASE_URL })),
+    );
+
+    await server.revoke(agent.did);
+
+    const fresh = await agent.buildAccountIntrospection({ baseUrl: BASE_URL });
+    await expect(server.handleAccountIntrospection(await toRequest(fresh))).rejects.toMatchObject({
+      code: "revoked_key",
+      status: 401,
+    });
+  });
+
+  it("revoke() on unknown account → 404 unknown_account", async () => {
+    const { server } = buildServer();
+    await expect(server.revoke("did:key:zUnknown")).rejects.toMatchObject({
+      code: "unknown_account",
+      status: 404,
+    });
+  });
+});
+
+describe("Verifier without a revocation list (backward compat)", () => {
+  it("skips revocation check when no list is supplied", async () => {
+    // Build a Server WITHOUT a revocationList.
+    const accounts = new MemoryAccountStore();
+    const server = new Server({
+      nonceStore: new MemoryNonceStore(),
+      serviceDid: DISCOVERY.service_did,
+      accounts,
+      recipients: { email: consoleEmailHandler },
+      discovery: DISCOVERY,
+      baseUrl: BASE_URL,
+    });
+
+    const agent = await Agent.generate();
+    const resp = await server.handleAccountIntrospection(
+      await toRequest(await agent.buildAccountIntrospection({ baseUrl: BASE_URL })),
+    );
+    expect(resp.status).toBe(200);
+  });
+});

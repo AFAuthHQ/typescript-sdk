@@ -23,14 +23,17 @@ import {
   consoleEmailHandler,
   MemoryAccountStore,
   MemoryNonceStore,
+  MemoryRevocationList,
   type DiscoveryDocument,
   type OwnerSession,
 } from "@afauth/server";
-import { createWorker, KvNonceStore } from "@afauth/worker";
+import { createWorker, KvNonceStore, KvRevocationList } from "@afauth/worker";
 
 interface Env {
   /** Optional Cloudflare KV namespace for the production nonce store. */
   AFAUTH_NONCES?: KVNamespace;
+  /** Optional Cloudflare KV namespace for the §8.3 revocation list. */
+  AFAUTH_REVOCATIONS?: KVNamespace;
   /** Service DID; e.g. "did:web:api.example.com". */
   SERVICE_DID?: string;
   /** Base URL of this Worker; used to compose claim-page URLs. */
@@ -80,12 +83,20 @@ async function extractOwnerSession(req: Request): Promise<OwnerSession | null> {
   }
 }
 
+// Process-wide revocation list (in-memory) used when no KV binding is
+// configured. Production deployments set AFAUTH_REVOCATIONS so the
+// list survives isolate recycling.
+const memoryRevocationList = new MemoryRevocationList();
+
 const exportedHandler: ExportedHandler<Env> = {
   fetch(req, env, ctx) {
     const discovery = buildDiscovery(env);
     const baseUrl = env.BASE_URL ?? DEFAULT_BASE_URL;
     const handler = createWorker({
       nonceStore: env.AFAUTH_NONCES ? new KvNonceStore(env.AFAUTH_NONCES) : new MemoryNonceStore(),
+      revocationList: env.AFAUTH_REVOCATIONS
+        ? new KvRevocationList(env.AFAUTH_REVOCATIONS)
+        : memoryRevocationList,
       serviceDid: discovery.service_did,
       accounts,
       recipients: { email: consoleEmailHandler },

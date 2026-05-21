@@ -355,6 +355,26 @@ function parseSignature(header: string, label: string): Uint8Array {
   return base64ToBytes(m[1]!);
 }
 
+// ---------- Revocation list (§8.3) ----------
+
+export interface RevocationList {
+  /** Returns true iff `did` has been revoked (via rotation or §8.4). */
+  isRevoked(did: Did): Promise<boolean>;
+  /** Atomically mark `did` as revoked with the given timestamp. */
+  add(did: Did, revokedAt: string): Promise<void>;
+}
+
+/** In-memory `RevocationList`. Suitable for tests and small examples. */
+export class MemoryRevocationList implements RevocationList {
+  private readonly revoked = new Map<Did, string>();
+  async isRevoked(did: Did): Promise<boolean> {
+    return this.revoked.has(did);
+  }
+  async add(did: Did, revokedAt: string): Promise<void> {
+    this.revoked.set(did, revokedAt);
+  }
+}
+
 // ---------- Verifier (§5.5) ----------
 
 export interface VerifierOptions {
@@ -364,6 +384,12 @@ export interface VerifierOptions {
   clockSkewSeconds?: number;
   /** Default: 300. Max allowed `expires - created`. */
   maxSignatureLifetimeSeconds?: number;
+  /**
+   * Optional. When supplied, the Verifier rejects requests signed by
+   * a revoked DID with `401 revoked_key`. When omitted (e.g., in unit
+   * tests), the Verifier skips the revocation check.
+   */
+  revocationList?: RevocationList;
   /**
    * Function returning the current unix epoch in seconds. Overridable
    * for tests; defaults to `Date.now() / 1000`.
@@ -380,12 +406,14 @@ export interface VerifiedRequest {
 
 export class Verifier {
   private readonly nonceStore: NonceStore;
+  private readonly revocationList: RevocationList | undefined;
   private readonly clockSkew: number;
   private readonly maxLifetime: number;
   private readonly now: () => number;
 
   constructor(opts: VerifierOptions) {
     this.nonceStore = opts.nonceStore;
+    this.revocationList = opts.revocationList;
     this.clockSkew = opts.clockSkewSeconds ?? 5;
     this.maxLifetime = opts.maxSignatureLifetimeSeconds ?? 300;
     this.now = opts.now ?? (() => Math.floor(Date.now() / 1000));
@@ -408,6 +436,15 @@ export class Verifier {
 
     const { label, covered, params } = parseSignatureInput(sigInputHeader);
     const signatureBytes = parseSignature(sigHeader, label);
+
+    // Revocation check (§8.3). Done before signature verification so
+    // revoked-key requests are rejected without burning Ed25519
+    // verification cycles. Revocation status is not secret —
+    // services may publish their lists per §8.3 — so the timing
+    // signal is acceptable.
+    if (this.revocationList && (await this.revocationList.isRevoked(params.keyid))) {
+      throw new AFAuthError("revoked_key", 401, "account key has been revoked");
+    }
 
     // Time bounds (§5.6).
     if (!Number.isInteger(params.created) || !Number.isInteger(params.expires)) {
@@ -551,6 +588,7 @@ export class Server {
   private readonly recipients: ServerOptions["recipients"];
   private readonly discovery: ServerOptions["discovery"];
   private readonly baseUrl: string;
+  private readonly revocationList: RevocationList | undefined;
   private readonly invitationTtlSeconds: number;
 
   constructor(opts: ServerOptions) {
@@ -559,6 +597,7 @@ export class Server {
     this.recipients = opts.recipients;
     this.discovery = opts.discovery;
     this.baseUrl = opts.baseUrl;
+    this.revocationList = opts.revocationList;
     this.invitationTtlSeconds = DEFAULT_INVITATION_TTL_SECONDS;
   }
 
@@ -753,10 +792,105 @@ export class Server {
     );
   }
 
-  // ----- Key rotation (§8.1) — M3 -----
+  // ----- Key rotation (§8.1, pre-claim) -----
 
-  async handleKeyRotation(_req: Request): Promise<Response> {
-    throw new AFAuthError("malformed_request", 501, "Server.handleKeyRotation lands in M3");
+  async handleKeyRotation(req: Request): Promise<Response> {
+    if (req.method !== "POST") {
+      throw new AFAuthError("malformed_request", 405, `method ${req.method} not allowed`);
+    }
+    const body = await req.text();
+    // Verify the request was signed by the agent's *current* key. If
+    // that key was already revoked, the verifier rejects here.
+    const verified = await this.verifier.verify({
+      method: req.method,
+      url: req.url,
+      headers: req.headers,
+      body: body === "" ? null : body,
+    });
+
+    let parsed: { new_account_did?: string };
+    try {
+      parsed = JSON.parse(body) as typeof parsed;
+    } catch {
+      throw new AFAuthError("malformed_request", 400, "request body is not valid JSON");
+    }
+    const newDid = parsed.new_account_did;
+    if (typeof newDid !== "string" || newDid.length === 0) {
+      throw new AFAuthError("malformed_request", 400, "missing `new_account_did`");
+    }
+    if (newDid === verified.agentDid) {
+      throw new AFAuthError(
+        "malformed_request",
+        400,
+        "new_account_did must differ from current account DID",
+      );
+    }
+    // Validate that the new DID is a parseable did:key.
+    try {
+      decodeDidKey(newDid);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : "unknown";
+      throw new AFAuthError(
+        "malformed_request",
+        400,
+        `new_account_did is not a valid did:key: ${reason}`,
+      );
+    }
+
+    const account = await this.accounts.get(verified.agentDid);
+    if (!account) {
+      throw new AFAuthError("unknown_account", 404, "account not found");
+    }
+    if (account.revoked) {
+      // Defensive — the verifier should have rejected first.
+      throw new AFAuthError("revoked_key", 401, "account key has been revoked");
+    }
+    // M3 scope: pre-claim rotation only. §8.2 (post-claim with owner
+    // confirmation) is a separate ceremony tracked for later.
+    if (account.state === "CLAIMED") {
+      throw new AFAuthError(
+        "owner_authentication_required",
+        403,
+        "post-claim key rotation (§8.2) requires owner confirmation and is not implemented in v0.1",
+      );
+    }
+
+    const rotatedAt = new Date().toISOString();
+    await this.accounts.rotateKey(verified.agentDid, newDid, rotatedAt);
+    // §8.3: register the old DID on the local revocation list so
+    // subsequent requests signed by the old key are rejected.
+    await this.revocationList?.add(verified.agentDid, rotatedAt);
+
+    return jsonResponse(
+      {
+        account_did: newDid,
+        old_revoked_at: rotatedAt,
+      },
+      200,
+    );
+  }
+
+  // ----- Owner-initiated revocation (§8.4) -----
+
+  /**
+   * Revoke the agent's key entirely. Called by the service from its
+   * own owner-authenticated dashboard or admin route — not from a
+   * signed AFAuth endpoint. The caller is responsible for verifying
+   * the owner is authenticated; this method performs the storage-level
+   * mutation and updates the revocation list.
+   *
+   * §8.4 scopes owner-initiated revocation to CLAIMED accounts; this
+   * method also accepts pre-claim revocations for service-driven
+   * abuse handling (the spec does not forbid this).
+   */
+  async revoke(did: Did): Promise<void> {
+    const account = await this.accounts.get(did);
+    if (!account) {
+      throw new AFAuthError("unknown_account", 404, `account ${did} not found`);
+    }
+    const revokedAt = new Date().toISOString();
+    await this.accounts.revoke(did, revokedAt);
+    await this.revocationList?.add(did, revokedAt);
   }
 
   // ----- Account introspection (§6.5) -----

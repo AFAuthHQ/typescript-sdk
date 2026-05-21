@@ -16,6 +16,7 @@ import {
   Server,
   type NonceStore,
   type OwnerSession,
+  type RevocationList,
   type ServerOptions,
 } from "@afauth/server";
 
@@ -137,6 +138,26 @@ export class KvNonceStore implements NonceStore {
     const ttl = Math.max(60, Math.ceil(ttlSeconds));
     await this.namespace.put(key, "1", { expirationTtl: ttl });
     return true;
+  }
+}
+
+/**
+ * Cloudflare KV–backed revocation list (§8.3). Stores each revoked DID
+ * → ISO timestamp without TTL; revocations are durable.
+ *
+ * Implementations that want bounded growth can later expire entries
+ * after a service-defined retention window without changing this
+ * interface.
+ */
+export class KvRevocationList implements RevocationList {
+  constructor(private readonly namespace: KVNamespace) {}
+
+  async isRevoked(did: Did): Promise<boolean> {
+    return (await this.namespace.get(`revoked:${did}`)) !== null;
+  }
+
+  async add(did: Did, revokedAt: string): Promise<void> {
+    await this.namespace.put(`revoked:${did}`, revokedAt);
   }
 }
 
