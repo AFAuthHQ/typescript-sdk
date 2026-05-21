@@ -378,11 +378,10 @@ export type AFAuthErrorCode =
   | "rate_limit_exceeded"
   | "malformed_request"
   | "unsupported_recipient_type"
-  // Reserved by AFAP-0002 (draft). Owner-authenticated session is
-  // present but its most recent authentication event predates the
-  // service's §7.5 freshness window. Distinct from
-  // `owner_authentication_required` (no session) and
-  // `owner_binding_blocked` (agent-signed op).
+  // §7.5 freshness floor. Owner-authenticated session is present but
+  // its most recent authentication event predates the service's
+  // freshness window. Distinct from `owner_authentication_required`
+  // (no session) and `owner_binding_blocked` (agent-signed op).
   | "owner_session_too_stale";
 
 export class AFAuthError extends Error {

@@ -600,13 +600,63 @@ export interface OwnerSession {
   userId: string;
   /**
    * ISO-8601 timestamp of the most recent authentication event this
-   * session evidences. Optional for backward compatibility; required
-   * by AFAP-0002's §7.5 freshness floor — handlers that gate
-   * owner-binding operations on freshness MUST reject sessions
-   * whose `authenticatedAt` is older than the configured window
-   * with `owner_session_too_stale` (403).
+   * session evidences. Required by §7.5's freshness floor for
+   * owner-binding operations; optional on the type for backward
+   * compatibility with claim-completion sessions, which are
+   * exempt (§7.5 applies post-claim only).
+   *
+   * Use `assertFreshOwnerSession` to enforce the freshness window
+   * before authorising an owner-binding operation.
    */
   authenticatedAt?: string;
+}
+
+/**
+ * §7.5 freshness check. Throws `AFAuthError("owner_session_too_stale",
+ * 403, …)` if `session.authenticatedAt` is missing or older than
+ * `maxAgeSeconds` relative to `now`.
+ *
+ * Use in service-defined owner-binding routes (revoke owner credential,
+ * link federated identity, add recovery contact, etc.) before invoking
+ * the underlying storage mutation. §7.5 mandates 60–300s as the
+ * recommended window; the SDK does not pin a default — callers must
+ * pick the freshness their threat model warrants.
+ *
+ * Example:
+ *
+ *   // POST /admin/revoke (service route — not signed by an agent)
+ *   const session = await myAuthLayer.extractOwnerSession(req);
+ *   assertFreshOwnerSession(session, { maxAgeSeconds: 300 });
+ *   await server.revoke(targetDid);
+ */
+export function assertFreshOwnerSession(
+  session: OwnerSession,
+  opts: { maxAgeSeconds: number; now?: () => number },
+): void {
+  if (!session.authenticatedAt) {
+    throw new AFAuthError(
+      "owner_session_too_stale",
+      403,
+      "owner session does not evidence an authentication event (authenticatedAt missing)",
+    );
+  }
+  const authMs = Date.parse(session.authenticatedAt);
+  if (!Number.isFinite(authMs)) {
+    throw new AFAuthError(
+      "owner_session_too_stale",
+      403,
+      "owner session authenticatedAt is not a valid ISO-8601 timestamp",
+    );
+  }
+  const nowMs = (opts.now ? opts.now() : Math.floor(Date.now() / 1000)) * 1000;
+  const ageSeconds = (nowMs - authMs) / 1000;
+  if (ageSeconds > opts.maxAgeSeconds) {
+    throw new AFAuthError(
+      "owner_session_too_stale",
+      403,
+      `owner session is ${Math.floor(ageSeconds)}s old; freshness window is ${opts.maxAgeSeconds}s`,
+    );
+  }
 }
 
 // DiscoveryDocument is defined in @afauth/core (single source of truth)
