@@ -50,9 +50,25 @@ export interface NonceStore {
   seen(keyid: Did, nonce: string, ttlSeconds: number): Promise<boolean>;
 }
 
-/** Single-process Map-backed nonce store. Suitable for tests. */
+/**
+ * Single-process Map-backed nonce store. Suitable for tests and small
+ * single-process deployments.
+ *
+ * Lazily garbage-collects expired entries on every Nth insert
+ * (default N = 256) so the map can't grow unbounded in long-running
+ * processes. The sweep is O(size) but amortises to O(1) per insert.
+ * Production deployments that need durability across process
+ * restarts should use a KV-backed `NonceStore` (e.g.
+ * `@afauth/worker`'s `KvNonceStore`).
+ */
 export class MemoryNonceStore implements NonceStore {
   private readonly seenSet = new Map<string, number>();
+  private inserts = 0;
+  private readonly gcEvery: number;
+
+  constructor(opts: { gcEvery?: number } = {}) {
+    this.gcEvery = opts.gcEvery ?? 256;
+  }
 
   async seen(keyid: Did, nonce: string, ttlSeconds: number): Promise<boolean> {
     const key = `${keyid}\x00${nonce}`;
@@ -60,7 +76,20 @@ export class MemoryNonceStore implements NonceStore {
     const existingExpiry = this.seenSet.get(key);
     if (existingExpiry !== undefined && existingExpiry > now) return false;
     this.seenSet.set(key, now + ttlSeconds);
+    this.inserts++;
+    if (this.inserts % this.gcEvery === 0) this.sweep(now);
     return true;
+  }
+
+  /** Number of currently-tracked entries (post any sweep). */
+  size(): number {
+    return this.seenSet.size;
+  }
+
+  private sweep(now: number): void {
+    for (const [k, expiry] of this.seenSet) {
+      if (expiry <= now) this.seenSet.delete(k);
+    }
   }
 }
 
@@ -116,6 +145,10 @@ export interface AccountStore {
 export class MemoryAccountStore implements AccountStore {
   private readonly accounts = new Map<Did, Account>();
   private readonly tokens = new Map<string, { did: Did; expiresAt: string }>();
+  /** Reverse index: did → its current pending-invitation token, if any.
+   *  Lets §7.3 atomic supersession run in O(1) instead of scanning
+   *  every token on every new invitation. */
+  private readonly didToToken = new Map<Did, string>();
 
   async get(did: Did): Promise<Account | null> {
     return this.accounts.get(did) ?? null;
@@ -161,12 +194,13 @@ export class MemoryAccountStore implements AccountStore {
     }
 
     // §7.3 atomic replacement: invalidate any prior pending invitation
-    // for this DID before installing the new one.
-    for (const [existingToken, entry] of this.tokens) {
-      if (entry.did === did) this.tokens.delete(existingToken);
-    }
+    // for this DID before installing the new one. O(1) via reverse
+    // index instead of scanning the full token map.
+    const existing = this.didToToken.get(did);
+    if (existing !== undefined) this.tokens.delete(existing);
 
     this.tokens.set(token, { did, expiresAt });
+    this.didToToken.set(did, token);
     account.state = "INVITED";
     account.pendingRecipient = recipient;
     this.accounts.set(did, account);
@@ -194,6 +228,7 @@ export class MemoryAccountStore implements AccountStore {
     };
     this.accounts.set(entry.did, claimed);
     this.tokens.delete(token);
+    this.didToToken.delete(entry.did);
     return claimed;
   }
 
@@ -205,9 +240,14 @@ export class MemoryAccountStore implements AccountStore {
     const rotated: Account = { ...account, did: newDid };
     this.accounts.delete(oldDid);
     this.accounts.set(newDid, rotated);
-    // Migrate any pending token references.
-    for (const entry of this.tokens.values()) {
-      if (entry.did === oldDid) entry.did = newDid;
+    // Migrate the pending-token reference (if any) atomically with
+    // the account-id swap. O(1) via reverse index.
+    const tok = this.didToToken.get(oldDid);
+    if (tok !== undefined) {
+      this.didToToken.delete(oldDid);
+      this.didToToken.set(newDid, tok);
+      const tokenEntry = this.tokens.get(tok);
+      if (tokenEntry) tokenEntry.did = newDid;
     }
     return rotated;
   }

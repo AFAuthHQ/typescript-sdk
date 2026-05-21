@@ -40,12 +40,17 @@ interface Resolved {
 
 function pathOf(endpoint: string): string {
   // The discovery doc may carry absolute or relative endpoint URLs;
-  // we route on path only.
+  // we route on path only. Trailing slashes are stripped so that
+  // `/foo/` and `/foo` route identically — important for the claim
+  // completion path-prefix match which composes `<prefix>/<token>`.
+  let p: string;
   try {
-    return new URL(endpoint, "http://_/").pathname;
+    p = new URL(endpoint, "http://_/").pathname;
   } catch {
-    return endpoint.startsWith("/") ? endpoint : `/${endpoint}`;
+    p = endpoint.startsWith("/") ? endpoint : `/${endpoint}`;
   }
+  if (p.length > 1 && p.endsWith("/")) p = p.slice(0, -1);
+  return p;
 }
 
 /** Cloudflare Worker handler. Routes the five AFAuth endpoints; 404 otherwise. */
