@@ -1,14 +1,13 @@
 /**
  * @afauth/core — shared primitives for the AFAuth Protocol.
  *
- * Types, codec, canonicalisation, content-digest, and error envelope are
- * defined here. The other three SDK packages (`@afauth/agent`,
- * `@afauth/server`, `@afauth/worker`) all depend on this module so the
- * canonicalisation rule and error shape stay aligned across the SDK.
- *
- * Function bodies throw `not_implemented` in this skeleton — types
- * are stable and match `implementation/sdk-v0.1.d.ts` in the spec repo.
+ * Types, codec, canonicalisation, content-digest, and error envelope.
+ * The other three SDK packages (`@afauth/agent`, `@afauth/server`,
+ * `@afauth/worker`) depend on this module so the canonicalisation rule
+ * and error shape stay aligned across the SDK.
  */
+
+import { sha256 } from "@noble/hashes/sha2.js";
 
 // ---------- Identifiers (§3) ----------
 
@@ -23,12 +22,101 @@ export type Ed25519PrivateKey = Uint8Array;
 
 // ---------- did:key codec (§3.1.1) ----------
 
-export function encodeDidKey(_publicKey: Ed25519PublicKey): Did {
-  throw new AFAuthError("malformed_request", 500, "encodeDidKey not implemented");
+const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const BASE58_INDEX = new Map<string, number>();
+for (let i = 0; i < BASE58_ALPHABET.length; i++) {
+  BASE58_INDEX.set(BASE58_ALPHABET[i]!, i);
 }
 
-export function decodeDidKey(_did: Did): Ed25519PublicKey {
-  throw new AFAuthError("malformed_request", 500, "decodeDidKey not implemented");
+function base58btcEncode(bytes: Uint8Array): string {
+  let n = 0n;
+  for (const b of bytes) n = (n << 8n) | BigInt(b);
+
+  let leadingZeros = 0;
+  for (const b of bytes) {
+    if (b === 0) leadingZeros++;
+    else break;
+  }
+
+  let body = "";
+  while (n > 0n) {
+    const rem = Number(n % 58n);
+    n /= 58n;
+    body = BASE58_ALPHABET[rem]! + body;
+  }
+  return "1".repeat(leadingZeros) + body;
+}
+
+function base58btcDecode(str: string): Uint8Array {
+  let n = 0n;
+  for (const ch of str) {
+    const v = BASE58_INDEX.get(ch);
+    if (v === undefined) {
+      throw new AFAuthError("malformed_request", 400, `invalid base58 character: ${ch}`);
+    }
+    n = n * 58n + BigInt(v);
+  }
+
+  let leadingZeros = 0;
+  for (const ch of str) {
+    if (ch === "1") leadingZeros++;
+    else break;
+  }
+
+  // Convert bigint to bytes (big-endian).
+  const bodyBytes: number[] = [];
+  while (n > 0n) {
+    bodyBytes.unshift(Number(n & 0xffn));
+    n >>= 8n;
+  }
+  const out = new Uint8Array(leadingZeros + bodyBytes.length);
+  for (let i = 0; i < bodyBytes.length; i++) out[leadingZeros + i] = bodyBytes[i]!;
+  return out;
+}
+
+// Multicodec varint for ed25519-pub = 0xed 0x01 (two bytes).
+const ED25519_PUB_VARINT = new Uint8Array([0xed, 0x01]);
+
+/** Encode a 32-byte Ed25519 public key as `did:key:z6Mk...`. */
+export function encodeDidKey(publicKey: Ed25519PublicKey): Did {
+  if (publicKey.length !== 32) {
+    throw new AFAuthError(
+      "malformed_request",
+      400,
+      `Ed25519 public key must be 32 bytes, got ${publicKey.length}`,
+    );
+  }
+  const buf = new Uint8Array(2 + 32);
+  buf.set(ED25519_PUB_VARINT, 0);
+  buf.set(publicKey, 2);
+  return `did:key:z${base58btcEncode(buf)}`;
+}
+
+/** Decode a `did:key:z...` to its 32-byte Ed25519 public key. */
+export function decodeDidKey(did: Did): Ed25519PublicKey {
+  if (!did.startsWith("did:key:z")) {
+    throw new AFAuthError("malformed_request", 400, `not a did:key:z... value: ${did}`);
+  }
+  const decoded = base58btcDecode(did.slice("did:key:z".length));
+  if (decoded.length < 2) {
+    throw new AFAuthError("malformed_request", 400, "did:key payload too short");
+  }
+  if (decoded[0] !== 0xed || decoded[1] !== 0x01) {
+    throw new AFAuthError(
+      "malformed_request",
+      400,
+      `unsupported multicodec prefix: 0x${decoded[0]!.toString(16)}${decoded[1]!.toString(16)} (only ed25519-pub 0xed01 in v0.1)`,
+    );
+  }
+  const pubKey = decoded.slice(2);
+  if (pubKey.length !== 32) {
+    throw new AFAuthError(
+      "malformed_request",
+      400,
+      `Ed25519 public key must be 32 bytes, got ${pubKey.length}`,
+    );
+  }
+  return pubKey;
 }
 
 // ---------- Recipient registry (§7.7) ----------
@@ -59,16 +147,58 @@ export interface CanonicalRequest {
   contentDigest?: string;
 }
 
+/**
+ * Builds the RFC 9421 canonical signature input — byte-exact, no
+ * trailing newline. Matches `harness/run.js#buildCanonicalInput` in
+ * the spec repo; any drift fails the conformance suite.
+ */
 export function buildCanonicalInput(
-  _req: CanonicalRequest,
-  _params: SignatureParams,
-  _covered: readonly CoveredComponent[],
+  req: CanonicalRequest,
+  params: SignatureParams,
+  covered: readonly CoveredComponent[],
 ): string {
-  throw new AFAuthError("malformed_request", 500, "buildCanonicalInput not implemented");
+  const lines: string[] = [];
+  for (const component of covered) {
+    if (component === "@method") {
+      lines.push(`"@method": ${req.method}`);
+    } else if (component === "@target-uri") {
+      lines.push(`"@target-uri": ${req.targetUri}`);
+    } else if (component === "content-digest") {
+      if (req.contentDigest === undefined) {
+        throw new AFAuthError(
+          "malformed_request",
+          400,
+          `covered components include content-digest but no contentDigest on request`,
+        );
+      }
+      lines.push(`"content-digest": ${req.contentDigest}`);
+    }
+  }
+  const componentList = covered.map((c) => `"${c}"`).join(" ");
+  const paramStr =
+    `created=${params.created};` +
+    `expires=${params.expires};` +
+    `nonce="${params.nonce}";` +
+    `keyid="${params.keyid}";` +
+    `alg="${params.alg}"`;
+  lines.push(`"@signature-params": (${componentList});${paramStr}`);
+  return lines.join("\n");
 }
 
-export function sha256ContentDigest(_body: string | Uint8Array): string {
-  throw new AFAuthError("malformed_request", 500, "sha256ContentDigest not implemented");
+// ---------- Content digest (RFC 9530 §2) ----------
+
+function bytesToBase64(bytes: Uint8Array): string {
+  // Universal — works in Node ≥16, Cloudflare Workers, Deno, browsers.
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary);
+}
+
+/** Computes the `Content-Digest` header value `'sha-256=:<base64>:'`. */
+export function sha256ContentDigest(body: string | Uint8Array): string {
+  const bytes = typeof body === "string" ? new TextEncoder().encode(body) : body;
+  const hash = sha256(bytes);
+  return `sha-256=:${bytesToBase64(hash)}:`;
 }
 
 // ---------- Error envelope (§11) ----------

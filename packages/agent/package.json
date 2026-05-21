@@ -12,7 +12,11 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsup src/index.ts --format esm --dts --clean",
     "test": "vitest run --passWithNoTests",
@@ -20,7 +24,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@afauth/core": "workspace:*"
+    "@afauth/core": "workspace:*",
+    "@noble/curves": "^2.2.0"
   },
   "devDependencies": {
     "tsup": "^8.0.0",
