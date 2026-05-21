@@ -1,23 +1,40 @@
 # AFAuth example Worker
 
-Reference Cloudflare Worker composing `@afauth/server` and `@afauth/worker`.
+Reference Cloudflare Worker composing `@afauth/server` and
+`@afauth/worker` into a deployable AFAuth-protected service.
 
-## What it does today (M0)
+## What it does
 
-- Boots on Cloudflare Workers.
-- Returns the `/.well-known/afauth` discovery document with status 200.
-- Constructs a `Server` instance to verify type-compatibility with the
-  ServerOptions surface defined in `@afauth/server`.
-- All five protocol endpoints return 404 (handler wiring lands in M1).
+- Serves the `/.well-known/afauth` discovery document (§4).
+- Verifies agent-signed requests on the four signed endpoints
+  (§5.5 + §5.6), including replay protection and revocation
+  lookups.
+- Runs the owner-invitation ceremony (§7.2): logs the magic link to
+  the Worker's console (visible in `wrangler tail`) via the
+  reference `consoleEmailHandler`.
+- Accepts claim completions at `POST /afauth/v1/claim/<token>` after
+  validating the §7.7 match relation against the supplied owner
+  session.
+- Implements pre-claim key rotation (§8.1) and §8.4 revocation.
+- Returns the agent's account record on
+  `GET /afauth/v1/accounts/me`, omitting `pendingRecipient`.
 
-## What it will do next (M1+)
+## Configuration knobs (env)
 
-- M1: route the five endpoints through `createWorker(opts)`; the
-  `Verifier` accepts the harness's test vectors end-to-end.
-- M2: owner-invitation + claim completion; the email
-  `RecipientHandler` logs the magic link to `console`.
-- M3: pre-claim key rotation, owner-initiated revocation backed by
-  a KV revocation list.
+| Var | Required | Default |
+|---|---|---|
+| `SERVICE_DID` | no | `did:web:example.com` |
+| `BASE_URL` | no | `https://example.com` |
+| `AFAUTH_NONCES` (KV namespace) | no — falls back to `MemoryNonceStore` | — |
+| `AFAUTH_REVOCATIONS` (KV namespace) | no — falls back to `MemoryRevocationList` | — |
+
+> **SECURITY: DEMO ONLY.** The example uses an `X-Owner-Session`
+> header to carry the claim-page session, which is trivially
+> forgeable by anyone who can reach the Worker. A real deployment
+> MUST replace `extractOwnerSession` with one that verifies a
+> proper authenticated session (signed cookie, IdP-issued JWT,
+> etc.). The header form exists only to make the ceremony
+> demonstrable locally.
 
 ## Running locally
 
@@ -26,13 +43,28 @@ pnpm install
 pnpm --filter @afauth/example-worker dev
 ```
 
-Then `curl http://localhost:8787/.well-known/afauth`.
+Then exercise the discovery endpoint:
+
+```bash
+curl http://localhost:8787/.well-known/afauth
+```
+
+To drive a full invitation → claim ceremony locally, use the
+`@afauth/agent` package to sign the requests; the email handler
+will log the magic link to the Worker's stderr (`wrangler tail`).
 
 ## Deploying
 
 ```bash
+# Provision durable storage:
+wrangler kv namespace create AFAUTH_NONCES
+wrangler kv namespace create AFAUTH_REVOCATIONS
+
+# Paste the returned namespace IDs into wrangler.toml, then:
 pnpm --filter @afauth/example-worker deploy
 ```
 
-Provision a KV namespace and uncomment the `kv_namespaces` block in
-`wrangler.toml` for the production nonce store.
+The default `MemoryAccountStore` is process-local and is suitable
+only for development; production deployments should substitute a
+durable `AccountStore` implementation (e.g. backed by D1 or
+Durable Objects) that upholds the §7.3 atomic-supersession contract.
