@@ -5,6 +5,8 @@ These files are copied verbatim from
 
 - `vectors/keypair.json` (reference test-only Ed25519 keypair)
 - `vectors/signatures/*.json` — §C.1, §C.2 (canonical input + reference signatures)
+- `vectors/discovery/*.json` — §C.3 (discovery-document parsing)
+- `vectors/recipients/*.json` — §C.4 (recipient normalisation)
 - `vectors/errors/*.json` — §C.5 (error envelopes)
 - `vectors/replay-window/*.json` — §C.6 (replay-window sequences)
 
@@ -20,6 +22,8 @@ When the spec repo updates its vectors, re-vendor:
 # from typescript-sdk repo root, with AFAuthHQ/spec checked out at ../spec
 cp ../spec/vectors/keypair.json                vendor/spec-vectors/keypair.json
 cp ../spec/vectors/signatures/*.json           vendor/spec-vectors/signatures/
+cp ../spec/vectors/discovery/*.json            vendor/spec-vectors/discovery/
+cp ../spec/vectors/recipients/*.json           vendor/spec-vectors/recipients/
 cp ../spec/vectors/errors/*.json               vendor/spec-vectors/errors/
 cp ../spec/vectors/replay-window/*.json        vendor/spec-vectors/replay-window/
 ```
@@ -29,5 +33,5 @@ Then re-run `pnpm test` and commit.
 ## Provenance
 
 - Source: `https://github.com/AFAuthHQ/spec`
-- Spec sections: Appendix C.1, C.2, C.5, C.6
+- Spec sections: Appendix C.1, C.2, C.3, C.4, C.5, C.6
 - License: Apache-2.0 (per `LICENSE-CODE` in the spec repo)

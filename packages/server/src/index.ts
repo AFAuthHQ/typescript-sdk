@@ -27,6 +27,7 @@ import {
   buildCanonicalInput,
   decodeDidKey,
   deriveInvitationId,
+  normaliseRecipient,
   sha256ContentDigest,
   type CoveredComponent,
   type Did,
@@ -301,8 +302,12 @@ export const consoleEmailHandler: RecipientHandler = {
   },
   matches({ pending, authenticated }) {
     if (pending.type !== "email" || authenticated.type !== "email") return false;
-    // §7.7.1: case-insensitive equality per RFC 5321 §2.4.
-    return pending.value.toLowerCase() === authenticated.value.toLowerCase();
+    // §7.7.1: case-insensitive equality after NFKC normalisation per
+    // RFC 5321 §2.4. Normalise both sides so this handler works
+    // correctly even if either input has not already been routed
+    // through `normaliseRecipient`.
+    const norm = (v: string) => v.normalize("NFKC").toLowerCase();
+    return norm(pending.value) === norm(authenticated.value);
   },
 };
 
@@ -767,6 +772,13 @@ export class Server {
     } else {
       throw new AFAuthError("malformed_request", 400, "request body missing `recipient`");
     }
+
+    // §7.7: normalise the recipient to its canonical form before
+    // storage and §7.7 match-relation checks. Throws
+    // malformed_request on values that violate the type's rule
+    // (e.g., phone with extension syntax, did with DID URL component,
+    // oidc issuer with fragment/query).
+    recipient = normaliseRecipient(recipient);
 
     // §7.2: redirect_url MUST be validated against an allow-list of
     // service-controlled hosts. Failing closed when no list is

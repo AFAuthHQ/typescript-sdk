@@ -207,6 +207,105 @@ export function sha256ContentDigest(body: string | Uint8Array): string {
   return `sha-256=:${bytesToBase64(hash)}:`;
 }
 
+// ---------- Recipient normalisation (§7.7) ----------
+
+/**
+ * Normalises a recipient per §7.7. Returns the canonical form on
+ * success; throws `AFAuthError("malformed_request", 400, …)` if the
+ * input violates the type's rule. The rules:
+ *
+ *   - **email** (§7.7.1) — NFKC + ASCII case-fold (`toLowerCase`).
+ *   - **phone** (§7.7.2) — MUST match `^\+[0-9]+$`. E.164 extension
+ *     syntax (`;ext=42`, `,42`, `x42`) is explicitly rejected.
+ *   - **oidc**  (§7.7.3) — `issuer` is opaque (no normalisation),
+ *     but fragment or query components are rejected.
+ *   - **did**   (§7.7.4) — bare DID only (no path/query/fragment).
+ *     `did:key` canonical form delegated to `decodeDidKey`.
+ *     `did:web` host MUST be lowercase.
+ *
+ * `normaliseRecipient` is idempotent: `n(n(r)) === n(r)`.
+ */
+export function normaliseRecipient(r: Recipient): Recipient {
+  switch (r.type) {
+    case "email":
+      if (typeof r.value !== "string") {
+        throw new AFAuthError("malformed_request", 400, "email.value must be a string");
+      }
+      return { type: "email", value: r.value.normalize("NFKC").toLowerCase() };
+
+    case "phone": {
+      if (typeof r.value !== "string") {
+        throw new AFAuthError("malformed_request", 400, "phone.value must be a string");
+      }
+      if (!/^\+[0-9]+$/.test(r.value)) {
+        if (/[;,xX]/.test(r.value)) {
+          throw new AFAuthError("malformed_request", 400, "phone contains E.164 extension syntax");
+        }
+        if (!r.value.startsWith("+")) {
+          throw new AFAuthError("malformed_request", 400, "phone is not E.164 (missing leading +)");
+        }
+        throw new AFAuthError(
+          "malformed_request",
+          400,
+          "phone contains characters other than + and 0-9",
+        );
+      }
+      return { type: "phone", value: r.value };
+    }
+
+    case "oidc": {
+      if (
+        !r.value ||
+        typeof r.value.issuer !== "string" ||
+        typeof r.value.sub !== "string"
+      ) {
+        throw new AFAuthError("malformed_request", 400, "oidc.value must be { issuer, sub }");
+      }
+      if (r.value.issuer.includes("#")) {
+        throw new AFAuthError("malformed_request", 400, "oidc issuer contains fragment");
+      }
+      if (r.value.issuer.includes("?")) {
+        throw new AFAuthError("malformed_request", 400, "oidc issuer contains query");
+      }
+      // Opaque — no normalisation per §7.7.3.
+      return { type: "oidc", value: { issuer: r.value.issuer, sub: r.value.sub } };
+    }
+
+    case "did": {
+      if (typeof r.value !== "string") {
+        throw new AFAuthError("malformed_request", 400, "did.value must be a string");
+      }
+      const afterMethod = r.value.slice("did:".length);
+      if (afterMethod.includes("/")) {
+        throw new AFAuthError("malformed_request", 400, "did contains DID URL component (path)");
+      }
+      if (afterMethod.includes("#")) {
+        throw new AFAuthError("malformed_request", 400, "did contains DID URL component (fragment)");
+      }
+      if (afterMethod.includes("?")) {
+        throw new AFAuthError("malformed_request", 400, "did contains DID URL component (query)");
+      }
+      if (r.value.startsWith("did:key:")) {
+        // `decodeDidKey` throws on any non-canonical encoding per §3.1.1.
+        decodeDidKey(r.value);
+        return { type: "did", value: r.value };
+      }
+      if (r.value.startsWith("did:web:")) {
+        const rest = r.value.slice("did:web:".length);
+        if (rest !== rest.toLowerCase()) {
+          throw new AFAuthError("malformed_request", 400, "did:web host MUST be lowercase");
+        }
+        return { type: "did", value: r.value };
+      }
+      throw new AFAuthError(
+        "malformed_request",
+        400,
+        `unsupported did method in v0.1: ${r.value.split(":")[1]}`,
+      );
+    }
+  }
+}
+
 // ---------- Discovery document (§4) ----------
 
 /**
