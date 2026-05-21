@@ -1,6 +1,6 @@
 {
   "name": "@afauthhq/core",
-  "version": "0.0.1",
+  "version": "0.1.0-alpha.0",
   "description": "AFAuth core primitives — did:key codec, RFC 9421 canonicalisation, error envelope, shared types",
   "license": "MIT",
   "type": "module",

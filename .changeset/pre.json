@@ -1,0 +1,14 @@
+{
+  "mode": "pre",
+  "tag": "alpha",
+  "initialVersions": {
+    "@afauthhq/example-worker": "0.0.0",
+    "@afauthhq/agent": "0.0.1",
+    "@afauthhq/core": "0.0.1",
+    "@afauthhq/server": "0.0.1",
+    "@afauthhq/worker": "0.0.1"
+  },
+  "changesets": [
+    "initial-alpha"
+  ]
+}
