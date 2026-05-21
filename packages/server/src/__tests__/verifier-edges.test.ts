@@ -9,7 +9,7 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
-import { Agent } from "@afauth/agent";
+import { Agent } from "@afauthhq/agent";
 import {
   MemoryNonceStore,
   MemoryRevocationList,

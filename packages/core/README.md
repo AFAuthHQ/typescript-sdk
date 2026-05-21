@@ -1,7 +1,7 @@
-# `@afauth/core`
+# `@afauthhq/core`
 
-Shared primitives for the AFAuth Protocol — used by `@afauth/agent`,
-`@afauth/server`, and `@afauth/worker`.
+Shared primitives for the AFAuth Protocol — used by `@afauthhq/agent`,
+`@afauthhq/server`, and `@afauthhq/worker`.
 
 ## Exports
 
@@ -15,7 +15,7 @@ Shared primitives for the AFAuth Protocol — used by `@afauth/agent`,
 - **Error envelope** (§11) — `AFAuthError`, `AFAuthErrorCode`
 - **Helpers** — `deriveInvitationId(token)` for non-secret invitation IDs
 
-This package has no runtime dependencies on other `@afauth/*` packages;
+This package has no runtime dependencies on other `@afauthhq/*` packages;
 it depends on `@noble/curves` and `@noble/hashes` for crypto primitives.
 
 ## See also

@@ -13,7 +13,7 @@
  *     rejects (lax validation); absent header passes through.
  */
 
-import { Agent } from "@afauth/agent";
+import { Agent } from "@afauthhq/agent";
 import { SignJWT, exportJWK, generateKeyPair } from "jose";
 import { describe, expect, it } from "vitest";
 import {

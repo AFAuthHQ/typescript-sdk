@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { Agent } from "@afauth/agent";
+import { Agent } from "@afauthhq/agent";
 import { MemoryNonceStore, Verifier } from "../index.js";
 
 const VENDOR_DIR = join(__dirname, "..", "..", "..", "..", "vendor", "spec-vectors");

@@ -9,7 +9,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { Agent } from "@afauth/agent";
+import { Agent } from "@afauthhq/agent";
 import {
   MemoryAccountStore,
   MemoryNonceStore,

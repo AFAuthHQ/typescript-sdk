@@ -1,5 +1,5 @@
 {
-  "name": "@afauth/agent",
+  "name": "@afauthhq/agent",
   "version": "0.0.1",
   "description": "AFAuth agent SDK — keypair, did:key, signed requests, protocol-aware builders",
   "license": "MIT",
@@ -25,7 +25,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@afauth/core": "workspace:*",
+    "@afauthhq/core": "workspace:*",
     "@noble/curves": "^2.2.0"
   },
   "devDependencies": {

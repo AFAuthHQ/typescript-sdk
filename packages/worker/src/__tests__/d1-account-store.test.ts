@@ -21,8 +21,8 @@ import { Miniflare } from "miniflare";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { D1AccountStore } from "../index.js";
-import type { Recipient } from "@afauth/core";
-import type { Account } from "@afauth/server";
+import type { Recipient } from "@afauthhq/core";
+import type { Account } from "@afauthhq/server";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SCHEMA = fs.readFileSync(

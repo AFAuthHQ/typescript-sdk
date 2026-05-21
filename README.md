@@ -12,10 +12,10 @@ example Worker.
 
 | Package | Purpose |
 |---|---|
-| [`@afauth/core`](packages/core) | Shared primitives: `did:key` codec, `DidResolver` + `DidKeyResolver` + `CompositeDidResolver`, RFC 9421 canonicalisation, SHA-256 content-digest, `Recipient` types, `AFAuthError` envelope, `deriveInvitationId`, `normaliseRecipient` |
-| [`@afauth/agent`](packages/agent) | `Agent.generate()` / `fromPrivateKey()`, `signRequest`, protocol-aware builders (owner invitation, key rotation, account introspection), `fetchDiscovery` + `assertDiscoveryDocument` |
-| [`@afauth/server`](packages/server) | `Verifier` (§5.5/§5.6), `Server` (five endpoint handlers + `revoke`), `DidWebResolver` (§3.1.2), `RateLimiter` + `MemoryRateLimiter` (§11.3), `Attestor` + `HmacAttestor`/`JwksAttestor`/`MultiAttestor` (§10), `assertFreshOwnerSession` (§7.5), Memory stores, reference `consoleEmailHandler` |
-| [`@afauth/worker`](packages/worker) | Cloudflare Workers bindings: `createWorker`, `KvNonceStore`, `KvRevocationList`, `KvRateLimiter`, `D1AccountStore` (+ `migrations/0001_init.sql`) |
+| [`@afauthhq/core`](packages/core) | Shared primitives: `did:key` codec, `DidResolver` + `DidKeyResolver` + `CompositeDidResolver`, RFC 9421 canonicalisation, SHA-256 content-digest, `Recipient` types, `AFAuthError` envelope, `deriveInvitationId`, `normaliseRecipient` |
+| [`@afauthhq/agent`](packages/agent) | `Agent.generate()` / `fromPrivateKey()`, `signRequest`, protocol-aware builders (owner invitation, key rotation, account introspection), `fetchDiscovery` + `assertDiscoveryDocument` |
+| [`@afauthhq/server`](packages/server) | `Verifier` (§5.5/§5.6), `Server` (five endpoint handlers + `revoke`), `DidWebResolver` (§3.1.2), `RateLimiter` + `MemoryRateLimiter` (§11.3), `Attestor` + `HmacAttestor`/`JwksAttestor`/`MultiAttestor` (§10), `assertFreshOwnerSession` (§7.5), Memory stores, reference `consoleEmailHandler` |
+| [`@afauthhq/worker`](packages/worker) | Cloudflare Workers bindings: `createWorker`, `KvNonceStore`, `KvRevocationList`, `KvRateLimiter`, `D1AccountStore` (+ `migrations/0001_init.sql`) |
 | [`examples/worker`](examples/worker) | Reference Cloudflare Worker composing the above |
 
 ## Status
@@ -38,10 +38,10 @@ is a snapshot of the vectors from
 
 | Test surface | Count |
 |---|---|
-| `@afauth/core` | 62 (codec roundtrips, canonical input vs §C.1, content-digest, §C.4 recipient normalisation, §C.5 envelopes) |
-| `@afauth/agent` | 29 (discovery validation, §C.3 corpus) |
-| `@afauth/server` | 110 (nonce store, conformance vectors via `Verifier.verify`, ceremony, claim completion, rotation, replay-window §C.6, body shapes, verifier edge cases, did:web resolver, rate-limit gates, attestation, owner-session freshness) |
-| `@afauth/worker` | 12 (D1AccountStore: §7.3 atomic supersession, claim, rotate, revoke via in-process miniflare D1) |
+| `@afauthhq/core` | 62 (codec roundtrips, canonical input vs §C.1, content-digest, §C.4 recipient normalisation, §C.5 envelopes) |
+| `@afauthhq/agent` | 29 (discovery validation, §C.3 corpus) |
+| `@afauthhq/server` | 110 (nonce store, conformance vectors via `Verifier.verify`, ceremony, claim completion, rotation, replay-window §C.6, body shapes, verifier edge cases, did:web resolver, rate-limit gates, attestation, owner-session freshness) |
+| `@afauthhq/worker` | 12 (D1AccountStore: §7.3 atomic supersession, claim, rotate, revoke via in-process miniflare D1) |
 | **Total** | **213 tests, all green in CI** |
 
 The first publish is staged as `0.1.0-alpha.0` (see
@@ -50,7 +50,7 @@ The first publish is staged as `0.1.0-alpha.0` (see
 ## Quickstart — agent
 
 ```typescript
-import { Agent, fetchDiscovery } from "@afauth/agent";
+import { Agent, fetchDiscovery } from "@afauthhq/agent";
 
 // Generate a fresh keypair (or restore one with Agent.fromPrivateKey).
 const agent = await Agent.generate();
@@ -81,7 +81,7 @@ import {
   MemoryNonceStore,
   MemoryRevocationList,
   Server,
-} from "@afauth/server";
+} from "@afauthhq/server";
 
 const server = new Server({
   nonceStore: new MemoryNonceStore(),       // replace for production
@@ -115,7 +115,7 @@ const server = new Server({
 //   GET  /afauth/v1/accounts/me                         → server.handleAccountIntrospection(req)
 ```
 
-For Cloudflare Workers, use `createWorker` from `@afauth/worker` to
+For Cloudflare Workers, use `createWorker` from `@afauthhq/worker` to
 route all five endpoints automatically — see
 [`examples/worker`](examples/worker).
 
@@ -143,8 +143,8 @@ The headline decisions for v0.1 are:
 - **No router framework** (ADR-0002) — `createWorker` uses a small
   in-house router; no Hono, no itty-router in the runtime dep tree.
 - **DID resolver in v0.1** (ADR-0003, amended) — the SDK ships both
-  `DidKeyResolver` (in `@afauth/core`) and `DidWebResolver` (in
-  `@afauth/server`). `Verifier`'s default is `did:key`-only for
+  `DidKeyResolver` (in `@afauthhq/core`) and `DidWebResolver` (in
+  `@afauthhq/server`). `Verifier`'s default is `did:key`-only for
   backward compat; pass
   `didResolver: new CompositeDidResolver({ key: new DidKeyResolver(), web: new DidWebResolver({}) })`
   to also accept `did:web` keyids.

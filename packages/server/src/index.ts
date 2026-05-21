@@ -1,5 +1,5 @@
 /**
- * @afauth/server — Server SDK for the AFAuth Protocol.
+ * @afauthhq/server — Server SDK for the AFAuth Protocol.
  *
  * Provides:
  *   - `Verifier`: standalone request verification per §5.5 + §5.6.
@@ -43,10 +43,10 @@ import {
   type Ed25519PublicKey,
   type Recipient,
   type SignatureParams,
-} from "@afauth/core";
+} from "@afauthhq/core";
 
 // Re-export DiscoveryDocument so server consumers don't need to also
-// import from @afauth/core for this type.
+// import from @afauthhq/core for this type.
 export type { DiscoveryDocument };
 
 // ---------- Nonce store (§5.6) ----------
@@ -69,7 +69,7 @@ export interface NonceStore {
  * processes. The sweep is O(size) but amortises to O(1) per insert.
  * Production deployments that need durability across process
  * restarts should use a KV-backed `NonceStore` (e.g.
- * `@afauth/worker`'s `KvNonceStore`).
+ * `@afauthhq/worker`'s `KvNonceStore`).
  */
 export class MemoryNonceStore implements NonceStore {
   private readonly seenSet = new Map<string, number>();
@@ -439,8 +439,8 @@ export class MemoryRevocationList implements RevocationList {
 //
 // DidWebResolver is the §3.1.2 reference implementation: GET
 // https://<host>/.well-known/did.json, validate, extract the Ed25519
-// verification method, cache, return. It lives in @afauth/server (not
-// @afauth/core) because it needs HTTP fetch; @afauth/core stays
+// verification method, cache, return. It lives in @afauthhq/server (not
+// @afauthhq/core) because it needs HTTP fetch; @afauthhq/core stays
 // dependency-free for the agent.
 
 /**
@@ -741,7 +741,7 @@ function extractEd25519FromDidDocument(doc: unknown, did: Did): Ed25519PublicKey
 //
 // Named attestors (microsoft-entra-agent-id, stripe-projects, etc.)
 // are vendor-specific configurations of JwksAttestor; they ship as
-// satellite packages outside `@afauth/server` to keep core lean.
+// satellite packages outside `@afauthhq/server` to keep core lean.
 
 export interface AttestationClaims {
   /** §10.2: attestor identifier (e.g. "stripe-projects", "microsoft-entra-agent-id"). */
@@ -943,7 +943,7 @@ function validateClaims(payload: unknown, iss: string, agentDid: Did): Attestati
 // the Server's call sites.
 //
 // Two reference impls land in v0.1: `MemoryRateLimiter` (single-process,
-// for tests + small examples) and `KvRateLimiter` in `@afauth/worker`
+// for tests + small examples) and `KvRateLimiter` in `@afauthhq/worker`
 // (fixed-window counter backed by Workers KV; best-effort across
 // isolates, sufficient for §11.3 enforcement).
 
@@ -984,7 +984,7 @@ export interface RateLimiter {
 /**
  * Single-process fixed-window rate limiter. Suitable for tests and
  * small single-instance deployments; horizontally-scaled deployments
- * need a shared backend (e.g. `KvRateLimiter` in `@afauth/worker`).
+ * need a shared backend (e.g. `KvRateLimiter` in `@afauthhq/worker`).
  */
 export class MemoryRateLimiter implements RateLimiter {
   private readonly windows = new Map<string, { windowStart: number; count: number }>();
@@ -1315,7 +1315,7 @@ export function assertFreshOwnerSession(
   }
 }
 
-// DiscoveryDocument is defined in @afauth/core (single source of truth)
+// DiscoveryDocument is defined in @afauthhq/core (single source of truth)
 // and re-exported at the top of this module.
 
 export interface ServerOptions extends VerifierOptions {

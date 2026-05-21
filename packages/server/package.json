@@ -1,5 +1,5 @@
 {
-  "name": "@afauth/server",
+  "name": "@afauthhq/server",
   "version": "0.0.1",
   "description": "AFAuth server SDK — Verifier, Server, NonceStore, AccountStore, RecipientHandler",
   "license": "MIT",
@@ -25,12 +25,12 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@afauth/core": "workspace:*",
+    "@afauthhq/core": "workspace:*",
     "@noble/curves": "^2.2.0",
     "jose": "^6.2.3"
   },
   "devDependencies": {
-    "@afauth/agent": "workspace:^",
+    "@afauthhq/agent": "workspace:^",
     "tsup": "^8.0.0",
     "typescript": "^5.5.0",
     "vitest": "^2.0.0"

@@ -12,8 +12,8 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Agent } from "@afauth/agent";
-import type { Recipient } from "@afauth/core";
+import { Agent } from "@afauthhq/agent";
+import type { Recipient } from "@afauthhq/core";
 import {
   consoleEmailHandler,
   MemoryAccountStore,

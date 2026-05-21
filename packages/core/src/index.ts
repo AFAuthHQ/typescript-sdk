@@ -1,9 +1,9 @@
 /**
- * @afauth/core — shared primitives for the AFAuth Protocol.
+ * @afauthhq/core — shared primitives for the AFAuth Protocol.
  *
  * Types, codec, canonicalisation, content-digest, and error envelope.
- * The other three SDK packages (`@afauth/agent`, `@afauth/server`,
- * `@afauth/worker`) depend on this module so the canonicalisation rule
+ * The other three SDK packages (`@afauthhq/agent`, `@afauthhq/server`,
+ * `@afauthhq/worker`) depend on this module so the canonicalisation rule
  * and error shape stay aligned across the SDK.
  */
 
@@ -128,7 +128,7 @@ export function decodeDidKey(did: Did): Ed25519PublicKey {
  * key) so the Verifier can pass the error envelope straight through.
  *
  * The reference impls in this SDK are `DidKeyResolver` (in this
- * module) and `DidWebResolver` (in `@afauth/server`, since it needs
+ * module) and `DidWebResolver` (in `@afauthhq/server`, since it needs
  * HTTP). Compose them with `CompositeDidResolver` to support multiple
  * methods on the same Verifier.
  */

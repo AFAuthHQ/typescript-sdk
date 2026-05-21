@@ -1,4 +1,4 @@
-# `@afauth/server`
+# `@afauthhq/server`
 
 Service SDK for the AFAuth Protocol. Verifies signed requests per
 §5.5/§5.6, runs the owner-invitation and claim-completion ceremonies
@@ -14,7 +14,7 @@ import {
   MemoryNonceStore,
   MemoryRevocationList,
   Server,
-} from "@afauth/server";
+} from "@afauthhq/server";
 
 const server = new Server({
   nonceStore: new MemoryNonceStore(),
@@ -22,7 +22,7 @@ const server = new Server({
   serviceDid: "did:web:api.example.com",
   accounts: new MemoryAccountStore(),
   recipients: { email: consoleEmailHandler },
-  discovery: { /* see @afauth/agent DiscoveryDocument */ },
+  discovery: { /* see @afauthhq/agent DiscoveryDocument */ },
   baseUrl: "https://api.example.com",
 
   // §7.2: redirect_url is rejected unless its host is in this list.
@@ -46,7 +46,7 @@ const server = new Server({
 - **`DidWebResolver`** — §3.1.2 resolver. Fetches and validates
   `https://<host>/.well-known/did.json`; TLS-only; configurable
   positive + negative cache. Compose with `did:key` via
-  `CompositeDidResolver` from `@afauth/core` to accept both methods
+  `CompositeDidResolver` from `@afauthhq/core` to accept both methods
   in one `Verifier`.
 - **`assertFreshOwnerSession(session, { maxAgeSeconds })`** —
   §7.5 freshness floor for post-claim owner-binding routes
@@ -69,7 +69,7 @@ const server = new Server({
   Nth insert), `AccountStore` + `MemoryAccountStore` (atomic
   invitation supersession with O(1) reverse index),
   `RevocationList` + `MemoryRevocationList`. Production-grade
-  durable stores ship in [`@afauth/worker`](../worker/)
+  durable stores ship in [`@afauthhq/worker`](../worker/)
   (`D1AccountStore`, `KvNonceStore`, `KvRevocationList`,
   `KvRateLimiter`).
 - **Recipient handlers** — `RecipientHandler<R>` interface; ships
@@ -79,5 +79,5 @@ const server = new Server({
 ## See also
 
 - [`AFAuthHQ/spec`](https://github.com/AFAuthHQ/spec) — protocol spec.
-- [`@afauth/worker`](../worker/) — Cloudflare Workers bindings that
+- [`@afauthhq/worker`](../worker/) — Cloudflare Workers bindings that
   route requests to this Server's handlers.

@@ -1,7 +1,7 @@
 {
-  "name": "@afauth/example-worker",
+  "name": "@afauthhq/example-worker",
   "version": "0.0.0",
-  "description": "Reference Cloudflare Worker composing @afauth/server + @afauth/worker",
+  "description": "Reference Cloudflare Worker composing @afauthhq/server + @afauthhq/worker",
   "license": "MIT",
   "private": true,
   "type": "module",
@@ -14,9 +14,9 @@
     "deploy": "wrangler deploy"
   },
   "dependencies": {
-    "@afauth/core": "workspace:*",
-    "@afauth/server": "workspace:*",
-    "@afauth/worker": "workspace:*"
+    "@afauthhq/core": "workspace:*",
+    "@afauthhq/server": "workspace:*",
+    "@afauthhq/worker": "workspace:*"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240614.0",

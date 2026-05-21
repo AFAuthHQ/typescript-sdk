@@ -1,7 +1,7 @@
 # AFAuth example Worker
 
-Reference Cloudflare Worker composing `@afauth/server` and
-`@afauth/worker` into a deployable AFAuth-protected service.
+Reference Cloudflare Worker composing `@afauthhq/server` and
+`@afauthhq/worker` into a deployable AFAuth-protected service.
 
 ## What it does
 
@@ -40,7 +40,7 @@ Reference Cloudflare Worker composing `@afauth/server` and
 
 ```bash
 pnpm install
-pnpm --filter @afauth/example-worker dev
+pnpm --filter @afauthhq/example-worker dev
 ```
 
 Then exercise the discovery endpoint:
@@ -50,7 +50,7 @@ curl http://localhost:8787/.well-known/afauth
 ```
 
 To drive a full invitation → claim ceremony locally, use the
-`@afauth/agent` package to sign the requests; the email handler
+`@afauthhq/agent` package to sign the requests; the email handler
 will log the magic link to the Worker's stderr (`wrangler tail`).
 
 ## Deploying
@@ -61,7 +61,7 @@ wrangler kv namespace create AFAUTH_NONCES
 wrangler kv namespace create AFAUTH_REVOCATIONS
 
 # Paste the returned namespace IDs into wrangler.toml, then:
-pnpm --filter @afauth/example-worker deploy
+pnpm --filter @afauthhq/example-worker deploy
 ```
 
 The default `MemoryAccountStore` is process-local and is suitable

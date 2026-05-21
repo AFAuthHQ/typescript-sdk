@@ -1,5 +1,5 @@
 /**
- * @afauth/agent — Agent SDK for the AFAuth Protocol.
+ * @afauthhq/agent — Agent SDK for the AFAuth Protocol.
  *
  * Provides the `Agent` class for signing requests per RFC 9421 with
  * AFAuth-specific canonical components, plus protocol-aware builders
@@ -22,11 +22,11 @@ import {
   type Ed25519PrivateKey,
   type Ed25519PublicKey,
   type Recipient,
-} from "@afauth/core";
+} from "@afauthhq/core";
 
 // Re-export DiscoveryDocument so existing `import { DiscoveryDocument }
-// from "@afauth/agent"` callsites keep working. The canonical
-// definition lives in `@afauth/core` (see L7 in the M0–M4 review).
+// from "@afauthhq/agent"` callsites keep working. The canonical
+// definition lives in `@afauthhq/core` (see L7 in the M0–M4 review).
 export type { DiscoveryDocument };
 
 export interface SignedRequest {

@@ -1,17 +1,17 @@
 /**
- * @afauth/worker — Cloudflare Workers bindings for the AFAuth Protocol.
+ * @afauthhq/worker — Cloudflare Workers bindings for the AFAuth Protocol.
  *
  * `createWorker(opts)` produces a Cloudflare `ExportedHandler` that
  * routes the five AFAuth endpoints (discovery, owner-invitation,
  * claim-completion, key-rotation, account-introspection) to the
- * matching `@afauth/server` handlers. Routing is done with a small
+ * matching `@afauthhq/server` handlers. Routing is done with a small
  * in-house router per ADR-0002 — no Hono, no itty-router.
  *
  * `KvNonceStore` wraps a Cloudflare KV namespace as a `NonceStore`,
  * using KV TTL for §5.6 expiry.
  */
 
-import { AFAuthError, type Did, type AFAuthErrorCode, type Recipient } from "@afauth/core";
+import { AFAuthError, type Did, type AFAuthErrorCode, type Recipient } from "@afauthhq/core";
 import {
   Server,
   type Account,
@@ -24,7 +24,7 @@ import {
   type RateLimiter,
   type RevocationList,
   type ServerOptions,
-} from "@afauth/server";
+} from "@afauthhq/server";
 
 export interface WorkerOptions extends ServerOptions {
   /**
@@ -37,7 +37,7 @@ export interface WorkerOptions extends ServerOptions {
 }
 
 interface Resolved {
-  discovery: import("@afauth/server").DiscoveryDocument;
+  discovery: import("@afauthhq/server").DiscoveryDocument;
   ownerInvitationPath: string;
   claimCompletionPathPrefix: string;
   keyRotationPath?: string;

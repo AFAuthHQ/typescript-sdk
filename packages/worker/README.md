@@ -1,18 +1,18 @@
-# `@afauth/worker`
+# `@afauthhq/worker`
 
 Cloudflare Workers bindings for the AFAuth Protocol. Wraps
-`@afauth/server` in a Worker-native router and provides KV-backed
+`@afauthhq/server` in a Worker-native router and provides KV-backed
 storage implementations.
 
 ## Quickstart
 
 ```typescript
-import { createWorker, KvNonceStore, KvRevocationList } from "@afauth/worker";
+import { createWorker, KvNonceStore, KvRevocationList } from "@afauthhq/worker";
 import {
   consoleEmailHandler,
   MemoryAccountStore,
   type DiscoveryDocument,
-} from "@afauth/server";
+} from "@afauthhq/server";
 
 interface Env {
   AFAUTH_NONCES: KVNamespace;
@@ -42,7 +42,7 @@ export default {
 ## Exports
 
 - **`createWorker(opts)`** — returns an `ExportedHandler` routing
-  the five AFAuth endpoints to `@afauth/server` handlers. Routing is
+  the five AFAuth endpoints to `@afauthhq/server` handlers. Routing is
   done with a small in-house router (ADR-0002).
 - **`KvNonceStore`** — `NonceStore` backed by Cloudflare KV (§5.6).
   Uses KV `expirationTtl`; floored to KV's 60s minimum.
@@ -65,7 +65,7 @@ export default {
 ## See also
 
 - [`AFAuthHQ/spec`](https://github.com/AFAuthHQ/spec) — protocol spec.
-- [`@afauth/server`](../server/) — the handlers `createWorker`
+- [`@afauthhq/server`](../server/) — the handlers `createWorker`
   dispatches to.
 - [`examples/worker/`](../../examples/worker/) — runnable reference
   Worker.

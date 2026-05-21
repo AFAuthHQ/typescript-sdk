@@ -1,5 +1,5 @@
 {
-  "name": "@afauth/worker",
+  "name": "@afauthhq/worker",
   "version": "0.0.1",
   "description": "AFAuth Cloudflare Workers bindings — createWorker, KvNonceStore",
   "license": "MIT",
@@ -25,11 +25,13 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@afauth/core": "workspace:*",
-    "@afauth/server": "workspace:*"
+    "@afauthhq/core": "workspace:*",
+    "@afauthhq/server": "workspace:*"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240614.0",
+    "@types/better-sqlite3": "^7.6.13",
+    "better-sqlite3": "^12.10.0",
     "miniflare": "^4.20260518.0",
     "tsup": "^8.0.0",
     "typescript": "^5.5.0",

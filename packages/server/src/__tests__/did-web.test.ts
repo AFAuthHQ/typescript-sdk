@@ -12,7 +12,7 @@
 
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { describe, expect, it } from "vitest";
-import { AFAuthError, encodeDidKey } from "@afauth/core";
+import { AFAuthError, encodeDidKey } from "@afauthhq/core";
 import {
   DidWebResolver,
   MemoryNonceStore,
@@ -21,7 +21,7 @@ import {
 import {
   CompositeDidResolver,
   DidKeyResolver,
-} from "@afauth/core";
+} from "@afauthhq/core";
 
 // ---- helpers ----
 
@@ -366,7 +366,7 @@ describe("Verifier with CompositeDidResolver(did:key + did:web)", () => {
       keyid: did,
       alg: "ed25519" as const,
     };
-    const { buildCanonicalInput } = await import("@afauth/core");
+    const { buildCanonicalInput } = await import("@afauthhq/core");
     const canonical = buildCanonicalInput(
       { method: "GET", targetUri: "https://service.example.com/x" },
       params,

@@ -1,8 +1,8 @@
 /**
  * Reference AFAuth Cloudflare Worker.
  *
- * Wires `@afauth/server` (Verifier, Server, MemoryAccountStore,
- * consoleEmailHandler) together with `@afauth/worker` (createWorker,
+ * Wires `@afauthhq/server` (Verifier, Server, MemoryAccountStore,
+ * consoleEmailHandler) together with `@afauthhq/worker` (createWorker,
  * KvNonceStore) into a deployable Worker.
  *
  * M2 capability:
@@ -27,13 +27,13 @@ import {
   type AccountStore,
   type DiscoveryDocument,
   type OwnerSession,
-} from "@afauth/server";
+} from "@afauthhq/server";
 import {
   createWorker,
   D1AccountStore,
   KvNonceStore,
   KvRevocationList,
-} from "@afauth/worker";
+} from "@afauthhq/worker";
 
 interface Env {
   /** Optional Cloudflare KV namespace for the production nonce store. */

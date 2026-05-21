@@ -1,4 +1,4 @@
-# `@afauth/agent`
+# `@afauthhq/agent`
 
 Agent SDK for the AFAuth Protocol. Generates and uses an Ed25519
 keypair to sign requests per RFC 9421, and builds protocol-aware
@@ -7,7 +7,7 @@ requests for the v0.1 endpoints.
 ## Quickstart
 
 ```typescript
-import { Agent, fetchDiscovery } from "@afauth/agent";
+import { Agent, fetchDiscovery } from "@afauthhq/agent";
 
 const agent = await Agent.generate();
 console.log(agent.did); // "did:key:z6Mk..."
@@ -43,5 +43,5 @@ const res = await fetch(signed.url, {
 ## See also
 
 - [`AFAuthHQ/spec`](https://github.com/AFAuthHQ/spec) — protocol spec.
-- [`@afauth/core`](../core/) — shared types and primitives this
+- [`@afauthhq/core`](../core/) — shared types and primitives this
   package consumes.

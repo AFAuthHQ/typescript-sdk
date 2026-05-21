@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import type { CoveredComponent, SignatureParams } from "@afauth/core";
+import type { CoveredComponent, SignatureParams } from "@afauthhq/core";
 import { MemoryNonceStore, Verifier } from "../index.js";
 
 const SIGS_DIR = join(__dirname, "..", "..", "..", "..", "vendor", "spec-vectors", "signatures");
