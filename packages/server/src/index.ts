@@ -25,13 +25,17 @@ import { ed25519 } from "@noble/curves/ed25519.js";
 import {
   AFAuthError,
   buildCanonicalInput,
+  CompositeDidResolver,
   decodeDidKey,
   deriveInvitationId,
+  DidKeyResolver,
   normaliseRecipient,
   sha256ContentDigest,
   type CoveredComponent,
   type Did,
+  type DidResolver,
   type DiscoveryDocument,
+  type Ed25519PublicKey,
   type Recipient,
   type SignatureParams,
 } from "@afauth/core";
@@ -426,6 +430,295 @@ export class MemoryRevocationList implements RevocationList {
   }
 }
 
+// ---------- DID resolution (§3.1.2) ----------
+//
+// DidWebResolver is the §3.1.2 reference implementation: GET
+// https://<host>/.well-known/did.json, validate, extract the Ed25519
+// verification method, cache, return. It lives in @afauth/server (not
+// @afauth/core) because it needs HTTP fetch; @afauth/core stays
+// dependency-free for the agent.
+
+/**
+ * Configuration knobs for `DidWebResolver`.
+ *
+ * Production deployments SHOULD configure `positiveCacheTtlSeconds`
+ * per §3.1.2 (RECOMMENDED ≤ 1 hour) and a real `fetch` with a sensible
+ * connect-and-read timeout. The defaults below are safe but
+ * conservative.
+ */
+export interface DidWebResolverOptions {
+  /**
+   * Pluggable fetch. Defaults to `globalThis.fetch` (available in
+   * Workers, Node ≥18, Deno, browsers). Override for tests or to
+   * inject a connection pool.
+   */
+  fetch?: typeof globalThis.fetch;
+  /** Default: 300. RECOMMENDED ≤ 3600 per §3.1.2. */
+  positiveCacheTtlSeconds?: number;
+  /** Default: 60. Cache TTL for resolution FAILURES (limits hammering bad hosts). */
+  negativeCacheTtlSeconds?: number;
+  /** Default: 5000. Per-fetch timeout in milliseconds. */
+  timeoutMs?: number;
+  /** Default: 65536. Cap on the DID document body size (denial-of-service guard). */
+  maxBytes?: number;
+  /**
+   * Default: false. When false, the resolver rejects `did:web` values
+   * that would resolve to a non-https URL. Set to true ONLY for tests
+   * (e.g. talking to an httptest server on localhost).
+   */
+  allowInsecureTransport?: boolean;
+  /** Function returning current unix-second time. Overridable for tests. */
+  now?: () => number;
+}
+
+interface CacheEntry {
+  expiresAt: number;
+  ok?: Ed25519PublicKey;
+  err?: AFAuthError;
+}
+
+/**
+ * Resolver for `did:web:host[:path]` identifiers per §3.1.2 and
+ * [W3C-DID-WEB].
+ *
+ * Mapping rules (W3C-DID-WEB §3.2):
+ *   did:web:example.com           → https://example.com/.well-known/did.json
+ *   did:web:example.com:user:a    → https://example.com/user/a/did.json
+ *   did:web:example.com%3A8443    → https://example.com:8443/.well-known/did.json
+ *
+ * The fetched document MUST be a JSON object whose `verificationMethod`
+ * array contains at least one entry with an Ed25519 public key (in
+ * either `Ed25519VerificationKey2020` + `publicKeyMultibase` form, or
+ * `JsonWebKey2020` + `publicKeyJwk` with `kty=OKP, crv=Ed25519`).
+ *
+ * Caching: positive results live for `positiveCacheTtlSeconds`;
+ * negative results for `negativeCacheTtlSeconds`. The resolver does
+ * NOT honour the response's `Cache-Control`; configure the TTLs
+ * directly.
+ */
+export class DidWebResolver implements DidResolver {
+  private readonly fetchFn: typeof globalThis.fetch;
+  private readonly positiveTtl: number;
+  private readonly negativeTtl: number;
+  private readonly timeoutMs: number;
+  private readonly maxBytes: number;
+  private readonly allowInsecure: boolean;
+  private readonly now: () => number;
+  private readonly cache = new Map<Did, CacheEntry>();
+
+  constructor(opts: DidWebResolverOptions = {}) {
+    this.fetchFn = opts.fetch ?? globalThis.fetch.bind(globalThis);
+    this.positiveTtl = opts.positiveCacheTtlSeconds ?? 300;
+    this.negativeTtl = opts.negativeCacheTtlSeconds ?? 60;
+    this.timeoutMs = opts.timeoutMs ?? 5000;
+    this.maxBytes = opts.maxBytes ?? 65536;
+    this.allowInsecure = opts.allowInsecureTransport ?? false;
+    this.now = opts.now ?? (() => Math.floor(Date.now() / 1000));
+  }
+
+  /**
+   * Drop the cached result for the given DID. Used after a verify
+   * failure to satisfy §3.1.2's "re-fetch on signature verification
+   * failure" obligation — call this from your Verifier's catch path
+   * when a did:web-signed request fails Ed25519 verification.
+   */
+  invalidate(did: Did): void {
+    this.cache.delete(did);
+  }
+
+  async resolve(did: Did): Promise<Ed25519PublicKey> {
+    const cached = this.cache.get(did);
+    if (cached && cached.expiresAt > this.now()) {
+      if (cached.ok) return cached.ok;
+      if (cached.err) throw cached.err;
+    }
+
+    let pub: Ed25519PublicKey;
+    try {
+      pub = await this.fetchAndExtract(did);
+    } catch (err) {
+      const afErr = err instanceof AFAuthError
+        ? err
+        : new AFAuthError("invalid_signature", 401, `DidWebResolver: ${(err as Error).message}`);
+      this.cache.set(did, { expiresAt: this.now() + this.negativeTtl, err: afErr });
+      throw afErr;
+    }
+    this.cache.set(did, { expiresAt: this.now() + this.positiveTtl, ok: pub });
+    return pub;
+  }
+
+  private async fetchAndExtract(did: Did): Promise<Ed25519PublicKey> {
+    const url = this.urlForDid(did);
+    if (!this.allowInsecure && !url.startsWith("https://")) {
+      throw new AFAuthError(
+        "invalid_signature",
+        401,
+        `DidWebResolver: did:web MUST resolve to HTTPS; got ${url}`,
+      );
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    let resp: Response;
+    try {
+      resp = await this.fetchFn(url, {
+        method: "GET",
+        headers: { accept: "application/json" },
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (!resp.ok) {
+      throw new AFAuthError(
+        "invalid_signature",
+        401,
+        `DidWebResolver: fetch ${url} returned HTTP ${resp.status}`,
+      );
+    }
+    const ct = (resp.headers.get("content-type") ?? "").split(";")[0]!.trim().toLowerCase();
+    if (ct !== "application/json" && ct !== "application/did+json") {
+      throw new AFAuthError(
+        "invalid_signature",
+        401,
+        `DidWebResolver: fetch ${url} content-type ${ct} is not application/json`,
+      );
+    }
+
+    const buf = await resp.arrayBuffer();
+    if (buf.byteLength > this.maxBytes) {
+      throw new AFAuthError(
+        "invalid_signature",
+        401,
+        `DidWebResolver: did.json body exceeds maxBytes=${this.maxBytes}`,
+      );
+    }
+    let doc: unknown;
+    try {
+      doc = JSON.parse(new TextDecoder().decode(buf));
+    } catch (e) {
+      throw new AFAuthError("invalid_signature", 401, `DidWebResolver: malformed JSON: ${(e as Error).message}`);
+    }
+    return extractEd25519FromDidDocument(doc, did);
+  }
+
+  /**
+   * W3C-DID-WEB §3.2: colons in the method-specific identifier are
+   * replaced with slashes; the `:host[:path]` portion becomes the
+   * URL host + path; absent path → `/.well-known/did.json`.
+   *
+   * `did:web:example.com%3A8443` keeps the URL-encoded port intact.
+   */
+  private urlForDid(did: Did): string {
+    if (!did.startsWith("did:web:")) {
+      throw new AFAuthError("invalid_signature", 401, `not a did:web value: ${did}`);
+    }
+    const idspec = did.slice("did:web:".length);
+    if (idspec === "") {
+      throw new AFAuthError("invalid_signature", 401, "did:web: missing host");
+    }
+    const parts = idspec.split(":");
+    const host = decodeURIComponent(parts[0]!);
+    if (host !== host.toLowerCase()) {
+      // Matches the recipient-normalisation rule in §7.7.4.
+      throw new AFAuthError("invalid_signature", 401, "did:web host MUST be lowercase");
+    }
+    if (parts.length === 1) {
+      return `https://${host}/.well-known/did.json`;
+    }
+    const tail = parts.slice(1).map((p) => decodeURIComponent(p)).join("/");
+    return `https://${host}/${tail}/did.json`;
+  }
+}
+
+/**
+ * Walks a DID document and returns the first Ed25519 verification key.
+ * Supports the two common encodings:
+ *   - `Ed25519VerificationKey2020` + `publicKeyMultibase: "z6Mk..."`
+ *   - `JsonWebKey2020` + `publicKeyJwk: {kty:"OKP", crv:"Ed25519", x:"<b64url>"}`
+ *
+ * Throws `invalid_signature` on schema violation or missing key.
+ */
+function extractEd25519FromDidDocument(doc: unknown, did: Did): Ed25519PublicKey {
+  if (!doc || typeof doc !== "object") {
+    throw new AFAuthError("invalid_signature", 401, "DID document is not an object");
+  }
+  const d = doc as Record<string, unknown>;
+  if (typeof d.id === "string" && d.id !== did) {
+    // §3.1.2 says the document's id must match the DID being resolved.
+    throw new AFAuthError(
+      "invalid_signature",
+      401,
+      `DID document id ${d.id} does not match resolved DID ${did}`,
+    );
+  }
+  const vms = d.verificationMethod;
+  if (!Array.isArray(vms) || vms.length === 0) {
+    throw new AFAuthError(
+      "invalid_signature",
+      401,
+      "DID document has no verificationMethod entries",
+    );
+  }
+  for (const raw of vms) {
+    if (!raw || typeof raw !== "object") continue;
+    const vm = raw as Record<string, unknown>;
+    const t = vm.type;
+    if (t === "Ed25519VerificationKey2020" && typeof vm.publicKeyMultibase === "string") {
+      const mb = vm.publicKeyMultibase;
+      if (!mb.startsWith("z")) {
+        throw new AFAuthError(
+          "invalid_signature",
+          401,
+          `publicKeyMultibase must use base58btc (z…); got ${mb.slice(0, 1)}`,
+        );
+      }
+      // Reuse decodeDidKey's parser by constructing a synthetic did:key.
+      try {
+        return decodeDidKey(`did:key:${mb}`);
+      } catch (e) {
+        throw new AFAuthError(
+          "invalid_signature",
+          401,
+          `publicKeyMultibase did not decode as Ed25519: ${(e as Error).message}`,
+        );
+      }
+    }
+    if (t === "JsonWebKey2020" && raw && typeof (vm.publicKeyJwk) === "object") {
+      const jwk = vm.publicKeyJwk as Record<string, unknown>;
+      if (jwk.kty !== "OKP" || jwk.crv !== "Ed25519" || typeof jwk.x !== "string") {
+        continue;
+      }
+      const x = jwk.x as string;
+      // base64url decode.
+      const pad = x.length % 4 === 0 ? "" : "=".repeat(4 - (x.length % 4));
+      const b64 = x.replace(/-/g, "+").replace(/_/g, "/") + pad;
+      let bin: string;
+      try {
+        bin = atob(b64);
+      } catch (e) {
+        throw new AFAuthError("invalid_signature", 401, "publicKeyJwk.x is not valid base64url");
+      }
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      if (bytes.length !== 32) {
+        throw new AFAuthError(
+          "invalid_signature",
+          401,
+          `Ed25519 publicKeyJwk.x must decode to 32 bytes, got ${bytes.length}`,
+        );
+      }
+      return bytes;
+    }
+  }
+  throw new AFAuthError(
+    "invalid_signature",
+    401,
+    "DID document has no Ed25519 verification method",
+  );
+}
+
 // ---------- Verifier (§5.5) ----------
 
 export interface VerifierOptions {
@@ -441,6 +734,13 @@ export interface VerifierOptions {
    * tests), the Verifier skips the revocation check.
    */
   revocationList?: RevocationList;
+  /**
+   * Optional DID resolver. Defaults to a `did:key`-only resolver
+   * (preserves v0.1 reference-impl behaviour). Supply a
+   * `CompositeDidResolver({ key: …, web: new DidWebResolver(…) })` to
+   * also accept `did:web` keyids.
+   */
+  didResolver?: DidResolver;
   /**
    * Function returning the current unix epoch in seconds. Overridable
    * for tests; defaults to `Date.now() / 1000`.
@@ -462,6 +762,7 @@ export class Verifier {
   private readonly revocationList: RevocationList;
   private readonly clockSkew: number;
   private readonly maxLifetime: number;
+  private readonly didResolver: DidResolver;
   private readonly now: () => number;
 
   constructor(opts: VerifierOptions) {
@@ -484,6 +785,9 @@ export class Verifier {
     }
     this.clockSkew = opts.clockSkewSeconds ?? 5;
     this.maxLifetime = opts.maxSignatureLifetimeSeconds ?? 300;
+    // v0.1 reference behaviour: did:key only. Callers that want
+    // did:web pass a CompositeDidResolver({ key: …, web: … }).
+    this.didResolver = opts.didResolver ?? new DidKeyResolver();
     this.now = opts.now ?? (() => Math.floor(Date.now() / 1000));
   }
 
@@ -567,7 +871,7 @@ export class Verifier {
       params,
       covered,
     );
-    const publicKey = decodeDidKey(params.keyid);
+    const publicKey = await this.didResolver.resolve(params.keyid);
     const sigValid = ed25519.verify(
       signatureBytes,
       new TextEncoder().encode(canonicalInput),
