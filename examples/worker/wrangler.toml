@@ -1,0 +1,13 @@
+name = "afauth-example-worker"
+main = "src/index.ts"
+compatibility_date = "2024-09-01"
+
+# Uncomment to provision a KV namespace for the production nonce store.
+# Run `wrangler kv namespace create AFAUTH_NONCES` first.
+# [[kv_namespaces]]
+# binding = "AFAUTH_NONCES"
+# id = "<paste the namespace id here>"
+
+[vars]
+SERVICE_DID = "did:web:example.com"
+BASE_URL    = "https://example.com"
