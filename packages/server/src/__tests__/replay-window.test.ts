@@ -89,7 +89,10 @@ describe("§C.6 replay-window vectors", () => {
 
   for (const v of vectors) {
     if (v.expected_outcome.type === "reject") {
-      it(`${v.name}: rejects with ${v.expected_outcome.code} (${v.expected_outcome.status})`, async () => {
+      // Hoist the narrowed values so they survive into the it() closure
+      // (TS doesn't propagate discriminated-union narrowing across closures).
+      const { code: expectedCode, status: expectedStatus } = v.expected_outcome;
+      it(`${v.name}: rejects with ${expectedCode} (${expectedStatus})`, async () => {
         const nonceStore = new MemoryNonceStore();
         const verifier = makeVerifier(v, nonceStore);
         await expect(
@@ -99,10 +102,7 @@ describe("§C.6 replay-window vectors", () => {
             headers: buildHeaders(v),
             body: v.request.body,
           }),
-        ).rejects.toMatchObject({
-          code: v.expected_outcome.code,
-          status: v.expected_outcome.status,
-        });
+        ).rejects.toMatchObject({ code: expectedCode, status: expectedStatus });
       });
     } else {
       it(`${v.name}: accepts`, async () => {
