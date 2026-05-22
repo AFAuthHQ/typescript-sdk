@@ -30,6 +30,25 @@ importers:
         specifier: ^2.0.0
         version: 2.1.9(@types/node@20.19.41)
 
+  examples/recipes:
+    dependencies:
+      '@afauthhq/agent':
+        specifier: workspace:*
+        version: link:../../packages/agent
+      '@afauthhq/core':
+        specifier: workspace:*
+        version: link:../../packages/core
+      '@afauthhq/server':
+        specifier: workspace:*
+        version: link:../../packages/server
+    devDependencies:
+      typescript:
+        specifier: ^5.5.0
+        version: 5.9.3
+      vitest:
+        specifier: ^2.0.0
+        version: 2.1.9(@types/node@20.19.41)
+
   examples/worker:
     dependencies:
       '@afauthhq/core':

@@ -1,0 +1,23 @@
+{
+  "name": "@afauthhq/example-recipes",
+  "version": "0.0.1",
+  "description": "Focused, copy-paste-ready examples for each AFAuth SDK surface: verify, rotate, revoke, rate-limit, attestor.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "lint": "echo TODO: configure lint",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@afauthhq/agent": "workspace:*",
+    "@afauthhq/core": "workspace:*",
+    "@afauthhq/server": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
+  }
+}
