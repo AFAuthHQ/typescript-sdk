@@ -1066,7 +1066,7 @@ export interface VerifiedRequest {
   agentDid: Did;
   method: string;
   url: string;
-  body: string | null;
+  body: string | Uint8Array | null;
 }
 
 let warnedAboutDefaultRevocationList = false;
@@ -1109,7 +1109,14 @@ export class Verifier {
     method: string;
     url: string;
     headers: Headers;
-    body: string | null;
+    /**
+     * Raw request body. Accept `Uint8Array` (preferred — RFC 9421 §2
+     * defines `Content-Digest` over BYTES, so reading the body via
+     * `req.arrayBuffer()` is byte-accurate even for non-UTF-8 payloads
+     * like multipart, protobuf, or ZIP) or `string` (legacy ergonomic
+     * for ASCII/JSON callers — encoded via TextEncoder before hashing).
+     */
+    body: string | Uint8Array | null;
   }): Promise<VerifiedRequest> {
     const sigInputHeader = req.headers.get("signature-input");
     const sigHeader = req.headers.get("signature");
@@ -1561,18 +1568,21 @@ export class Server {
     if (req.method !== "POST") {
       throw new AFAuthError("malformed_request", 405, `method ${req.method} not allowed`);
     }
-    const body = await req.text();
+    // RFC 9421 §2: Content-Digest is computed over the raw body bytes.
+    // Read via arrayBuffer() so non-UTF-8 bodies (binary uploads,
+    // multipart, protobuf) preserve byte-identity through verification.
+    const bodyBytes = new Uint8Array(await req.arrayBuffer());
     const verified = await this.verifier.verify({
       method: req.method,
       url: req.url,
       headers: req.headers,
-      body: body === "" ? null : body,
+      body: bodyBytes.length === 0 ? null : bodyBytes,
     });
     await this.enforceRateLimit("owner_invitation", verified.agentDid);
 
     let parsed: { recipient?: Recipient; email?: string; redirect_url?: string };
     try {
-      parsed = JSON.parse(body) as typeof parsed;
+      parsed = JSON.parse(new TextDecoder().decode(bodyBytes)) as typeof parsed;
     } catch {
       throw new AFAuthError("malformed_request", 400, "request body is not valid JSON");
     }
@@ -1760,20 +1770,20 @@ export class Server {
     if (req.method !== "POST") {
       throw new AFAuthError("malformed_request", 405, `method ${req.method} not allowed`);
     }
-    const body = await req.text();
+    const bodyBytes = new Uint8Array(await req.arrayBuffer());
     // Verify the request was signed by the agent's *current* key. If
     // that key was already revoked, the verifier rejects here.
     const verified = await this.verifier.verify({
       method: req.method,
       url: req.url,
       headers: req.headers,
-      body: body === "" ? null : body,
+      body: bodyBytes.length === 0 ? null : bodyBytes,
     });
     await this.enforceRateLimit("key_rotation", verified.agentDid);
 
     let parsed: { new_account_did?: string };
     try {
-      parsed = JSON.parse(body) as typeof parsed;
+      parsed = JSON.parse(new TextDecoder().decode(bodyBytes)) as typeof parsed;
     } catch {
       throw new AFAuthError("malformed_request", 400, "request body is not valid JSON");
     }

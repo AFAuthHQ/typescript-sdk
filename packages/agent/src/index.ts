@@ -33,7 +33,14 @@ export interface SignedRequest {
   method: string;
   url: string;
   headers: Record<string, string>;
-  body: string | null;
+  /**
+   * The body that was signed. `Uint8Array` is returned when the caller
+   * supplied bytes; otherwise the original string is preserved. Both
+   * forms hash byte-identically — RFC 9421 §2 defines Content-Digest
+   * over bytes, so a `Uint8Array` body is preferred for multipart,
+   * binary, or non-UTF-8 payloads.
+   */
+  body: string | Uint8Array | null;
 }
 
 export interface SignOptions {
@@ -101,11 +108,12 @@ export class Agent {
    * the spec — see ADR-0004.
    */
   async signRequest(
-    req: { method: string; url: string; body?: string | null },
+    req: { method: string; url: string; body?: string | Uint8Array | null },
     opts: SignOptions = {},
   ): Promise<SignedRequest> {
     const body = req.body ?? null;
-    const hasBody = body !== null && body !== "";
+    const hasBody =
+      body !== null && (typeof body === "string" ? body !== "" : body.byteLength !== 0);
 
     const covered: readonly CoveredComponent[] =
       opts.coveredComponents ??
@@ -119,7 +127,7 @@ export class Agent {
     const expires = now + expiresIn;
     const nonce = opts.nonce ?? randomHexBytes(16);
 
-    const contentDigest = hasBody ? sha256ContentDigest(body) : undefined;
+    const contentDigest = hasBody ? sha256ContentDigest(body!) : undefined;
 
     if (covered.includes("content-digest") && contentDigest === undefined) {
       throw new AFAuthError(
@@ -161,7 +169,13 @@ export class Agent {
     };
     if (contentDigest) {
       headers["content-digest"] = contentDigest;
-      headers["content-type"] = "application/json";
+      // Default content-type only when the body is a string (the
+      // protocol's high-level builders post JSON). Binary callers
+      // know their own content-type and set it on the outgoing
+      // request — guessing here would lie about the payload.
+      if (typeof body === "string") {
+        headers["content-type"] = "application/json";
+      }
     }
 
     return { method: req.method, url: req.url, headers, body };

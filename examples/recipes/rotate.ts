@@ -39,7 +39,7 @@ export async function rotateAgentKey(oldAgent: Agent): Promise<Agent> {
   const res = await fetch(signed.url, {
     method: signed.method,
     headers: signed.headers,
-    body: signed.body,
+    body: signed.body as BodyInit | null,
   });
 
   if (!res.ok) {
