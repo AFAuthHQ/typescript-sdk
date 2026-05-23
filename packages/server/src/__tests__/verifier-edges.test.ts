@@ -33,7 +33,7 @@ function toHeaders(rec: Record<string, string>): Headers {
   return h;
 }
 
-function reqOf(signed: { method: string; url: string; headers: Record<string, string>; body: string | null }) {
+function reqOf(signed: { method: string; url: string; headers: Record<string, string>; body: string | Uint8Array | null }) {
   return { method: signed.method, url: signed.url, headers: toHeaders(signed.headers), body: signed.body };
 }
 
@@ -210,7 +210,7 @@ describe("ServerOptions.implicitSignup", () => {
     const agent = await Agent.generate();
     const signed = await agent.buildAccountIntrospection({ baseUrl: "https://api.example.com" });
     const init: RequestInit = { method: signed.method, headers: signed.headers };
-    if (signed.body !== null) init.body = signed.body;
+    if (signed.body !== null) init.body = signed.body as BodyInit;
     await expect(server.handleAccountIntrospection(new Request(signed.url, init))).rejects.toMatchObject({
       code: "unknown_account",
       status: 404,

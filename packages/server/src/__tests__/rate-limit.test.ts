@@ -125,7 +125,7 @@ describe("Server.handleOwnerInvitation enforces rate limits", () => {
       const req = new Request(signed.url, {
         method: signed.method,
         headers: new Headers(signed.headers),
-        body: signed.body ?? undefined,
+        body: (signed.body ?? undefined) as BodyInit | undefined,
       });
       return server.handleOwnerInvitation(req);
     }
@@ -168,7 +168,7 @@ describe("Server.handleOwnerInvitation enforces rate limits", () => {
       return server.handleOwnerInvitation(new Request(signed.url, {
         method: signed.method,
         headers: new Headers(signed.headers),
-        body: signed.body ?? undefined,
+        body: (signed.body ?? undefined) as BodyInit | undefined,
       }));
     }
 
@@ -207,7 +207,7 @@ describe("Server.handleOwnerInvitation enforces rate limits", () => {
       const r = await server.handleOwnerInvitation(new Request(signed.url, {
         method: signed.method,
         headers: new Headers(signed.headers),
-        body: signed.body ?? undefined,
+        body: (signed.body ?? undefined) as BodyInit | undefined,
       }));
       expect(r.status).toBe(202);
     }
@@ -238,7 +238,7 @@ describe("Server.handleOwnerInvitation enforces rate limits", () => {
       const r = await server.handleOwnerInvitation(new Request(signed.url, {
         method: signed.method,
         headers: new Headers(signed.headers),
-        body: signed.body ?? undefined,
+        body: (signed.body ?? undefined) as BodyInit | undefined,
       }));
       expect(r.status).toBe(202);
     }

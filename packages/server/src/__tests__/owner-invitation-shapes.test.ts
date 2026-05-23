@@ -74,10 +74,10 @@ async function toRequest(signed: {
   method: string;
   url: string;
   headers: Record<string, string>;
-  body: string | null;
+  body: string | Uint8Array | null;
 }): Promise<Request> {
   const init: RequestInit = { method: signed.method, headers: signed.headers };
-  if (signed.body !== null) init.body = signed.body;
+  if (signed.body !== null) init.body = signed.body as BodyInit;
   return new Request(signed.url, init);
 }
 
@@ -98,7 +98,7 @@ describe("§7.2 recipient body shapes", () => {
 
     const signed = await agent.buildOwnerInvitation({ baseUrl: BASE_URL, recipient });
     // Confirm the wire body matches the §7.7.3 spec example exactly.
-    const body = JSON.parse(signed.body!);
+    const body = JSON.parse(signed.body as string);
     expect(body.recipient).toEqual({
       type: "oidc",
       value: { issuer: "https://accounts.google.com", sub: "103948572345" },

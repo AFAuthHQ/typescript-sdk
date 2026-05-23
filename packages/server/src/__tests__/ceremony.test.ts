@@ -56,10 +56,10 @@ async function toRequest(signed: {
   method: string;
   url: string;
   headers: Record<string, string>;
-  body: string | null;
+  body: string | Uint8Array | null;
 }): Promise<Request> {
   const init: RequestInit = { method: signed.method, headers: signed.headers };
-  if (signed.body !== null) init.body = signed.body;
+  if (signed.body !== null) init.body = signed.body as BodyInit;
   return new Request(signed.url, init);
 }
 
