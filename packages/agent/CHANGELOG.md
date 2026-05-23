@@ -1,5 +1,17 @@
 # @afauthhq/agent
 
+## 0.1.1
+
+### Patch Changes
+
+- `signRequest` and `SignedRequest.body` now accept `Uint8Array` so JS
+  agents can sign binary bodies (multipart, ZIP, protobuf) symmetrically
+  with non-JS agents on Go/Rust/Python. The default
+  `content-type: application/json` header is set only for string bodies
+  — binary callers know their own content-type. Pairs with
+  `@afauthhq/server@0.1.1`, which fixes the symmetric server-side bug
+  that prevented byte-accurate verification.
+
 ## 0.1.0
 
 ### Minor Changes

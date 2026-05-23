@@ -1,5 +1,14 @@
 # @afauthhq/worker
 
+## 0.1.1
+
+### Patch Changes
+
+- Bumps `@afauthhq/server` dependency to `0.1.1`, which fixes binary-body
+  Content-Digest verification (`Server.handle*` now reads raw bytes via
+  `arrayBuffer()` instead of a lossy `req.text()` roundtrip). No worker
+  source changes.
+
 ## 0.1.0
 
 ### Minor Changes

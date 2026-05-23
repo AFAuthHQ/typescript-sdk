@@ -1,5 +1,29 @@
 # @afauthhq/server
 
+## 0.1.1
+
+### Patch Changes
+
+- **Fix**: Hash raw body bytes, not a UTF-8 roundtrip of them.
+
+  `Server.handleOwnerInvitation` and `handleKeyRotation` previously
+  read bodies via `await req.text()`, which replaces invalid UTF-8
+  bytes with U+FFFD before `sha256ContentDigest` re-encodes them.
+  Result: any RFC-9421-conformant agent (Go, Rust, Python) that signs
+  the raw bytes of a binary payload (multipart, ZIP, protobuf) failed
+  verification with `401 invalid_signature`. JSON bodies happened to
+  work because UTF-8 is byte-identity on ASCII.
+
+  Handlers now read via `arrayBuffer()` and pass `Uint8Array` to the
+  Verifier; JSON.parse decodes only when the route's contract requires
+  it. `Verifier.verify` and `VerifiedRequest.body` are widened to
+  `string | Uint8Array | null` — the runtime already accepted bytes
+  via `sha256ContentDigest`'s typeof-string branch; only the public
+  type signature was lying.
+
+  No protocol/spec change — RFC 9421 §2 already defines
+  `Content-Digest` over bytes.
+
 ## 0.1.0
 
 ### Minor Changes
