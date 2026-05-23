@@ -190,4 +190,70 @@ describe("D1AccountStore", () => {
     expect(fetched?.state).toBe("INVITED");
     expect(fetched?.pendingRecipient).toEqual(aliceEmail);
   });
+
+  describe("SweepableAccountStore", () => {
+    it("listOpenAccounts returns UNCLAIMED + INVITED, omits CLAIMED", async () => {
+      await store.createUnclaimed("did:key:zUnclaimed");
+
+      await store.createUnclaimed("did:key:zInvited");
+      const expiresAt = new Date(Date.now() + 3600_000).toISOString();
+      await store.setPendingInvitation("did:key:zInvited", aliceEmail, "tok", expiresAt);
+
+      await store.createUnclaimed("did:key:zClaimed");
+      await store.setPendingInvitation("did:key:zClaimed", bobEmail, "tok2", expiresAt);
+      await store.completeClaimByToken("tok2", {
+        identity: bobEmail,
+        userId: "u_b",
+        claimedAt: new Date().toISOString(),
+      });
+
+      const open = await store.listOpenAccounts();
+      const dids = open.map((a) => a.did).sort();
+      expect(dids).toEqual(["did:key:zInvited", "did:key:zUnclaimed"]);
+    });
+
+    it("expire flips state to EXPIRED and drops the pending invitation row", async () => {
+      await store.createUnclaimed("did:key:zStale");
+      const expiresAt = new Date(Date.now() + 3600_000).toISOString();
+      await store.setPendingInvitation("did:key:zStale", aliceEmail, "stale-tok", expiresAt);
+
+      const expiredAt = new Date().toISOString();
+      const out = await store.expire("did:key:zStale", expiredAt);
+      expect(out.state).toBe("EXPIRED");
+
+      // listOpenAccounts no longer surfaces it.
+      const open = await store.listOpenAccounts();
+      expect(open.map((a) => a.did)).not.toContain("did:key:zStale");
+
+      // The pending invitation has been dropped.
+      expect(await store.findByPendingToken("stale-tok")).toBeNull();
+    });
+
+    it("expire is idempotent on already-EXPIRED accounts", async () => {
+      await store.createUnclaimed("did:key:zAgent");
+      await store.expire("did:key:zAgent", new Date().toISOString());
+      const again = await store.expire("did:key:zAgent", new Date().toISOString());
+      expect(again.state).toBe("EXPIRED");
+    });
+
+    it("expire on CLAIMED throws already_claimed (Appendix A forbids the transition)", async () => {
+      await store.createUnclaimed("did:key:zClaimed");
+      const expiresAt = new Date(Date.now() + 3600_000).toISOString();
+      await store.setPendingInvitation("did:key:zClaimed", bobEmail, "tk", expiresAt);
+      await store.completeClaimByToken("tk", {
+        identity: bobEmail,
+        userId: "u",
+        claimedAt: new Date().toISOString(),
+      });
+      await expect(
+        store.expire("did:key:zClaimed", new Date().toISOString()),
+      ).rejects.toThrow(/CLAIMED/);
+    });
+
+    it("expire on unknown account throws unknown_account", async () => {
+      await expect(store.expire("did:key:zNope", new Date().toISOString())).rejects.toThrow(
+        /does not exist/,
+      );
+    });
+  });
 });

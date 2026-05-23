@@ -17,6 +17,7 @@ import {
   type Account,
   type AccountState,
   type AccountStore,
+  type SweepableAccountStore,
   type NonceStore,
   type OwnerSession,
   type RateLimitConfig,
@@ -371,7 +372,7 @@ interface InvitationRow {
 }
 
 function rowToAccount(row: AccountRow, pending?: Recipient): Account {
-  const out: Account = { did: row.did, state: row.state };
+  const out: Account = { did: row.did, state: row.state, createdAt: row.created_at };
   if (row.revoked) out.revoked = true;
   if (row.owner_json) out.owner = JSON.parse(row.owner_json) as Account["owner"];
   if (pending) out.pendingRecipient = pending;
@@ -390,7 +391,7 @@ function rowToAccount(row: AccountRow, pending?: Recipient): Account {
  * Every atomic op uses `db.batch()` to run its statements as a single
  * transaction; race-free under concurrent invocations.
  */
-export class D1AccountStore implements AccountStore {
+export class D1AccountStore implements SweepableAccountStore {
   constructor(private readonly db: D1Database) {}
 
   async get(did: Did): Promise<Account | null> {
@@ -440,7 +441,7 @@ export class D1AccountStore implements AccountStore {
       )
       .bind(did, "UNCLAIMED", nowIso, nowIso)
       .run();
-    return { did, state: "UNCLAIMED" };
+    return { did, state: "UNCLAIMED", createdAt: nowIso };
   }
 
   async setPendingInvitation(
@@ -480,7 +481,12 @@ export class D1AccountStore implements AccountStore {
         .prepare("UPDATE afauth_accounts SET state = ?, updated_at = ? WHERE did = ?")
         .bind("INVITED", nowIso, did),
     ]);
-    return { did, state: "INVITED", pendingRecipient: recipient };
+    return {
+      did,
+      state: "INVITED",
+      createdAt: account.createdAt,
+      pendingRecipient: recipient,
+    };
   }
 
   async completeClaimByToken(
@@ -537,7 +543,7 @@ export class D1AccountStore implements AccountStore {
         .bind(newDid, oldDid),
       this.db.prepare("DELETE FROM afauth_accounts WHERE did = ?").bind(oldDid),
     ]);
-    const out: Account = { did: newDid, state: old.state };
+    const out: Account = { did: newDid, state: old.state, createdAt: old.created_at };
     if (old.revoked) out.revoked = true;
     if (old.owner_json) out.owner = JSON.parse(old.owner_json) as Account["owner"];
     return out;
@@ -556,6 +562,49 @@ export class D1AccountStore implements AccountStore {
       .bind(revokedAt, did)
       .run();
     const row: AccountRow = { ...existing, revoked: 1, updated_at: revokedAt };
+    return rowToAccount(row);
+  }
+
+  async listOpenAccounts(): Promise<Account[]> {
+    const result = await this.db
+      .prepare(
+        "SELECT * FROM afauth_accounts WHERE state IN ('UNCLAIMED', 'INVITED') ORDER BY created_at ASC",
+      )
+      .all<AccountRow>();
+    return (result.results ?? []).map((row) => rowToAccount(row));
+  }
+
+  async expire(did: Did, expiredAt: string): Promise<Account> {
+    const existing = await this.db
+      .prepare("SELECT * FROM afauth_accounts WHERE did = ?")
+      .bind(did)
+      .first<AccountRow>();
+    if (!existing) {
+      throw new AFAuthError("unknown_account", 404, `account ${did} does not exist`);
+    }
+    if (existing.state === "CLAIMED") {
+      // Spec forbids CLAIMED → EXPIRED (Appendix A).
+      throw new AFAuthError(
+        "already_claimed",
+        409,
+        `account ${did} is CLAIMED; the CLAIMED → EXPIRED transition is forbidden`,
+      );
+    }
+    if (existing.state === "EXPIRED") {
+      // Idempotent.
+      return rowToAccount(existing);
+    }
+    // Atomic: flip state to EXPIRED and DELETE any pending invitation.
+    // EXPIRED accounts have no operable surface, so the pending
+    // recipient cannot be bound; dropping it matches what
+    // `MemoryAccountStore.expire` does.
+    await this.db.batch([
+      this.db
+        .prepare("UPDATE afauth_accounts SET state = ?, updated_at = ? WHERE did = ?")
+        .bind("EXPIRED", expiredAt, did),
+      this.db.prepare("DELETE FROM afauth_invitations WHERE account_did = ?").bind(did),
+    ]);
+    const row: AccountRow = { ...existing, state: "EXPIRED", updated_at: expiredAt };
     return rowToAccount(row);
   }
 }

@@ -110,6 +110,8 @@ export type AccountState = "UNCLAIMED" | "INVITED" | "CLAIMED" | "EXPIRED";
 export interface Account {
   did: Did;
   state: AccountState;
+  /** ISO-8601 timestamp the account was first materialised (§6.4/§6.5). */
+  createdAt: string;
   pendingRecipient?: Recipient;
   owner?: { identity: Recipient; userId: string; claimedAt: string };
   revoked?: boolean;
@@ -148,11 +150,45 @@ export interface AccountStore {
 }
 
 /**
+ * Optional extension of `AccountStore` for stores that can enumerate
+ * un-terminal accounts (UNCLAIMED + INVITED) and atomically transition
+ * them to EXPIRED.
+ *
+ * Required by `sweepExpiredAccounts`; not required by the rest of the
+ * SDK. Backends that cannot list (opaque KV with no index) skip
+ * implementing this and run TTL enforcement via storage-layer
+ * mechanisms instead — KV `expirationTtl` on each row, for example.
+ *
+ * Both built-in stores implement this:
+ *   - `MemoryAccountStore` (this package)
+ *   - `D1AccountStore` (`@afauthhq/worker`)
+ */
+export interface SweepableAccountStore extends AccountStore {
+  /**
+   * List every account in `UNCLAIMED` or `INVITED` state. The sweep
+   * helper calls this to find candidates for the EXPIRED transition.
+   *
+   * Implementations MAY paginate internally; the return value is the
+   * full set. Production deployments with very large numbers of open
+   * accounts should batch by `createdAt` to keep this bounded — see
+   * the `D1AccountStore` implementation as a reference.
+   */
+  listOpenAccounts(): Promise<Account[]>;
+
+  /**
+   * Transition the account to `EXPIRED`. Idempotent — calling on an
+   * already-EXPIRED account is a no-op. Calling on a CLAIMED or
+   * unknown account throws (the spec forbids CLAIMED → EXPIRED).
+   */
+  expire(did: Did, expiredAt: string): Promise<Account>;
+}
+
+/**
  * Single-process in-memory implementation of `AccountStore`. Suitable
  * for tests and small examples; production deployments should use a
  * durable backend (e.g. a KV-backed implementation).
  */
-export class MemoryAccountStore implements AccountStore {
+export class MemoryAccountStore implements SweepableAccountStore {
   private readonly accounts = new Map<Did, Account>();
   private readonly tokens = new Map<string, { did: Did; expiresAt: string }>();
   /** Reverse index: did → its current pending-invitation token, if any.
@@ -177,7 +213,11 @@ export class MemoryAccountStore implements AccountStore {
   async createUnclaimed(did: Did): Promise<Account> {
     const existing = this.accounts.get(did);
     if (existing) return existing;
-    const fresh: Account = { did, state: "UNCLAIMED" };
+    const fresh: Account = {
+      did,
+      state: "UNCLAIMED",
+      createdAt: new Date().toISOString(),
+    };
     this.accounts.set(did, fresh);
     return fresh;
   }
@@ -233,6 +273,7 @@ export class MemoryAccountStore implements AccountStore {
     const claimed: Account = {
       did: account.did,
       state: "CLAIMED",
+      createdAt: account.createdAt,
       owner,
       ...(account.revoked ? { revoked: account.revoked } : {}),
     };
@@ -271,6 +312,133 @@ export class MemoryAccountStore implements AccountStore {
     this.accounts.set(did, account);
     return { ...account };
   }
+
+  async listOpenAccounts(): Promise<Account[]> {
+    const out: Account[] = [];
+    for (const account of this.accounts.values()) {
+      if (account.state === "UNCLAIMED" || account.state === "INVITED") {
+        out.push({ ...account });
+      }
+    }
+    return out;
+  }
+
+  async expire(did: Did, _expiredAt: string): Promise<Account> {
+    const account = this.accounts.get(did);
+    if (!account) {
+      throw new AFAuthError("unknown_account", 404, `account ${did} does not exist`);
+    }
+    if (account.state === "CLAIMED") {
+      // Spec forbids CLAIMED → EXPIRED (Appendix A).
+      throw new AFAuthError(
+        "already_claimed",
+        409,
+        `account ${did} is CLAIMED; the CLAIMED → EXPIRED transition is forbidden`,
+      );
+    }
+    if (account.state === "EXPIRED") {
+      // Idempotent.
+      return { ...account };
+    }
+    account.state = "EXPIRED";
+    // Drop the pending invitation (if any) — EXPIRED accounts have no
+    // operable surface, and the pending recipient is no longer
+    // bindable.
+    if (account.pendingRecipient) delete account.pendingRecipient;
+    const tok = this.didToToken.get(did);
+    if (tok !== undefined) {
+      this.tokens.delete(tok);
+      this.didToToken.delete(did);
+    }
+    this.accounts.set(did, account);
+    return { ...account };
+  }
+}
+
+// ---------- TTL sweep (§6.1 / Appendix A) ----------
+
+export interface SweepOptions {
+  /**
+   * Service's `unclaimed_ttl_seconds` from §4.4 — the maximum age
+   * before an UNCLAIMED or INVITED account transitions to EXPIRED.
+   * Required (no sensible default — pick a value appropriate to the
+   * account's value).
+   */
+  unclaimedTtlSeconds: number;
+  /**
+   * Function returning the current `Date`. Overridable for tests.
+   * Defaults to `() => new Date()`.
+   */
+  now?: () => Date;
+}
+
+export interface SweepResult {
+  /** DIDs transitioned to EXPIRED in this run. */
+  expired: Did[];
+  /** Total accounts considered (UNCLAIMED + INVITED). */
+  scanned: number;
+}
+
+/**
+ * Periodic sweep that transitions UNCLAIMED / INVITED accounts to
+ * `EXPIRED` once they exceed `unclaimedTtlSeconds` from their
+ * `createdAt`. Spec §6.1 / Appendix A make this transition mandatory;
+ * the SDK does not run it automatically because *when* to sweep is
+ * service policy.
+ *
+ * USAGE
+ *
+ *   // Run every 15 minutes from your scheduler (cron / Workers
+ *   // scheduled trigger / Lambda EventBridge rule).
+ *   const result = await sweepExpiredAccounts(accountStore, {
+ *     unclaimedTtlSeconds: discovery.limits!.unclaimed_ttl_seconds!,
+ *   });
+ *   console.log(`expired ${result.expired.length} of ${result.scanned}`);
+ *
+ * SCOPE
+ *
+ *   - Sweeps UNCLAIMED → EXPIRED and INVITED → EXPIRED. Both transitions
+ *     are spec-mandated (Appendix A).
+ *   - Does NOT sweep INVITED → UNCLAIMED (the per-invitation TTL
+ *     transition). That transition is purely cosmetic — the account
+ *     remains operable, and the next owner-invitation atomically
+ *     supersedes the stale pending recipient anyway (§7.3). Storage
+ *     backends MAY drop the stale invitation row opportunistically on
+ *     read; `D1AccountStore.findByPendingToken` does this.
+ *   - CLAIMED accounts are never touched (Appendix A forbids
+ *     CLAIMED → EXPIRED).
+ *
+ * The transition itself is delegated to `store.expire()`, which is
+ * idempotent. A concurrent invocation of the sweep is safe: each `expire`
+ * call is atomic at the storage layer, and the second invocation is a
+ * no-op.
+ */
+export async function sweepExpiredAccounts(
+  store: SweepableAccountStore,
+  opts: SweepOptions,
+): Promise<SweepResult> {
+  if (!Number.isFinite(opts.unclaimedTtlSeconds) || opts.unclaimedTtlSeconds <= 0) {
+    throw new Error(
+      `sweepExpiredAccounts: unclaimedTtlSeconds must be a positive number; got ${opts.unclaimedTtlSeconds}`,
+    );
+  }
+  const now = opts.now ? opts.now() : new Date();
+  const cutoffMs = now.getTime() - opts.unclaimedTtlSeconds * 1000;
+  const expiredAt = now.toISOString();
+
+  const candidates = await store.listOpenAccounts();
+  const expired: Did[] = [];
+
+  for (const account of candidates) {
+    const createdMs = Date.parse(account.createdAt);
+    if (!Number.isFinite(createdMs)) continue;
+    if (createdMs <= cutoffMs) {
+      await store.expire(account.did, expiredAt);
+      expired.push(account.did);
+    }
+  }
+
+  return { expired, scanned: candidates.length };
 }
 
 // ---------- Recipient handlers (§7.7) ----------
@@ -758,8 +926,11 @@ export interface Attestor {
   /**
    * Verifies an attestation JWT for `agentDid`. Returns the parsed
    * claims on success. Throws `AFAuthError("invalid_attestation", …)`
-   * on signature/claim violation; throws `unsupported_attestor` if
-   * this attestor does not handle the token's `iss`.
+   * on signature/claim violation, including the case where the token's
+   * `iss` is not one this attestor accepts (`MultiAttestor` and
+   * single-issuer attestors both report unknown issuers as
+   * `invalid_attestation` per §11.3 — there is no separate
+   * `unsupported_attestor` code).
    */
   verify(jwt: string, agentDid: Did): Promise<AttestationClaims>;
 }
@@ -1648,6 +1819,13 @@ export class Server {
     if (account.revoked) {
       throw new AFAuthError("revoked_key", 401, "account key has been revoked");
     }
+    if (account.state === "EXPIRED") {
+      throw new AFAuthError(
+        "account_expired",
+        410,
+        "account exceeded unclaimed_ttl_seconds and is no longer operable",
+      );
+    }
     if (account.state === "CLAIMED") {
       throw new AFAuthError(
         "already_claimed",
@@ -1818,6 +1996,13 @@ export class Server {
       // Defensive — the verifier should have rejected first.
       throw new AFAuthError("revoked_key", 401, "account key has been revoked");
     }
+    if (account.state === "EXPIRED") {
+      throw new AFAuthError(
+        "account_expired",
+        410,
+        "account exceeded unclaimed_ttl_seconds and is no longer operable",
+      );
+    }
     // M3 scope: pre-claim rotation only. §8.2 (post-claim with owner
     // confirmation) is a separate ceremony tracked for later.
     if (account.state === "CLAIMED") {
@@ -1899,10 +2084,19 @@ export class Server {
     }
 
     // §7.2 / §13.2: agent-signed responses MUST NOT expose pending fields.
+    const disc = await this.resolveDiscovery();
     const body: Record<string, unknown> = {
       account_did: account.did,
       state: account.state,
+      created_at: account.createdAt,
     };
+    if (account.state === "UNCLAIMED" && disc.limits?.unclaimed_ttl_seconds) {
+      const expiresMs =
+        Date.parse(account.createdAt) + disc.limits.unclaimed_ttl_seconds * 1000;
+      if (Number.isFinite(expiresMs)) {
+        body.unclaimed_expires_at = new Date(expiresMs).toISOString();
+      }
+    }
     if (account.owner) {
       body.owner = {
         identity: account.owner.identity,
