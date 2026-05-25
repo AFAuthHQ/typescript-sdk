@@ -20,6 +20,8 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm build
       - run: pnpm test
-      - name: Coverage summary
-        run: pnpm coverage 2>&1 | tee coverage.log | tail -40
-        continue-on-error: true
+      - name: Coverage thresholds
+        # Per-package vitest.config.ts declares the floor each package
+        # must hold; vitest exits non-zero on regression. This step is
+        # the gate — it MUST NOT continue-on-error.
+        run: pnpm coverage 2>&1 | tee coverage.log | tail -60
