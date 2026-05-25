@@ -71,8 +71,14 @@ function buildWorker(opts?: {
     baseUrl: BASE_URL,
     extractOwnerSession: async () => session,
   });
+  // The worker's fetch is typed against cloudflare's incoming-request
+  // Request (`Request<unknown, IncomingRequestCfProperties>`), not the
+  // DOM Request the test constructs. The runtime accepts either —
+  // miniflare hands DOM Requests to user fetch handlers — but tsc
+  // doesn't, so we cast at this boundary.
+  const dispatch = worker.fetch! as (req: Request, env: unknown, ctx: unknown) => Promise<Response>;
   return {
-    fetch: (req) => worker.fetch!(req, {} as never, {} as never) as Promise<Response>,
+    fetch: (req) => dispatch(req, {} as never, {} as never),
     accounts,
     revocation,
     setOwnerSession: (next) => {
@@ -87,10 +93,14 @@ async function toRequest(signed: {
   headers: Record<string, string>;
   body: string | Uint8Array | null;
 }): Promise<Request> {
+  // RequestInit.body accepts BufferSource at runtime (and the DOM lib
+  // types reflect that), but workers-types narrows BodyInit in a way
+  // that excludes Uint8Array. Cast at the boundary — see fetch dispatch
+  // comment in buildWorker for the same workers-types/DOM tension.
   return new Request(signed.url, {
     method: signed.method,
     headers: signed.headers,
-    body: signed.body === null ? undefined : signed.body,
+    body: (signed.body === null ? undefined : signed.body) as BodyInit | undefined,
   });
 }
 
@@ -295,11 +305,16 @@ describe("createWorker — error envelope passthrough", () => {
         baseUrl: BASE_URL,
         extractOwnerSession: async () => null,
       });
-      const res = (await worker.fetch!(
+      const dispatch = worker.fetch! as (
+        req: Request,
+        env: unknown,
+        ctx: unknown,
+      ) => Promise<Response>;
+      const res = await dispatch(
         new Request(`${BASE_URL}/afauth/v1/accounts/me`),
         {} as never,
         {} as never,
-      )) as Response;
+      );
       expect(res.status).toBe(500);
       expect(consoleErrorSpy).toHaveBeenCalled();
     } finally {
