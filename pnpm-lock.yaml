@@ -149,6 +149,9 @@ importers:
         specifier: workspace:*
         version: link:../server
     devDependencies:
+      '@afauthhq/agent':
+        specifier: workspace:^
+        version: link:../agent
       '@cloudflare/workers-types':
         specifier: ^4.20240614.0
         version: 4.20260521.1

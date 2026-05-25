@@ -29,6 +29,7 @@
     "@afauthhq/server": "workspace:*"
   },
   "devDependencies": {
+    "@afauthhq/agent": "workspace:^",
     "@cloudflare/workers-types": "^4.20240614.0",
     "@types/better-sqlite3": "^7.6.13",
     "better-sqlite3": "^12.10.0",
