@@ -922,6 +922,19 @@ export interface AttestationClaims {
   [key: string]: unknown;
 }
 
+export interface VerifyOptions {
+  /**
+   * If supplied, the JWT's `aud` claim MUST equal this value.
+   * AFAP-0006 §10.3.1 makes audience binding mandatory for the
+   * `afauth-trust` attestor ("A service MUST reject a token whose
+   * `aud` does not match its own `service_did`"). Other attestors
+   * with `aud` semantics should pass their `service_did` here.
+   *
+   * Omitted: no aud check (preserves pre-AFAP-0006 behavior).
+   */
+  audience?: string;
+}
+
 export interface Attestor {
   /**
    * Verifies an attestation JWT for `agentDid`. Returns the parsed
@@ -932,7 +945,7 @@ export interface Attestor {
    * `invalid_attestation` per §11.3 — there is no separate
    * `unsupported_attestor` code).
    */
-  verify(jwt: string, agentDid: Did): Promise<AttestationClaims>;
+  verify(jwt: string, agentDid: Did, opts?: VerifyOptions): Promise<AttestationClaims>;
 }
 
 interface BaseAttestorOpts {
@@ -959,12 +972,13 @@ export class HmacAttestor implements Attestor {
     this.now = opts.now ?? (() => Math.floor(Date.now() / 1000));
   }
 
-  async verify(jwt: string, agentDid: Did): Promise<AttestationClaims> {
+  async verify(jwt: string, agentDid: Did, opts: VerifyOptions = {}): Promise<AttestationClaims> {
     let result: JWTVerifyResult;
     try {
       result = await jwtVerify(jwt, this.key, {
         algorithms: ["HS256"],
         issuer: this.iss,
+        ...(opts.audience ? { audience: opts.audience } : {}),
         currentDate: new Date(this.now() * 1000),
       });
     } catch (err) {
@@ -974,7 +988,7 @@ export class HmacAttestor implements Attestor {
         `HmacAttestor: ${(err as Error).message}`,
       );
     }
-    return validateClaims(result.payload, this.iss, agentDid);
+    return validateClaims(result.payload, this.iss, agentDid, opts.audience);
   }
 }
 
@@ -1007,12 +1021,13 @@ export class JwksAttestor implements Attestor {
     this.now = opts.now ?? (() => Math.floor(Date.now() / 1000));
   }
 
-  async verify(jwt: string, agentDid: Did): Promise<AttestationClaims> {
+  async verify(jwt: string, agentDid: Did, opts: VerifyOptions = {}): Promise<AttestationClaims> {
     let result: JWTVerifyResult;
     try {
       result = await jwtVerify(jwt, this.jwks, {
         algorithms: this.algorithms as string[],
         issuer: this.iss,
+        ...(opts.audience ? { audience: opts.audience } : {}),
         currentDate: new Date(this.now() * 1000),
       });
     } catch (err) {
@@ -1022,8 +1037,44 @@ export class JwksAttestor implements Attestor {
         `JwksAttestor: ${(err as Error).message}`,
       );
     }
-    return validateClaims(result.payload, this.iss, agentDid);
+    return validateClaims(result.payload, this.iss, agentDid, opts.audience);
   }
+}
+
+// ---------- afauth-trust (AFAP-0006) -----------------------------
+//
+// `afauth-trust` is the v0.1 default attestor operated by afauth.org.
+// AFAP-0006 §10.3.1 pins:
+//   - iss = "afauth-trust"
+//   - JWKS published at https://afauth.org/.well-known/jwks.json
+//   - EdDSA-signed, exp - iat ≤ 900s
+//   - audience-bound (aud = service_did)
+//   - categorical `verification` claim ∈ {"email","oauth","payment"}
+//
+// `trustAttestor()` returns a JwksAttestor pre-configured against the
+// AFAP-pinned identifier and URL. Drop into MultiAttestor alongside
+// any service-operator HMAC or platform attestor you also accept:
+//
+//   const attestor = new MultiAttestor([
+//     trustAttestor(),
+//     new HmacAttestor({ iss: "my-service", secret: SHARED_SECRET }),
+//   ]);
+
+export const AFAUTH_TRUST_ISS = "afauth-trust" as const;
+export const AFAUTH_TRUST_JWKS_URL =
+  "https://afauth.org/.well-known/jwks.json" as const;
+
+export function trustAttestor(opts: {
+  /** Override for staging / local dev. Defaults to the AFAP-pinned URL. */
+  jwksUrl?: string;
+  now?: () => number;
+} = {}): JwksAttestor {
+  return new JwksAttestor({
+    iss: AFAUTH_TRUST_ISS,
+    jwksUrl: opts.jwksUrl ?? AFAUTH_TRUST_JWKS_URL,
+    algorithms: ["EdDSA"],
+    now: opts.now,
+  });
 }
 
 /**
@@ -1050,7 +1101,7 @@ export class MultiAttestor implements Attestor {
     }
   }
 
-  async verify(jwt: string, agentDid: Did): Promise<AttestationClaims> {
+  async verify(jwt: string, agentDid: Did, opts: VerifyOptions = {}): Promise<AttestationClaims> {
     // Peek at the iss claim without verifying the signature first.
     // jose's `decodeJwt` does this safely; we just split + base64 the
     // payload to avoid pulling another export in.
@@ -1076,11 +1127,16 @@ export class MultiAttestor implements Attestor {
         `attestor ${payload.iss} not accepted by this service`,
       );
     }
-    return attestor.verify(jwt, agentDid);
+    return attestor.verify(jwt, agentDid, opts);
   }
 }
 
-function validateClaims(payload: unknown, iss: string, agentDid: Did): AttestationClaims {
+function validateClaims(
+  payload: unknown,
+  iss: string,
+  agentDid: Did,
+  audience?: string,
+): AttestationClaims {
   if (!payload || typeof payload !== "object") {
     throw new AFAuthError("invalid_attestation", 401, "JWT payload is not an object");
   }
@@ -1100,6 +1156,23 @@ function validateClaims(payload: unknown, iss: string, agentDid: Did): Attestati
   }
   if (typeof p.exp !== "number") {
     throw new AFAuthError("invalid_attestation", 401, "JWT missing exp claim");
+  }
+  // Belt-and-suspenders: jose's jwtVerify already enforces audience
+  // when supplied. We re-check here so the post-verify return value
+  // can't drift if a future jose option lands that bypasses the lib's
+  // check (and to give a stable error message shape).
+  if (audience !== undefined) {
+    const aud = p.aud;
+    const audOk =
+      aud === audience ||
+      (Array.isArray(aud) && (aud as unknown[]).includes(audience));
+    if (!audOk) {
+      throw new AFAuthError(
+        "invalid_attestation",
+        401,
+        `aud mismatch: want ${audience}, got ${JSON.stringify(aud)}`,
+      );
+    }
   }
   return p as AttestationClaims;
 }
@@ -1586,6 +1659,7 @@ export class Server {
   private readonly rateLimiter?: RateLimiter;
   private readonly rateLimits: ServerRateLimits;
   private readonly attestor?: Attestor;
+  private readonly serviceDid: Did;
 
   constructor(opts: ServerOptions) {
     // Verifier already defaults a missing revocationList to
@@ -1605,6 +1679,7 @@ export class Server {
     this.rateLimiter = opts.rateLimiter;
     this.rateLimits = opts.rateLimits ?? {};
     this.attestor = opts.attestor;
+    this.serviceDid = opts.serviceDid;
   }
 
   /**
@@ -1647,7 +1722,11 @@ export class Server {
       );
     }
     if (header && this.attestor) {
-      await this.attestor.verify(header, agentDid);
+      // Pin audience to this service's DID — AFAP-0006 §10.3.1 makes
+      // it MUST for the afauth-trust attestor, and platform/commerce
+      // attestors all benefit from the same defense against
+      // cross-service token replay.
+      await this.attestor.verify(header, agentDid, { audience: this.serviceDid });
     }
   }
 

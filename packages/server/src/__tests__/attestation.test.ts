@@ -62,15 +62,17 @@ async function makeHmacToken(opts: {
   sub: string;
   exp?: number;
   secret?: Uint8Array;
+  aud?: string;
 }): Promise<string> {
   const exp = opts.exp ?? Math.floor(Date.now() / 1000) + 60;
-  return await new SignJWT({})
+  const builder = new SignJWT({})
     .setProtectedHeader({ alg: "HS256" })
     .setIssuer(opts.iss ?? "test-attestor")
     .setSubject(opts.sub)
     .setIssuedAt(Math.floor(Date.now() / 1000))
-    .setExpirationTime(exp)
-    .sign(opts.secret ?? SECRET);
+    .setExpirationTime(exp);
+  if (opts.aud) builder.setAudience(opts.aud);
+  return await builder.sign(opts.secret ?? SECRET);
 }
 
 describe("HmacAttestor", () => {
@@ -164,6 +166,108 @@ describe("JwksAttestor", () => {
   });
 });
 
+describe("VerifyOptions.audience", () => {
+  it("HmacAttestor accepts when aud matches", async () => {
+    const att = new HmacAttestor({ iss: "x-svc", secret: SECRET });
+    const agentDid = "did:key:zAud";
+    const jwt = await new SignJWT({})
+      .setProtectedHeader({ alg: "HS256" })
+      .setIssuer("x-svc")
+      .setSubject(agentDid)
+      .setAudience("did:web:svc.example")
+      .setIssuedAt()
+      .setExpirationTime(Math.floor(Date.now() / 1000) + 60)
+      .sign(SECRET);
+    const claims = await att.verify(jwt, agentDid, { audience: "did:web:svc.example" });
+    expect(claims.sub).toBe(agentDid);
+  });
+
+  it("HmacAttestor rejects when aud mismatches", async () => {
+    const att = new HmacAttestor({ iss: "x-svc", secret: SECRET });
+    const agentDid = "did:key:zAud";
+    const jwt = await new SignJWT({})
+      .setProtectedHeader({ alg: "HS256" })
+      .setIssuer("x-svc")
+      .setSubject(agentDid)
+      .setAudience("did:web:other.example")
+      .setIssuedAt()
+      .setExpirationTime(Math.floor(Date.now() / 1000) + 60)
+      .sign(SECRET);
+    await expect(
+      att.verify(jwt, agentDid, { audience: "did:web:svc.example" }),
+    ).rejects.toThrow(/aud/i);
+  });
+
+  it("HmacAttestor without audience option does not check aud", async () => {
+    const att = new HmacAttestor({ iss: "x-svc", secret: SECRET });
+    const agentDid = "did:key:zAud";
+    const jwt = await new SignJWT({})
+      .setProtectedHeader({ alg: "HS256" })
+      .setIssuer("x-svc")
+      .setSubject(agentDid)
+      .setAudience("did:web:anywhere.example")
+      .setIssuedAt()
+      .setExpirationTime(Math.floor(Date.now() / 1000) + 60)
+      .sign(SECRET);
+    const claims = await att.verify(jwt, agentDid);
+    expect(claims.aud).toBe("did:web:anywhere.example");
+  });
+});
+
+describe("trustAttestor() — AFAP-0006 pre-config", () => {
+  it("pins iss=afauth-trust and the AFAP JWKS URL", async () => {
+    const { trustAttestor, AFAUTH_TRUST_ISS, AFAUTH_TRUST_JWKS_URL } = await import(
+      "../index.js"
+    );
+    const att = trustAttestor();
+    expect(att.iss).toBe(AFAUTH_TRUST_ISS);
+    expect(att.iss).toBe("afauth-trust");
+    expect(AFAUTH_TRUST_JWKS_URL).toBe("https://afauth.org/.well-known/jwks.json");
+  });
+
+  it("verifies a real EdDSA token minted by the trust attestor", async () => {
+    const { trustAttestor } = await import("../index.js");
+    const kid = "tk-test-1";
+    const { publicKey, privateKey } = await generateKeyPair("EdDSA");
+    const jwk = await exportJWK(publicKey);
+    jwk.kid = kid;
+    jwk.use = "sig";
+    jwk.alg = "EdDSA";
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url) => {
+      const s = url.toString();
+      if (s === "https://staging.afauth.org/.well-known/jwks.json") {
+        return new Response(JSON.stringify({ keys: [jwk] }), {
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    }) as typeof globalThis.fetch;
+
+    try {
+      const att = trustAttestor({
+        jwksUrl: "https://staging.afauth.org/.well-known/jwks.json",
+      });
+      const agentDid = "did:key:z6MkTrustTest";
+      const jwt = await new SignJWT({ verification: "email" })
+        .setProtectedHeader({ alg: "EdDSA", kid })
+        .setIssuer("afauth-trust")
+        .setSubject(agentDid)
+        .setAudience("did:web:svc.example")
+        .setIssuedAt()
+        .setExpirationTime(Math.floor(Date.now() / 1000) + 900)
+        .sign(privateKey);
+      const claims = await att.verify(jwt, agentDid);
+      expect(claims.iss).toBe("afauth-trust");
+      expect(claims.sub).toBe(agentDid);
+      expect((claims as { verification?: string }).verification).toBe("email");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
 describe("MultiAttestor", () => {
   it("dispatches to the matching iss", async () => {
     const a = new HmacAttestor({ iss: "first", secret: SECRET });
@@ -237,7 +341,8 @@ describe("Server attested_only enforcement (§9.2)", () => {
       attestor: getDefaultAttestor(),
     });
     const agent = await Agent.generate();
-    const jwt = await makeHmacToken({ sub: agent.did });
+    // Server now pins audience to its own serviceDid — tokens must include it.
+    const jwt = await makeHmacToken({ sub: agent.did, aud: SERVICE_DID });
     const signed = await agent.buildAccountIntrospection({ baseUrl: BASE_URL });
     const headers = new Headers(signed.headers);
     headers.set("afauth-attestation", jwt);
@@ -246,6 +351,24 @@ describe("Server attested_only enforcement (§9.2)", () => {
     }));
     expect(resp.status).toBe(200);
     expect(await accounts.get(agent.did)).not.toBeNull();
+  });
+
+  it("attested_only + token with wrong aud → 401 (cross-service replay defense)", async () => {
+    const { server } = newServer({
+      unclaimedMode: "attested_only",
+      attestor: getDefaultAttestor(),
+    });
+    const agent = await Agent.generate();
+    const jwt = await makeHmacToken({ sub: agent.did, aud: "did:web:wrong.example" });
+    const signed = await agent.buildAccountIntrospection({ baseUrl: BASE_URL });
+    const headers = new Headers(signed.headers);
+    headers.set("afauth-attestation", jwt);
+    const resp = await server.handleAccountIntrospection(new Request(signed.url, {
+      method: signed.method, headers,
+    })).catch((e) => (e as { toResponse: () => Response }).toResponse());
+    expect(resp.status).toBe(401);
+    const body = (await resp.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("invalid_attestation");
   });
 
   it("attested_only + invalid token → 401 invalid_attestation (no account row)", async () => {

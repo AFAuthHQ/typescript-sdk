@@ -29,6 +29,17 @@ import {
 // definition lives in `@afauthhq/core` (see L7 in the M0–M4 review).
 export type { DiscoveryDocument };
 
+// AFAP-0006 trust-attestor client.
+export {
+  TrustClient,
+  TrustHttpError,
+  AFAUTH_TRUST_DEFAULT_BASE,
+  type TrustBinding,
+  type TrustClientOptions,
+  type TrustLinkStart,
+  type TrustToken,
+} from "./trust.js";
+
 export interface SignedRequest {
   method: string;
   url: string;
