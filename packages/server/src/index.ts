@@ -1043,10 +1043,10 @@ export class JwksAttestor implements Attestor {
 
 // ---------- afauth-trust (AFAP-0006) -----------------------------
 //
-// `afauth-trust` is the v0.1 default attestor operated by afauth.org.
-// AFAP-0006 §10.3.1 pins:
+// `afauth-trust` is the v0.1 default attestor operated by afauth.org
+// at trust.afauth.org. AFAP-0006 §10.3.1 pins:
 //   - iss = "afauth-trust"
-//   - JWKS published at https://afauth.org/.well-known/jwks.json
+//   - JWKS published at https://trust.afauth.org/.well-known/jwks.json
 //   - EdDSA-signed, exp - iat ≤ 900s
 //   - audience-bound (aud = service_did)
 //   - categorical `verification` claim ∈ {"email","oauth","payment"}
@@ -1062,7 +1062,7 @@ export class JwksAttestor implements Attestor {
 
 export const AFAUTH_TRUST_ISS = "afauth-trust" as const;
 export const AFAUTH_TRUST_JWKS_URL =
-  "https://afauth.org/.well-known/jwks.json" as const;
+  "https://trust.afauth.org/.well-known/jwks.json" as const;
 
 export function trustAttestor(opts: {
   /** Override for staging / local dev. Defaults to the AFAP-pinned URL. */

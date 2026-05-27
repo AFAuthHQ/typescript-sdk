@@ -222,7 +222,7 @@ describe("trustAttestor() — AFAP-0006 pre-config", () => {
     const att = trustAttestor();
     expect(att.iss).toBe(AFAUTH_TRUST_ISS);
     expect(att.iss).toBe("afauth-trust");
-    expect(AFAUTH_TRUST_JWKS_URL).toBe("https://afauth.org/.well-known/jwks.json");
+    expect(AFAUTH_TRUST_JWKS_URL).toBe("https://trust.afauth.org/.well-known/jwks.json");
   });
 
   it("verifies a real EdDSA token minted by the trust attestor", async () => {
