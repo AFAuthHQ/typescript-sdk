@@ -1,5 +1,14 @@
 # @afauthhq/example-worker
 
+## 0.0.2
+
+### Patch Changes
+
+- Updated dependencies
+- Updated dependencies
+  - @afauthhq/server@0.2.0
+  - @afauthhq/worker@0.2.0
+
 ## 0.0.1
 
 ### Patch Changes

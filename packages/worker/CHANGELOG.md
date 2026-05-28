@@ -1,5 +1,46 @@
 # @afauthhq/worker
 
+## 0.2.0
+
+### Minor Changes
+
+- Close v0.1 spec gaps: `Account.createdAt`, `EXPIRED` state, and TTL
+  sweep helper.
+
+  **`@afauthhq/server`.** `Account.createdAt` is now a required field
+  (set by `createUnclaimed` / preserved through `claim` and `rotate`).
+  `AccountState` already declared `"EXPIRED"`; the server now actually
+  enforces it — signup and key-rotation against an EXPIRED account
+  return `account_expired` (HTTP 410). `GET /accounts/me` includes
+  `created_at`, and `unclaimed_expires_at` when the discovery doc
+  advertises `limits.unclaimed_ttl_seconds`.
+
+  New `SweepableAccountStore` interface extends `AccountStore` with
+  `listOpenAccounts()` + `expire(did, expiredAt)`. New top-level
+  `sweepExpiredAccounts(store, { unclaimedTtlSeconds })` helper
+  transitions UNCLAIMED / INVITED accounts past their TTL to EXPIRED —
+  spec §6.1 / Appendix A make this mandatory but the SDK does not run
+  it automatically (call it from your scheduler: cron, Workers
+  scheduled trigger, Lambda EventBridge). CLAIMED → EXPIRED is
+  forbidden by the spec; `expire()` throws `already_claimed` if asked.
+  `MemoryAccountStore` implements `SweepableAccountStore` out of the box.
+
+  **`@afauthhq/worker`.** `D1AccountStore` implements
+  `SweepableAccountStore`. The D1 schema already had `created_at` —
+  no migration needed. `listOpenAccounts()` queries
+  `state IN ('UNCLAIMED', 'INVITED')` ordered by `created_at`; `expire()`
+  flips state and atomically deletes any pending invitation row.
+
+  **Breaking surface** (0.x semver): third-party `AccountStore`
+  implementations now need to return `createdAt` on every `Account`.
+  Built-in stores handle this transparently.
+
+### Patch Changes
+
+- Updated dependencies
+- Updated dependencies
+  - @afauthhq/server@0.2.0
+
 ## 0.1.1
 
 ### Patch Changes
