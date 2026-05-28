@@ -918,6 +918,15 @@ export interface AttestationClaims {
   sub: string;
   /** §10.2: token expiry (unix seconds). */
   exp: number;
+  /**
+   * §10.4 pairwise human pseudonym. Present whenever the attestor
+   * asserts a binding to a stable principal (the trust attestor
+   * signals this by emitting `verification`). Opaque base64url
+   * string, 22–86 chars; safe to use as a per-service uniqueness
+   * key for the human behind the agent (§10.4.4). Services that
+   * accept multiple attestors MUST scope this by `(iss, sub_h)`.
+   */
+  sub_h?: string;
   /** Attestor-specific extra claims (raw). */
   [key: string]: unknown;
 }
@@ -1174,7 +1183,38 @@ function validateClaims(
       );
     }
   }
+
+  // §10.4.1 — when the attestor asserts a binding to a stable
+  // principal (signalled by the presence of `verification`), it MUST
+  // include a well-formed `sub_h`. Reject the JWT otherwise so a
+  // misbehaving attestor cannot silently strip the dedup signal.
+  if (p.verification !== undefined && !isWellFormedSubH(p.sub_h)) {
+    throw new AFAuthError(
+      "invalid_attestation",
+      401,
+      "attestation carries `verification` but `sub_h` is missing or malformed (§10.4.1)",
+    );
+  }
+  // If `sub_h` is present at all, it MUST satisfy §10.4.2 shape so
+  // consumers can rely on it as an opaque base64url key.
+  if (p.sub_h !== undefined && !isWellFormedSubH(p.sub_h)) {
+    throw new AFAuthError(
+      "invalid_attestation",
+      401,
+      "attestation `sub_h` is not a base64url string within [22,86] chars (§10.4.2)",
+    );
+  }
+
   return p as AttestationClaims;
+}
+
+// §10.4.2 — `sub_h` MUST be base64url with ≥128 bits of entropy
+// (22 chars at the floor, 86 at the ceiling). The regex pins the
+// alphabet (URL-safe, no padding) and length band; the entropy
+// floor is the attestor's responsibility.
+const SUB_H_RE = /^[A-Za-z0-9_-]{22,86}$/;
+function isWellFormedSubH(v: unknown): v is string {
+  return typeof v === "string" && SUB_H_RE.test(v);
 }
 
 // ---------- Rate limiter (§11.3 rate_limit_exceeded) ----------
