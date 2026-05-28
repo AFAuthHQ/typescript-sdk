@@ -214,6 +214,72 @@ describe("VerifyOptions.audience", () => {
   });
 });
 
+describe("sub_h validation — AFAP-0006 §10.4", () => {
+  const GOOD_SUB_H = "8f3cZ_K9qWmA-LpQ7tVnRsxBcD2yE0HfJgIuYpXoNkM"; // 43-char base64url
+  const SHORT_SUB_H = "tooShort"; // <22 chars
+
+  async function tokenWith(extra: Record<string, unknown>): Promise<{ jwt: string; sub: string }> {
+    const sub = "did:key:zSubH";
+    const jwt = await new SignJWT(extra)
+      .setProtectedHeader({ alg: "HS256" })
+      .setIssuer("trust-test")
+      .setSubject(sub)
+      .setIssuedAt()
+      .setExpirationTime(Math.floor(Date.now() / 1000) + 60)
+      .sign(SECRET);
+    return { jwt, sub };
+  }
+
+  function attestor() {
+    return new HmacAttestor({ iss: "trust-test", secret: SECRET });
+  }
+
+  it("accepts a token carrying verification + well-formed sub_h", async () => {
+    const { jwt, sub } = await tokenWith({ verification: "oauth", sub_h: GOOD_SUB_H });
+    const claims = await attestor().verify(jwt, sub);
+    expect(claims.verification).toBe("oauth");
+    expect(claims.sub_h).toBe(GOOD_SUB_H);
+  });
+
+  it("rejects a verification claim without sub_h (§10.4.1)", async () => {
+    const { jwt, sub } = await tokenWith({ verification: "oauth" });
+    await expect(attestor().verify(jwt, sub)).rejects.toThrow(/sub_h.*missing or malformed/);
+  });
+
+  it("rejects a sub_h shorter than 22 chars (§10.4.2)", async () => {
+    const { jwt, sub } = await tokenWith({ verification: "oauth", sub_h: SHORT_SUB_H });
+    await expect(attestor().verify(jwt, sub)).rejects.toThrow(/sub_h.*missing or malformed/);
+  });
+
+  it("rejects a sub_h containing non-base64url characters", async () => {
+    const { jwt, sub } = await tokenWith({
+      verification: "oauth",
+      sub_h: "has+plus/and=padding-which-violates-base64url-shape",
+    });
+    await expect(attestor().verify(jwt, sub)).rejects.toThrow(/sub_h/);
+  });
+
+  it("accepts a token without verification AND without sub_h (runtime attestor)", async () => {
+    const { jwt, sub } = await tokenWith({});
+    const claims = await attestor().verify(jwt, sub);
+    expect(claims.sub).toBe(sub);
+    expect(claims.sub_h).toBeUndefined();
+  });
+
+  it("rejects a malformed sub_h even when no verification claim is present", async () => {
+    const { jwt, sub } = await tokenWith({ sub_h: SHORT_SUB_H });
+    await expect(attestor().verify(jwt, sub)).rejects.toThrow(/sub_h.*not a base64url/);
+  });
+
+  it("exposes sub_h on the returned claims for service-side dedup", async () => {
+    const { jwt, sub } = await tokenWith({ verification: "payment", sub_h: GOOD_SUB_H });
+    const claims = await attestor().verify(jwt, sub);
+    // §10.4.4 — services use sub_h as a per-(iss, sub_h) dedup key.
+    expect(typeof claims.sub_h).toBe("string");
+    expect(claims.sub_h).toMatch(/^[A-Za-z0-9_-]{22,86}$/);
+  });
+});
+
 describe("trustAttestor() — AFAP-0006 pre-config", () => {
   it("pins iss=afauth-trust and the AFAP JWKS URL", async () => {
     const { trustAttestor, AFAUTH_TRUST_ISS, AFAUTH_TRUST_JWKS_URL } = await import(
@@ -250,7 +316,12 @@ describe("trustAttestor() — AFAP-0006 pre-config", () => {
         jwksUrl: "https://staging.afauth.org/.well-known/jwks.json",
       });
       const agentDid = "did:key:z6MkTrustTest";
-      const jwt = await new SignJWT({ verification: "email" })
+      const jwt = await new SignJWT({
+        verification: "email",
+        // §10.4 — trust attestor MUST include sub_h whenever
+        // `verification` is present. Test value is a 43-char base64url.
+        sub_h: "8f3cZ_K9qWmA-LpQ7tVnRsxBcD2yE0HfJgIuYpXoNkM",
+      })
         .setProtectedHeader({ alg: "EdDSA", kid })
         .setIssuer("afauth-trust")
         .setSubject(agentDid)
@@ -262,6 +333,7 @@ describe("trustAttestor() — AFAP-0006 pre-config", () => {
       expect(claims.iss).toBe("afauth-trust");
       expect(claims.sub).toBe(agentDid);
       expect((claims as { verification?: string }).verification).toBe("email");
+      expect(claims.sub_h).toMatch(/^[A-Za-z0-9_-]{22,86}$/);
     } finally {
       globalThis.fetch = originalFetch;
     }
