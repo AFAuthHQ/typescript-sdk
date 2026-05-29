@@ -10,6 +10,38 @@ discovery and account-introspection endpoints.
 ```typescript
 import {
   consoleEmailHandler,
+  defineService,
+  MemoryAccountStore,
+  MemoryNonceStore,
+} from "@afauthhq/server";
+
+const server = defineService({
+  baseUrl: "https://api.example.com",
+  serviceDid: "did:web:api.example.com",
+  accounts: new MemoryAccountStore(),
+  recipients: { email: consoleEmailHandler },
+  nonceStore: new MemoryNonceStore(),
+  // attestation: "required" (default) wires trustAttestor() and sets
+  //   discovery.billing.unclaimed_mode = "attested_only".
+  // Override with "optional" (migration path) or "off" (paid/read-only).
+});
+```
+
+`defineService` flips two protocol switches ON by default: it advertises
+`attested_only` in the discovery doc (§9.2) and configures
+`trustAttestor()` as the verifier (§10). The net effect is
+spam-resistance out of the box — un-attested implicit signups are
+rejected with 401 `attestation_required`, and downstream anti-abuse
+state can key off the per-service human pseudonym `sub_h` (§10.4).
+
+For `MultiAttestor` setups, custom `HmacAttestor`, or fully custom
+discovery, use `new Server({...})` — see [Advanced configuration](#advanced-configuration).
+
+### Advanced configuration
+
+```typescript
+import {
+  consoleEmailHandler,
   MemoryAccountStore,
   MemoryNonceStore,
   MemoryRevocationList,
@@ -35,6 +67,11 @@ const server = new Server({
 
 ## Exports
 
+- **`defineService(opts)`** — opinionated convenience factory. Returns
+  a `Server` with `attestation: "required"` defaults (`unclaimed_mode:
+  "attested_only"` + `trustAttestor()`). Pass `attestation: "optional"`
+  or `"off"` to opt out. Override `discovery`, `attestor`, etc. for
+  partial customizations; drop to `new Server({...})` for full control.
 - **`Server`** — five endpoint handlers (`handleDiscovery`,
   `handleOwnerInvitation`, `handleClaimCompletion`,
   `handleKeyRotation`, `handleAccountIntrospection`) plus

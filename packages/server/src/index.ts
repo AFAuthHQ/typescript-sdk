@@ -2230,3 +2230,152 @@ export class Server {
     return jsonResponse(body, 200);
   }
 }
+
+// ---------------------------------------------------------------------
+// defineService — opinionated convenience factory (§9.2 / §10 default-on)
+// ---------------------------------------------------------------------
+//
+// `new Server({...})` is the low-level escape hatch: pass an explicit
+// discovery doc, attestor, nonce store, revocation list, etc. It makes
+// no assumptions about attestation mode.
+//
+// `defineService({...})` is the recommended path for new integrations.
+// It flips the protocol's spam-resistance switches to ON by default:
+//
+//   - attestation: 'required' (default)
+//       → discovery.billing.unclaimed_mode = 'attested_only'
+//       → attestor = trustAttestor() (afauth-trust)
+//       → un-attested implicit signups → 401 attestation_required
+//   - attestation: 'optional'
+//       → discovery.billing.unclaimed_mode unset (open)
+//       → attestor = trustAttestor() (verifies when present, allows when absent)
+//   - attestation: 'off'
+//       → no attestor, no enforcement (matches `new Server({...})` defaults)
+//
+// Services that need MultiAttestor, custom HMAC attestors, or a fully
+// custom discovery doc should fall back to `new Server({...})`.
+
+export type AttestationMode = "required" | "optional" | "off";
+
+export interface DefineServiceOptions {
+  /** Public base URL of the service (e.g. "https://api.example.com"). */
+  baseUrl: string;
+  /** Service DID. Used as `aud` for attestation verification and in discovery. */
+  serviceDid: Did;
+  /** Persistent account store. */
+  accounts: AccountStore;
+  /** Recipient handlers for owner invitations. */
+  recipients: ServerOptions["recipients"];
+
+  /**
+   * Attestation policy. Defaults to `'required'` — spam-resistant out
+   * of the box. Set `'off'` to opt out (read-only or paid-only services).
+   */
+  attestation?: AttestationMode;
+  /**
+   * Override the default attestor. When omitted and `attestation` is
+   * `'required'` or `'optional'`, this defaults to `trustAttestor()`.
+   * Useful for pointing at a staging trust attestor, swapping in
+   * `MultiAttestor`, or layering an HMAC service-operator attestor.
+   */
+  attestor?: Attestor;
+  /**
+   * Partial discovery overrides merged on top of the synthesized
+   * document. Use this to customize endpoint paths, advertise extra
+   * `accepted_attestors`, declare `limits`, etc.
+   */
+  discovery?: Partial<DiscoveryDocument>;
+
+  // Pass-throughs to ServerOptions for less common knobs:
+  nonceStore?: NonceStore;
+  revocationList?: RevocationList;
+  rateLimiter?: RateLimiter;
+  rateLimits?: ServerRateLimits;
+  redirectAllowList?: readonly string[];
+  implicitSignup?: boolean;
+  didResolver?: DidResolver;
+  clockSkewSeconds?: number;
+  maxSignatureLifetimeSeconds?: number;
+  now?: () => number;
+}
+
+/**
+ * Build a `Server` with attestation-required defaults (§9.2).
+ *
+ *   const server = defineService({
+ *     baseUrl: 'https://api.example.com',
+ *     serviceDid: 'did:web:api.example.com',
+ *     accounts, recipients,
+ *   });
+ *
+ * Equivalent to wiring `unclaimed_mode: 'attested_only'`,
+ * `accepted_attestors: ['afauth-trust']`, and `attestor: trustAttestor()`
+ * by hand. Override `attestation: 'off'` to opt out.
+ */
+export function defineService(opts: DefineServiceOptions): Server {
+  const mode: AttestationMode = opts.attestation ?? "required";
+
+  const attestor: Attestor | undefined =
+    opts.attestor ?? (mode === "off" ? undefined : trustAttestor());
+
+  const discovery = synthesizeDiscovery({
+    baseUrl: opts.baseUrl,
+    serviceDid: opts.serviceDid,
+    mode,
+    override: opts.discovery,
+  });
+
+  return new Server({
+    baseUrl: opts.baseUrl,
+    serviceDid: opts.serviceDid,
+    accounts: opts.accounts,
+    recipients: opts.recipients,
+    discovery,
+    nonceStore: opts.nonceStore ?? new MemoryNonceStore(),
+    revocationList: opts.revocationList,
+    rateLimiter: opts.rateLimiter,
+    rateLimits: opts.rateLimits,
+    redirectAllowList: opts.redirectAllowList,
+    implicitSignup: opts.implicitSignup,
+    didResolver: opts.didResolver,
+    clockSkewSeconds: opts.clockSkewSeconds,
+    maxSignatureLifetimeSeconds: opts.maxSignatureLifetimeSeconds,
+    now: opts.now,
+    ...(attestor ? { attestor } : {}),
+  });
+}
+
+function synthesizeDiscovery(args: {
+  baseUrl: string;
+  serviceDid: Did;
+  mode: AttestationMode;
+  override?: Partial<DiscoveryDocument>;
+}): DiscoveryDocument {
+  const base = args.baseUrl.replace(/\/+$/, "");
+  const endpoints = {
+    accounts: `${base}/accounts`,
+    owner_invitation: `${base}/owner-invitations`,
+    claim_page: `${base}/claim`,
+    claim_completion: `${base}/claim/complete`,
+    ...args.override?.endpoints,
+  };
+
+  const billing: NonNullable<DiscoveryDocument["billing"]> = {
+    ...(args.mode === "required" ? { unclaimed_mode: "attested_only" } : {}),
+    ...(args.mode !== "off" ? { accepted_attestors: [AFAUTH_TRUST_ISS] } : {}),
+    ...args.override?.billing,
+  };
+
+  const { endpoints: _ignoreEndpoints, billing: _ignoreBilling, ...overrideRest } =
+    args.override ?? {};
+
+  const doc: DiscoveryDocument = {
+    afauth_version: "0.1",
+    service_did: args.serviceDid,
+    signature_algorithms: ["ed25519"],
+    ...overrideRest,
+    endpoints,
+    ...(Object.keys(billing).length > 0 ? { billing } : {}),
+  };
+  return doc;
+}
