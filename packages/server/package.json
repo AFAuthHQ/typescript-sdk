@@ -1,6 +1,6 @@
 {
   "name": "@afauthhq/server",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "AFAuth server SDK — Verifier, Server, NonceStore, AccountStore, RecipientHandler",
   "license": "MIT",
   "type": "module",

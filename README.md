@@ -21,7 +21,7 @@ example Worker.
 
 ## Status
 
-**Published on npm: `@afauthhq/{agent,server,worker}@0.2.0` + `@afauthhq/core@0.1.0`.** Tracks v0.1 of the spec.
+**Published on npm: `@afauthhq/{server,worker}@0.3.0` + `@afauthhq/agent@0.2.0` + `@afauthhq/core@0.1.0`.** Tracks v0.1 of the spec.
 
 The SDK implements milestones M0–M5 of the v0.1 spec — the full
 ceremony surface plus rotation, revocation, and full §11 error envelope
@@ -38,7 +38,7 @@ coverage — plus the four beta-hardening additions:
 - **`trustAttestor()`** factory in `@afauthhq/server` — one-line `Server` config that pre-pins `iss: "afauth-trust"`, the AFAP JWKS URL, and EdDSA. Audience binding threaded through `Attestor.verify`.
 - **Account expiry** — `Account.createdAt` is now required; `EXPIRED` state enforced with `HTTP 410 account_expired`. `SweepableAccountStore` + `sweepExpiredAccounts()` give services a hook for periodic cleanup. `D1AccountStore` implements the sweep interface (no migration — schema already had `created_at`).
 
-On top of `0.2.0`, `@afauthhq/server` adds **`defineService`** — an opinionated factory that wires `attestation: "required"` defaults (discovery `unclaimed_mode: "attested_only"` + bundled `trustAttestor()`). Spam-resistance becomes the SDK happy path: un-attested implicit signups are rejected at the wire, and downstream anti-abuse state keys off the per-service human pseudonym `sub_h` (§10.4). Override with `attestation: "optional"` (migration path) or `"off"` (read-only / paid-only).
+`@afauthhq/server@0.3.0` adds **`defineService`** — an opinionated factory that wires `attestation: "required"` defaults (discovery `unclaimed_mode: "attested_only"` + bundled `trustAttestor()`). Spam-resistance becomes the SDK happy path: un-attested implicit signups are rejected at the wire, and downstream anti-abuse state keys off the per-service human pseudonym `sub_h` (§10.4). Override with `attestation: "optional"` (migration path) or `"off"` (read-only / paid-only). `@afauthhq/worker@0.3.0` republishes against the new server.
 
 Conformance is verified against the spec's test vectors (Appendix
 C.1–C.6) — see [`vendor/spec-vectors/`](vendor/spec-vectors/), which
