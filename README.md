@@ -16,7 +16,7 @@ example Worker.
 | [`@afauthhq/core`](packages/core) | Shared primitives: `did:key` codec, `DidResolver` + `DidKeyResolver` + `CompositeDidResolver`, RFC 9421 canonicalisation, SHA-256 content-digest, `Recipient` types, `AFAuthError` envelope, `deriveInvitationId`, `normaliseRecipient` |
 | [`@afauthhq/agent`](packages/agent) | `Agent.generate()` / `fromPrivateKey()`, `signRequest`, protocol-aware builders (owner invitation, key rotation, account introspection), `fetchDiscovery` + `assertDiscoveryDocument`, **AFAP-0006 `TrustClient`** (link flow + per-service JWT minting against `afauth-trust`) |
 | [`@afauthhq/server`](packages/server) | **`defineService` factory** (spam-resistant defaults), `Verifier` (§5.5/§5.6), `Server` (five endpoint handlers + `revoke`), `DidWebResolver` (§3.1.2), `RateLimiter` + `MemoryRateLimiter` (§11.3), `Attestor` + `HmacAttestor`/`JwksAttestor`/`MultiAttestor` + `trustAttestor()` factory (§10), `assertFreshOwnerSession` (§7.5), `SweepableAccountStore` + `sweepExpiredAccounts()`, Memory stores, reference `consoleEmailHandler` |
-| [`@afauthhq/worker`](packages/worker) | Cloudflare Workers bindings: `createWorker`, `KvNonceStore`, `KvRevocationList`, `KvRateLimiter`, `D1AccountStore` (+ `migrations/0001_init.sql`, implements `SweepableAccountStore`) |
+| [`@afauthhq/worker`](packages/worker) | Cloudflare Workers bindings: `createWorker`, `KvNonceStore`, `DurableObjectNonceStore`/`createNonceDurableObject`, `KvRevocationList`, `KvRateLimiter`, `D1AccountStore` (+ `migrations/0001_init.sql`, implements `SweepableAccountStore`) |
 | [`examples/worker`](examples/worker) | Reference Cloudflare Worker composing the above |
 
 ## Status

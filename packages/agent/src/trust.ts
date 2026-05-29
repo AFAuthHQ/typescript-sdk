@@ -16,7 +16,7 @@
  *
  * The binding token is the agent's secret credential at the trust
  * attestor. It should be persisted by the caller (the AFAuth CLI
- * stores it at `~/.config/afauth/trust.json` with chmod 600).
+ * stores it at `~/.afauth/trust.json` with chmod 600).
  */
 
 import { ed25519 } from "@noble/curves/ed25519.js";
@@ -36,7 +36,7 @@ export interface TrustLinkStart {
   link_url: string;
   /** Endpoint the agent polls until state becomes "confirmed". */
   poll_url: string;
-  /** Seconds until the link request expires. Default 600. */
+  /** Seconds until the link request expires. Currently 1800 (30 minutes). */
   expires_in: number;
 }
 
