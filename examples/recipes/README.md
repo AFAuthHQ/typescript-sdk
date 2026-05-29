@@ -1,12 +1,13 @@
 # AFAuth SDK Recipes
 
-Five focused examples for surfaces that aren't covered by the full
+Six focused examples for surfaces that aren't covered by the full
 [`examples/worker`](../worker) reference Worker. Each file is a
 self-contained snippet you can lift into your own code, type-checked
 against the live SDK.
 
 | File | What it shows |
 |---|---|
+| [`define-service.ts`](./define-service.ts) | `defineService` — spam-resistant defaults (attestation required, `sub_h`-keyed) and how to opt out |
 | [`verify.ts`](./verify.ts) | Standalone `Verifier` — edge-plugin pattern per Appendix E |
 | [`rotate.ts`](./rotate.ts) | Pre-claim key rotation via `agent.buildKeyRotation` (§8.1) |
 | [`revoke.ts`](./revoke.ts) | Owner-driven revocation via `server.revoke(did)` (§8.4) |

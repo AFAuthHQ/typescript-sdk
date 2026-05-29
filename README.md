@@ -15,7 +15,7 @@ example Worker.
 |---|---|
 | [`@afauthhq/core`](packages/core) | Shared primitives: `did:key` codec, `DidResolver` + `DidKeyResolver` + `CompositeDidResolver`, RFC 9421 canonicalisation, SHA-256 content-digest, `Recipient` types, `AFAuthError` envelope, `deriveInvitationId`, `normaliseRecipient` |
 | [`@afauthhq/agent`](packages/agent) | `Agent.generate()` / `fromPrivateKey()`, `signRequest`, protocol-aware builders (owner invitation, key rotation, account introspection), `fetchDiscovery` + `assertDiscoveryDocument`, **AFAP-0006 `TrustClient`** (link flow + per-service JWT minting against `afauth-trust`) |
-| [`@afauthhq/server`](packages/server) | `Verifier` (§5.5/§5.6), `Server` (five endpoint handlers + `revoke`), `DidWebResolver` (§3.1.2), `RateLimiter` + `MemoryRateLimiter` (§11.3), `Attestor` + `HmacAttestor`/`JwksAttestor`/`MultiAttestor` + **`trustAttestor()` factory** (§10), `assertFreshOwnerSession` (§7.5), `SweepableAccountStore` + `sweepExpiredAccounts()`, Memory stores, reference `consoleEmailHandler` |
+| [`@afauthhq/server`](packages/server) | **`defineService` factory** (spam-resistant defaults), `Verifier` (§5.5/§5.6), `Server` (five endpoint handlers + `revoke`), `DidWebResolver` (§3.1.2), `RateLimiter` + `MemoryRateLimiter` (§11.3), `Attestor` + `HmacAttestor`/`JwksAttestor`/`MultiAttestor` + `trustAttestor()` factory (§10), `assertFreshOwnerSession` (§7.5), `SweepableAccountStore` + `sweepExpiredAccounts()`, Memory stores, reference `consoleEmailHandler` |
 | [`@afauthhq/worker`](packages/worker) | Cloudflare Workers bindings: `createWorker`, `KvNonceStore`, `KvRevocationList`, `KvRateLimiter`, `D1AccountStore` (+ `migrations/0001_init.sql`, implements `SweepableAccountStore`) |
 | [`examples/worker`](examples/worker) | Reference Cloudflare Worker composing the above |
 
@@ -37,6 +37,8 @@ coverage — plus the four beta-hardening additions:
 - **`TrustClient`** in `@afauthhq/agent` — drives the trust-attestor link flow (`linkStart` → `linkPoll` → per-service `token`) and caches per-audience JWTs in memory. `TrustHttpError` surfaces upstream codes (`binding_expired`, `binding_revoked`, `verification_required`) for actionable recovery prompts.
 - **`trustAttestor()`** factory in `@afauthhq/server` — one-line `Server` config that pre-pins `iss: "afauth-trust"`, the AFAP JWKS URL, and EdDSA. Audience binding threaded through `Attestor.verify`.
 - **Account expiry** — `Account.createdAt` is now required; `EXPIRED` state enforced with `HTTP 410 account_expired`. `SweepableAccountStore` + `sweepExpiredAccounts()` give services a hook for periodic cleanup. `D1AccountStore` implements the sweep interface (no migration — schema already had `created_at`).
+
+On top of `0.2.0`, `@afauthhq/server` adds **`defineService`** — an opinionated factory that wires `attestation: "required"` defaults (discovery `unclaimed_mode: "attested_only"` + bundled `trustAttestor()`). Spam-resistance becomes the SDK happy path: un-attested implicit signups are rejected at the wire, and downstream anti-abuse state keys off the per-service human pseudonym `sub_h` (§10.4). Override with `attestation: "optional"` (migration path) or `"off"` (read-only / paid-only).
 
 Conformance is verified against the spec's test vectors (Appendix
 C.1–C.6) — see [`vendor/spec-vectors/`](vendor/spec-vectors/), which
@@ -81,42 +83,35 @@ const res = await fetch(signed.url, {
 ```typescript
 import {
   consoleEmailHandler,
+  defineService,
   MemoryAccountStore,
   MemoryNonceStore,
   MemoryRevocationList,
-  Server,
 } from "@afauthhq/server";
 
-const server = new Server({
-  nonceStore: new MemoryNonceStore(),       // replace for production
-  revocationList: new MemoryRevocationList(),
+const server = defineService({
+  baseUrl: "https://api.example.com",
   serviceDid: "did:web:api.example.com",
   accounts: new MemoryAccountStore(),
   recipients: { email: consoleEmailHandler },
-  discovery: {
-    afauth_version: "0.1",
-    service_did: "did:web:api.example.com",
-    endpoints: {
-      accounts: "/afauth/v1/accounts",
-      owner_invitation: "/afauth/v1/accounts/me/owner-invitation",
-      claim_page: "/claim",
-      claim_completion: "/afauth/v1/claim",
-    },
-    signature_algorithms: ["ed25519"],
-    recipient_types: ["email"],
-  },
-  baseUrl: "https://api.example.com",
+  nonceStore: new MemoryNonceStore(),         // replace for production
+  revocationList: new MemoryRevocationList(),
+  // attestation: "required" is the default — wires trustAttestor() and
+  //   sets discovery.billing.unclaimed_mode = "attested_only".
+  // Pass "optional" for a migration path, "off" to disable entirely.
 
   // §7.2: redirect_url is rejected unless its host is in this list.
   redirectAllowList: ["yourapp.com"],
 });
 
-// In your HTTP layer, dispatch to the handlers:
+// In your HTTP layer, dispatch to the handlers. The synthesized
+// discovery doc derives these paths from baseUrl; pass a `discovery`
+// override on defineService to customize them.
 //   GET  /.well-known/afauth                            → server.handleDiscovery(req)
-//   POST /afauth/v1/accounts/me/owner-invitation        → server.handleOwnerInvitation(req)
-//   POST /afauth/v1/claim/<token>                       → server.handleClaimCompletion(req, session)
-//   POST /afauth/v1/accounts/me/keys/rotate             → server.handleKeyRotation(req)
-//   GET  /afauth/v1/accounts/me                         → server.handleAccountIntrospection(req)
+//   POST /owner-invitations                             → server.handleOwnerInvitation(req)
+//   POST /claim/complete                                → server.handleClaimCompletion(req, session)
+//   POST /accounts/me/keys/rotate                       → server.handleKeyRotation(req)
+//   GET  /accounts/me                                   → server.handleAccountIntrospection(req)
 ```
 
 For Cloudflare Workers, use `createWorker` from `@afauthhq/worker` to

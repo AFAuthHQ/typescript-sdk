@@ -61,6 +61,36 @@ tag         = "v1"
 new_classes = ["AFAuthNonceDO"]
 ```
 
+## Spam-resistant defaults
+
+`createWorker` mirrors `new Server({...})` rather than the higher-level
+[`defineService`](../server/README.md#quickstart) factory — the Worker
+needs explicit options for its DO bindings, KV namespaces, and
+`extractOwnerSession`. To get the same spam-resistance, pass
+`trustAttestor()` and declare `attested_only` on the discovery doc:
+
+```typescript
+import { trustAttestor } from "@afauthhq/server";
+
+const discovery: DiscoveryDocument = {
+  /* ... */
+  billing: {
+    unclaimed_mode: "attested_only",
+    accepted_attestors: ["afauth-trust"],
+  },
+};
+
+createWorker({
+  /* ... */
+  attestor: trustAttestor(),
+  discovery,
+});
+```
+
+Agents that haven't run `afauth trust link` will be rejected with
+`401 attestation_required`; the [`afauth signup`](https://github.com/AFAuthHQ/cli#usage)
+CLI guides them through the link flow on that error.
+
 ## Nonce store: pick DO, not KV
 
 §5.6 requires the seen-nonce set be **shared and atomic** across
