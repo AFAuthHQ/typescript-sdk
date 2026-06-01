@@ -55,8 +55,10 @@ is a snapshot of the vectors from
 
 ## Quickstart — agent
 
+> Because `defineService` (below) defaults to `attested_only`, the default agent journey links to a human once at `trust.afauth.org` and attaches a short-lived attestation per request. The two quickstarts interoperate out of the box.
+
 ```typescript
-import { Agent, fetchDiscovery } from "@afauthhq/agent";
+import { Agent, TrustClient, fetchDiscovery } from "@afauthhq/agent";
 
 // Generate a fresh keypair (or restore one with Agent.fromPrivateKey).
 const agent = await Agent.generate();
@@ -65,15 +67,31 @@ console.log(agent.did); // "did:key:z6Mk…"
 // Fetch + validate the service's discovery document.
 const disc = await fetchDiscovery("https://api.example.com");
 
-// Build and send a signed owner-invitation request.
+// Build a signed owner-invitation request.
 const signed = await agent.buildOwnerInvitation({
   baseUrl: "https://api.example.com",
   recipient: { type: "email", value: "alice@example.com" },
 });
 
+// Default services advertise unclaimed_mode "attested_only" (see the
+// service quickstart below). Link to a human once, then attach a
+// per-service attestation JWT — otherwise the signup is rejected with
+// `attestation_required`.
+const trust = new TrustClient({
+  agentDid: agent.did,
+  agentPublicKey: agent.publicKey,
+  agentPrivateKey: agent.exportPrivateKey(),
+});
+const link = await trust.linkStart({ label: "my-agent" });
+console.log(`Have a human confirm: ${link.link_url}`);
+while (!(await trust.linkPoll(link.req_id))) {
+  await new Promise((r) => setTimeout(r, 2_000));
+}
+const { jwt } = await trust.token(disc.service_did);
+
 const res = await fetch(signed.url, {
   method: signed.method,
-  headers: signed.headers,
+  headers: { ...signed.headers, "AFAuth-Attestation": jwt },
   body: signed.body,
 });
 ```

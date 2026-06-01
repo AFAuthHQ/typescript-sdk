@@ -118,3 +118,7 @@ const server = new Server({
 - [`AFAuthHQ/spec`](https://github.com/AFAuthHQ/spec) — protocol spec.
 - [`@afauthhq/worker`](../worker/) — Cloudflare Workers bindings that
   route requests to this Server's handlers.
+- [`@afauthhq/agent` → `TrustClient`](../agent/) — the agent side of the
+  default path: how an agent links to a human at `trust.afauth.org` and
+  mints the `AFAuth-Attestation` JWT this Server's `attested_only`
+  default requires.

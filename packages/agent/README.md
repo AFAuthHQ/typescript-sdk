@@ -7,7 +7,7 @@ requests for the v0.1 endpoints.
 ## Quickstart
 
 ```typescript
-import { Agent, fetchDiscovery } from "@afauthhq/agent";
+import { Agent, TrustClient, fetchDiscovery } from "@afauthhq/agent";
 
 const agent = await Agent.generate();
 console.log(agent.did); // "did:key:z6Mk..."
@@ -20,10 +20,23 @@ const signed = await agent.buildOwnerInvitation({
   recipient: { type: "email", value: "alice@example.com" },
 });
 
-// Send it:
+// Link this agent to a human once — default services require it.
+const trust = new TrustClient({
+  agentDid: agent.did,
+  agentPublicKey: agent.publicKey,
+  agentPrivateKey: agent.exportPrivateKey(),
+});
+const link = await trust.linkStart({ label: "my-agent" });
+console.log(`Open to confirm: ${link.link_url}`);
+while (!(await trust.linkPoll(link.req_id))) {
+  await new Promise((r) => setTimeout(r, 2_000));
+}
+const { jwt } = await trust.token(disc.service_did);
+
+// Send it, presenting the attestation:
 const res = await fetch(signed.url, {
   method: signed.method,
-  headers: signed.headers,
+  headers: { ...signed.headers, "AFAuth-Attestation": jwt },
   body: signed.body,
 });
 ```
@@ -39,6 +52,17 @@ const res = await fetch(signed.url, {
   `/.well-known/afauth` with full §4.3 / §4.5 validation.
 - **`assertDiscoveryDocument(value)`** — validates a parsed
   discovery doc without fetching.
+- **`TrustClient`** (AFAP-0006) — trust-attestor client. `linkStart()` →
+  show `link_url` to a human → `linkPoll(reqId)` returns a `TrustBinding`
+  (persist it). `token(serviceDid)` mints a short-lived §10 attestation
+  JWT (cached per audience) to send as the `AFAuth-Attestation` header.
+  Defaults to `trust.afauth.org` (`AFAUTH_TRUST_DEFAULT_BASE`).
+- **`TrustHttpError`** — surfaces upstream codes (`binding_expired`,
+  `binding_revoked`, `verification_required`) for actionable recovery.
+
+> Services built with `defineService` default to `attested_only`, so an
+> agent that only signs a request is rejected with `attestation_required`.
+> Link to a human and attach a `TrustClient.token()` JWT to reach them.
 
 ## See also
 
