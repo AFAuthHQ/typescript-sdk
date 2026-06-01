@@ -25,7 +25,7 @@ example Worker.
 
 The SDK implements milestones M0–M5 of the v0.1 spec — the full
 ceremony surface plus rotation, revocation, and full §11 error envelope
-coverage — plus the four beta-hardening additions:
+coverage — plus four hardening additions:
 
 - **`did:web` resolver** (§3.1.2) with TLS-only fetch, schema validation, positive + negative caching.
 - **Rate-limit helper** (§11.3 `rate_limit_exceeded`) — per-route configs, `Retry-After` on the 429.
