@@ -124,6 +124,10 @@ agent share an actor and serialize against each other.
   class. Suitable for dev/low-value deployments only.
 - **`KvRevocationList`** — `RevocationList` backed by Cloudflare KV
   (§8.3). Durable; no TTL.
+- **`KvAttestedFreshnessStore`** — `AttestedFreshnessStore` backed by
+  Cloudflare KV (§10.7). Stores each account's `attestedUntil`; the KV
+  entry's TTL is set to the remaining window, so lapsed sessions
+  self-evict. Pass to `Server` via `attestedSession: { store }`.
 - **`KvRateLimiter`** — `RateLimiter` backed by Cloudflare KV
   (§11.3). Fixed-window counter per key; eventually-consistent
   reads mean racing isolates may over-count (fail-safe per §11.3),

@@ -47,14 +47,14 @@ is a snapshot of the vectors from
 | Test surface | Count |
 |---|---|
 | `@afauthhq/core` | 62 (codec roundtrips, canonical input vs §C.1, content-digest, §C.4 recipient normalisation, §C.5 envelopes) |
-| `@afauthhq/agent` | 40 (discovery validation, §C.3 corpus, `TrustClient` link flow + token caching) |
-| `@afauthhq/server` | 135 (nonce store, conformance vectors via `Verifier.verify`, ceremony, claim completion, rotation, replay-window §C.6, body shapes, verifier edge cases, rate-limit gates, attestation incl. `trustAttestor()` + audience binding, owner-session freshness, account expiry) |
-| `@afauthhq/worker` | 42 (D1AccountStore: §7.3 atomic supersession, claim, rotate, revoke, sweep; `createWorker` routing; KV stores) |
-| **Total** | **279 tests, all green in CI** |
+| `@afauthhq/agent` | 46 (discovery validation, §C.3 corpus, `TrustClient` link flow + token caching, `AttestedFetcher` §10.7 refresh-on-challenge) |
+| `@afauthhq/server` | 162 (nonce store, conformance vectors via `Verifier.verify`, ceremony, claim completion, rotation, replay-window §C.6, body shapes, verifier edge cases, rate-limit gates, attestation incl. `trustAttestor()` + audience binding, §10.7 attested-session gate + cross-component E2E, owner-session freshness, account expiry) |
+| `@afauthhq/worker` | 53 (D1AccountStore: §7.3 atomic supersession, claim, rotate, revoke, sweep; `createWorker` routing; KV stores incl. `KvAttestedFreshnessStore`) |
+| **Total** | **323 tests, all green in CI** |
 
 ## Quickstart — agent
 
-> Because `defineService` (below) defaults to `attested_only`, the default agent journey links to a human once at `trust.afauth.org` and attaches a short-lived attestation per request. The two quickstarts interoperate out of the box.
+> Because `defineService` (below) defaults to `attested_only`, the default agent journey links to a human once at `trust.afauth.org` and presents a short-lived attestation — per request, or kept live as a §10.7 attested session (`AttestedFetcher`). The two quickstarts interoperate out of the box.
 
 ```typescript
 import { Agent, TrustClient, fetchDiscovery } from "@afauthhq/agent";

@@ -97,13 +97,21 @@ const server = new Server({
   via JWKS URL), `MultiAttestor` (dispatch by `iss`). Pass
   `attestor` to `Server`; §9.2 `attested_only` enforced
   automatically on the implicit-signup path.
+- **Attested sessions** (§10.7) — `server.verifyAttested(req)` gates
+  your own authenticated routes on a currently-valid attestation,
+  refreshing the window when the agent re-presents one and challenging
+  with `401 attestation_required` when it lapses. Configure via
+  `attestedSession: { store, mode }` (needs an `attestor`);
+  `AttestedSessionGate` is the standalone primitive. Stores:
+  `AttestedFreshnessStore` + `MemoryAttestedFreshnessStore` here,
+  `KvAttestedFreshnessStore` in [`@afauthhq/worker`](../worker/).
 - **Stores** — `NonceStore` + `MemoryNonceStore` (lazy GC on every
   Nth insert), `AccountStore` + `MemoryAccountStore` (atomic
   invitation supersession with O(1) reverse index),
   `RevocationList` + `MemoryRevocationList`. Production-grade
   durable stores ship in [`@afauthhq/worker`](../worker/)
   (`D1AccountStore`, `KvNonceStore`, `KvRevocationList`,
-  `KvRateLimiter`).
+  `KvAttestedFreshnessStore`, `KvRateLimiter`).
 - **Recipient handlers** — `RecipientHandler<R>` interface; ships
   `consoleEmailHandler` for local development (logs the magic link
   to `console.error`).
