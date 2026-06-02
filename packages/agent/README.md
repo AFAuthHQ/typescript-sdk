@@ -59,6 +59,12 @@ const res = await fetch(signed.url, {
   Defaults to `trust.afauth.org` (`AFAUTH_TRUST_DEFAULT_BASE`).
 - **`TrustHttpError`** — surfaces upstream codes (`binding_expired`,
   `binding_revoked`, `verification_required`) for actionable recovery.
+- **`AttestedFetcher`** (§10.7) — wraps an `Agent` + `TrustClient` and
+  runs the refresh-on-challenge loop: signs each request and, on
+  `401 attestation_required`, mints a fresh attestation and retries
+  once. A revoked/expired binding surfaces as a terminal
+  `TrustHttpError` rather than an unbounded retry. Reactive by default;
+  `proactive: true` attaches an attestation on the first attempt.
 
 > Services built with `defineService` default to `attested_only`, so an
 > agent that only signs a request is rejected with `attestation_required`.
