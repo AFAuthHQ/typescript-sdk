@@ -167,7 +167,7 @@ describe("M3 pre-claim key rotation (§8.1)", () => {
     spy.mockRestore();
   });
 
-  it("rotation while CLAIMED rejected — §8.2 post-claim is out of v0.1 scope", async () => {
+  it("rotation while CLAIMED rejected — agent-signed owner-binding op → owner_binding_blocked (§8.2/§11.3)", async () => {
     const { server } = buildServer();
     const agent = await Agent.generate();
     const recipient: Recipient = { type: "email", value: "alice@example.com" };
@@ -186,12 +186,16 @@ describe("M3 pre-claim key rotation (§8.1)", () => {
     );
     spy.mockRestore();
 
-    // Attempt rotation post-claim.
+    // Attempt rotation post-claim. An agent-signed key change after claim is
+    // an owner-binding operation the agent signature cannot complete (§8.2).
+    // §11.3 mandates `owner_binding_blocked` here — distinct from
+    // `owner_authentication_required`, whose "supply an owner session" remedy
+    // can NEVER complete this agent-signed path, so it must not be returned.
     await expect(
       server.handleKeyRotation(
         await toRequest(await agent.buildKeyRotation({ baseUrl: BASE_URL, newDid: newAgent.did })),
       ),
-    ).rejects.toMatchObject({ code: "owner_authentication_required", status: 403 });
+    ).rejects.toMatchObject({ code: "owner_binding_blocked", status: 403 });
   });
 
   it("invalid new_account_did rejected with 400 malformed_request", async () => {
