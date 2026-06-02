@@ -363,7 +363,7 @@ export interface DiscoveryDocument {
     key_revocation?: string;
   };
   signature_algorithms: readonly "ed25519"[];
-  features?: readonly ("attestation" | "key_rotation")[];
+  features?: readonly ("attestation" | "key_rotation" | "attested_session")[];
   recipient_types?: readonly ("email" | "phone" | "oidc" | "did")[];
   limits?: {
     unclaimed_ttl_seconds?: number;

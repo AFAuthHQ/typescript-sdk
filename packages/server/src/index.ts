@@ -969,6 +969,161 @@ function isWellFormedSubH(v: unknown): v is string {
   return typeof v === "string" && SUB_H_RE.test(v);
 }
 
+// ---------- Attested sessions (§10.7) ----------
+//
+// §10.7 lets an `attested_only` service keep a currently-valid
+// attestation ON FILE for an account and challenge with
+// `attestation_required` once it lapses, instead of demanding a fresh
+// attestation on every request (§10.6) or only at signup (the §8.5
+// blind spot). The agent re-presents a freshly-minted attestation; the
+// service verifies it offline and slides the freshness window forward.
+// Revocation latency is bounded by the window: once the binding is
+// revoked/disabled at the attestor the agent can no longer mint, so the
+// session lapses within the window.
+//
+//   - strict   : window = the attestation's own `exp` (≤ the §10.2
+//                ceiling). Never serves past a token's `exp`; introduces
+//                no relaxation of §10.6.
+//   - extended : window = `sessionTtlSeconds`, refreshed on each
+//                presentation; MAY serve that long past the last `exp`.
+//                Use only when strict mode's re-mint cadence is too
+//                costly — it trades a longer revocation latency.
+
+export type AttestedSessionMode = "strict" | "extended";
+
+/**
+ * Per-account record of how long an attested session stays fresh.
+ * `attestedUntil` is a unix-SECONDS timestamp (matching attestation
+ * `exp` and the Verifier clock). Mirrors `RevocationList`: an in-memory
+ * default ships here; `@afauthhq/worker` provides a KV-backed impl.
+ */
+export interface AttestedFreshnessStore {
+  /** The account's `attestedUntil` (unix seconds), or null if none on file. */
+  get(did: Did): Promise<number | null>;
+  /** Record/refresh the account's `attestedUntil` (unix seconds). */
+  set(did: Did, attestedUntilSeconds: number): Promise<void>;
+  /** Drop the account's session (e.g. on teardown). */
+  clear(did: Did): Promise<void>;
+}
+
+/** In-memory `AttestedFreshnessStore`. Suitable for tests and single-process services. */
+export class MemoryAttestedFreshnessStore implements AttestedFreshnessStore {
+  private readonly until = new Map<Did, number>();
+  async get(did: Did): Promise<number | null> {
+    return this.until.get(did) ?? null;
+  }
+  async set(did: Did, attestedUntilSeconds: number): Promise<void> {
+    this.until.set(did, attestedUntilSeconds);
+  }
+  async clear(did: Did): Promise<void> {
+    this.until.delete(did);
+  }
+}
+
+/**
+ * Pure §10.7 window function: the `attestedUntil` (unix seconds) a
+ * service records after verifying a freshly-presented attestation.
+ *
+ *   - strict   : the attestation's own `exp` (the attestor already
+ *                rejected an already-expired token, so `exp > now`).
+ *   - extended : `now + sessionTtlSeconds`, which MAY exceed `exp`.
+ */
+export function attestedUntilAfter(
+  claims: { exp: number },
+  mode: AttestedSessionMode,
+  nowSeconds: number,
+  sessionTtlSeconds?: number,
+): number {
+  if (mode === "extended") {
+    if (!sessionTtlSeconds || sessionTtlSeconds <= 0) {
+      throw new Error("attestedUntilAfter: extended mode requires a positive sessionTtlSeconds");
+    }
+    return nowSeconds + sessionTtlSeconds;
+  }
+  return claims.exp;
+}
+
+/** True iff a session recorded as `attestedUntil` (unix seconds) is still fresh at `nowSeconds`. */
+export function isAttestationFresh(attestedUntil: number | null, nowSeconds: number): boolean {
+  return attestedUntil !== null && nowSeconds < attestedUntil;
+}
+
+export interface AttestedSessionOptions {
+  /** Verifies presented attestations (the same attestor the Server uses at signup). */
+  attestor: Attestor;
+  /** Where per-account `attestedUntil` lives. */
+  store: AttestedFreshnessStore;
+  /** This service's DID — pinned as the attestation `aud` (AFAP-0006 §10.3.1). */
+  serviceDid: Did;
+  /** Freshness mode. Default `"strict"`. */
+  mode?: AttestedSessionMode;
+  /** Window length for `"extended"` mode (seconds). Required when mode is extended. */
+  sessionTtlSeconds?: number;
+  /** Unix-seconds clock. Overridable for tests. */
+  now?: () => number;
+  /** Optional: surfaced in the challenge's `details.accepted_attestors`. */
+  acceptedAttestors?: readonly string[];
+}
+
+/**
+ * §10.7 attested-session gate. Call `check()` on each authenticated
+ * BUSINESS request to an established `attested_only` account, after
+ * signature verification:
+ *
+ *   - If an `AFAuth-Attestation` header is present, verify it
+ *     (audience-pinned) and slide the freshness window forward. An
+ *     already-expired token is rejected by the attestor as
+ *     `invalid_attestation` (§10.2) — the window never extends a token
+ *     past its own `exp`.
+ *   - Then, if the account's session is not fresh, throw
+ *     `401 attestation_required` so the agent re-mints and retries.
+ *
+ * The per-request signature (§5) remains the authenticator; this gate
+ * is an additional liveness check, not a substitute for it.
+ */
+export class AttestedSessionGate {
+  private readonly attestor: Attestor;
+  private readonly store: AttestedFreshnessStore;
+  private readonly serviceDid: Did;
+  private readonly mode: AttestedSessionMode;
+  private readonly sessionTtlSeconds?: number;
+  private readonly now: () => number;
+  private readonly acceptedAttestors?: readonly string[];
+
+  constructor(opts: AttestedSessionOptions) {
+    if (opts.mode === "extended" && !(opts.sessionTtlSeconds && opts.sessionTtlSeconds > 0)) {
+      throw new Error("AttestedSessionGate: extended mode requires a positive sessionTtlSeconds");
+    }
+    this.attestor = opts.attestor;
+    this.store = opts.store;
+    this.serviceDid = opts.serviceDid;
+    this.mode = opts.mode ?? "strict";
+    this.sessionTtlSeconds = opts.sessionTtlSeconds;
+    this.now = opts.now ?? (() => Math.floor(Date.now() / 1000));
+    this.acceptedAttestors = opts.acceptedAttestors;
+  }
+
+  /** Process any presented attestation, then enforce freshness. Throws `401 attestation_required` when stale. */
+  async check(req: { headers: Headers }, agentDid: Did): Promise<void> {
+    const nowS = this.now();
+    const header = req.headers.get("afauth-attestation");
+    if (header) {
+      // Throws `invalid_attestation` (401) on a bad/expired token (§10.2).
+      const claims = await this.attestor.verify(header, agentDid, { audience: this.serviceDid });
+      await this.store.set(agentDid, attestedUntilAfter(claims, this.mode, nowS, this.sessionTtlSeconds));
+    }
+    const attestedUntil = await this.store.get(agentDid);
+    if (!isAttestationFresh(attestedUntil, nowS)) {
+      throw new AFAuthError(
+        "attestation_required",
+        401,
+        "attested session has lapsed; present a fresh AFAuth-Attestation (§10.7)",
+        this.acceptedAttestors ? { accepted_attestors: this.acceptedAttestors } : undefined,
+      );
+    }
+  }
+}
+
 // ---------- Rate limiter (§11.3 rate_limit_exceeded) ----------
 //
 // The protocol reserves `rate_limit_exceeded` (429) in §11.3 but takes
@@ -1428,6 +1583,20 @@ export interface ServerOptions extends VerifierOptions {
    * the §7.5 60–300s band. Lower it for higher-assurance services.
    */
   ownerSessionMaxAgeSeconds?: number;
+  /**
+   * §10.7: opt in to attested sessions. When set (and an `attestor` is
+   * configured), `Server.verifyAttested()` gates business requests on a
+   * currently-valid attestation — refreshing the window when the agent
+   * re-presents one and challenging with `attestation_required` when it
+   * lapses. Requires `attestor` (the same one used at signup).
+   */
+  attestedSession?: {
+    store: AttestedFreshnessStore;
+    /** Default `"strict"` (window = the attestation's own `exp`). */
+    mode?: AttestedSessionMode;
+    /** Window length for `"extended"` mode (seconds). */
+    sessionTtlSeconds?: number;
+  };
 }
 
 // Default invitation TTL: 24 hours (§7.3 says "service-defined";
@@ -1465,6 +1634,7 @@ export class Server {
   private readonly attestor?: Attestor;
   private readonly serviceDid: Did;
   private readonly ownerSessionMaxAgeSeconds: number;
+  private readonly attestedGate?: AttestedSessionGate;
 
   constructor(opts: ServerOptions) {
     // Verifier already defaults a missing revocationList to
@@ -1486,6 +1656,52 @@ export class Server {
     this.attestor = opts.attestor;
     this.serviceDid = opts.serviceDid;
     this.ownerSessionMaxAgeSeconds = opts.ownerSessionMaxAgeSeconds ?? 300;
+
+    if (opts.attestedSession) {
+      if (!this.attestor) {
+        throw new Error(
+          "ServerOptions.attestedSession requires an attestor to verify re-presented attestations (§10.7).",
+        );
+      }
+      this.attestedGate = new AttestedSessionGate({
+        attestor: this.attestor,
+        store: opts.attestedSession.store,
+        serviceDid: this.serviceDid,
+        mode: opts.attestedSession.mode,
+        sessionTtlSeconds: opts.attestedSession.sessionTtlSeconds,
+        now: opts.now,
+      });
+    }
+  }
+
+  /**
+   * §10.7 business-request entry for attested-session services. Verifies
+   * the signed request (like the bare Verifier), then — when
+   * `attestedSession` is configured — processes any presented
+   * `AFAuth-Attestation` header (sliding the freshness window forward)
+   * and enforces freshness, throwing `401 attestation_required` once the
+   * session has lapsed so the agent re-mints and retries.
+   *
+   * Use this on your service's OWN authenticated endpoints; the AFAuth
+   * protocol endpoints (introspection, claim, key ops) self-verify.
+   */
+  async verifyAttested(
+    req: Request,
+    body: string | Uint8Array | null = null,
+  ): Promise<VerifiedRequest> {
+    if (!this.attestedGate) {
+      throw new Error(
+        "Server.verifyAttested requires ServerOptions.attestedSession to be configured (§10.7).",
+      );
+    }
+    const verified = await this.verifier.verify({
+      method: req.method,
+      url: req.url,
+      headers: req.headers,
+      body,
+    });
+    await this.attestedGate.check(req, verified.agentDid);
+    return verified;
   }
 
   /**

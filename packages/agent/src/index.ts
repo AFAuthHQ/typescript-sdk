@@ -40,6 +40,9 @@ export {
   type TrustToken,
 } from "./trust.js";
 
+// §10.7 attested-session client (refresh-on-challenge loop).
+export { AttestedFetcher, type AttestedFetcherOptions } from "./attested-fetch.js";
+
 export interface SignedRequest {
   method: string;
   url: string;
