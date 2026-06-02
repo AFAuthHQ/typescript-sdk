@@ -305,3 +305,263 @@ describe("Verifier without a revocation list (backward compat)", () => {
     expect(resp.status).toBe(200);
   });
 });
+
+describe("MemoryAccountStore.reKey — §8.2 owner re-key resume", () => {
+  const alice: Recipient = { type: "email", value: "alice@example.com" };
+
+  async function claimedThenRevoked() {
+    const accounts = new MemoryAccountStore();
+    const exp = new Date(Date.now() + 3600_000).toISOString();
+    await accounts.createUnclaimed("did:key:zOld");
+    await accounts.setPendingInvitation("did:key:zOld", alice, "tok", exp);
+    const owner = {
+      identity: alice,
+      userId: "usr_alice",
+      claimedAt: new Date().toISOString(),
+    };
+    await accounts.completeClaimByToken("tok", owner);
+    await accounts.revoke("did:key:zOld", new Date().toISOString());
+    return { accounts, owner };
+  }
+
+  it("the bug reKey fixes: a plain rotateKey carries revoked=true onto the new DID", async () => {
+    const { accounts } = await claimedThenRevoked();
+    await accounts.rotateKey("did:key:zOld", "did:key:zRot", new Date().toISOString());
+    // Why reKey exists: rotate alone spreads the old row forward, so a
+    // "revoke then install new key" via rotateKey leaves the new DID
+    // still flagged revoked.
+    expect((await accounts.get("did:key:zRot"))?.revoked).toBe(true);
+  });
+
+  it("reKey installs the new DID, CLEARS revoked, preserves owner, drops the old DID", async () => {
+    const { accounts, owner } = await claimedThenRevoked();
+    const out = await accounts.reKey("did:key:zOld", "did:key:zNew", new Date().toISOString());
+
+    expect(out.did).toBe("did:key:zNew");
+    expect(out.state).toBe("CLAIMED");
+    // The load-bearing assertion is the ROW flag — NOT "the Verifier
+    // accepts the new key", which is true regardless because the new DID
+    // is never added to the revocation list.
+    expect(out.revoked).toBeFalsy();
+    expect((await accounts.get("did:key:zNew"))?.revoked).toBeFalsy();
+    // Owner binding carries forward — the same human keeps the account.
+    expect((await accounts.get("did:key:zNew"))?.owner).toEqual(owner);
+    // Old DID is gone.
+    expect(await accounts.get("did:key:zOld")).toBeNull();
+    // A flag-reading surface agrees it is clean: setPendingInvitation no
+    // longer short-circuits on `revoked` (it now hits the CLAIMED guard).
+    await expect(
+      accounts.setPendingInvitation(
+        "did:key:zNew",
+        alice,
+        "t2",
+        new Date(Date.now() + 3600_000).toISOString(),
+      ),
+    ).rejects.toThrow(/already claimed/);
+  });
+
+  it("reKey on an unknown account → 404 unknown_account", async () => {
+    const accounts = new MemoryAccountStore();
+    await expect(
+      accounts.reKey("did:key:zGhost", "did:key:zNew", new Date().toISOString()),
+    ).rejects.toMatchObject({ code: "unknown_account", status: 404 });
+  });
+});
+
+describe("Server.handleKeyReKey + handleKeyRevocation — owner-gated (§8.2 / §8.4)", () => {
+  let spy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    spy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  });
+  afterEach(() => spy.mockRestore());
+
+  const recipient: Recipient = { type: "email", value: "alice@example.com" };
+
+  /** Walk a freshly-generated agent to CLAIMED under owner `usr_alice`. */
+  async function claimed(server: Server) {
+    const agent = await Agent.generate();
+    await server.handleOwnerInvitation(
+      await toRequest(await agent.buildOwnerInvitation({ baseUrl: BASE_URL, recipient })),
+    );
+    const token = new URL(
+      /https?:\/\/\S+/.exec(spy.mock.calls[0]![0] as string)![0],
+    ).searchParams.get("token")!;
+    await server.handleClaimCompletion(
+      new Request(`${BASE_URL}/afauth/v1/claim/${token}`, { method: "POST" }),
+      { authenticated: recipient, userId: "usr_alice" },
+    );
+    spy.mockClear();
+    return agent;
+  }
+
+  /** Owner session for `usr_alice`; `ageSeconds` backdates the auth event. */
+  function ownerSession(userId = "usr_alice", ageSeconds = 0) {
+    return {
+      authenticated: recipient,
+      userId,
+      authenticatedAt: new Date(Date.now() - ageSeconds * 1000).toISOString(),
+    };
+  }
+
+  function reKeyReq(currentDid: string, newDid: string): Request {
+    return new Request(`${BASE_URL}/afauth/v1/accounts/me/keys/rekey`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ current_account_did: currentDid, new_account_did: newDid }),
+    });
+  }
+
+  function revokeReq(accountDid: string): Request {
+    return new Request(`${BASE_URL}/afauth/v1/accounts/me/keys/revoke`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ account_did: accountDid }),
+    });
+  }
+
+  // ----- re-key (§8.2) -----
+
+  it("resumes a revoked CLAIMED account under a new key; old key→401, new key works", async () => {
+    const { server, accounts, revocationList } = buildServer();
+    const oldAgent = await claimed(server);
+    const newAgent = await Agent.generate();
+
+    await server.revoke(oldAgent.did); // owner suspects compromise → revoke
+
+    const resp = await server.handleKeyReKey(
+      reKeyReq(oldAgent.did, newAgent.did),
+      ownerSession(),
+    );
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as { account_did: string; state: string };
+    expect(body.account_did).toBe(newAgent.did);
+    expect(body.state).toBe("CLAIMED");
+
+    // Account lives under the new DID, revoked cleared, old DID gone.
+    expect((await accounts.get(newAgent.did))?.revoked).toBeFalsy();
+    expect(await accounts.get(oldAgent.did)).toBeNull();
+    // Old key is locked out at the Verifier.
+    expect(await revocationList.isRevoked(oldAgent.did)).toBe(true);
+    await expect(
+      server.handleAccountIntrospection(
+        await toRequest(await oldAgent.buildAccountIntrospection({ baseUrl: BASE_URL })),
+      ),
+    ).rejects.toMatchObject({ code: "revoked_key", status: 401 });
+    // New key works.
+    const fresh = await server.handleAccountIntrospection(
+      await toRequest(await newAgent.buildAccountIntrospection({ baseUrl: BASE_URL })),
+    );
+    expect(fresh.status).toBe(200);
+  });
+
+  it("re-keys a healthy (non-revoked) CLAIMED account too", async () => {
+    const { server, accounts } = buildServer();
+    const oldAgent = await claimed(server);
+    const newAgent = await Agent.generate();
+    const resp = await server.handleKeyReKey(reKeyReq(oldAgent.did, newAgent.did), ownerSession());
+    expect(resp.status).toBe(200);
+    expect((await accounts.get(newAgent.did))?.revoked).toBeFalsy();
+  });
+
+  it("stale owner session → 403 owner_session_too_stale", async () => {
+    const { server } = buildServer();
+    const oldAgent = await claimed(server);
+    const newAgent = await Agent.generate();
+    await expect(
+      server.handleKeyReKey(reKeyReq(oldAgent.did, newAgent.did), ownerSession("usr_alice", 10_000)),
+    ).rejects.toMatchObject({ code: "owner_session_too_stale", status: 403 });
+  });
+
+  it("SECURITY: a non-owner session cannot re-key another owner's account, and leaves it untouched", async () => {
+    const { server, accounts } = buildServer();
+    const oldAgent = await claimed(server);
+    const newAgent = await Agent.generate();
+    await expect(
+      server.handleKeyReKey(reKeyReq(oldAgent.did, newAgent.did), ownerSession("usr_mallory")),
+    ).rejects.toMatchObject({ code: "owner_authentication_required", status: 403 });
+    // Victim account is byte-for-byte unchanged; the attacker's DID never materialised.
+    expect((await accounts.get(oldAgent.did))?.owner?.userId).toBe("usr_alice");
+    expect(await accounts.get(newAgent.did)).toBeNull();
+  });
+
+  it("re-key on an UNCLAIMED account → 409 not_claimed", async () => {
+    const { server } = buildServer();
+    const oldAgent = await Agent.generate();
+    await server.handleAccountIntrospection(
+      await toRequest(await oldAgent.buildAccountIntrospection({ baseUrl: BASE_URL })),
+    ); // implicit signup → UNCLAIMED
+    const newAgent = await Agent.generate();
+    await expect(
+      server.handleKeyReKey(reKeyReq(oldAgent.did, newAgent.did), ownerSession()),
+    ).rejects.toMatchObject({ code: "not_claimed", status: 409 });
+  });
+
+  it("re-key to the same DID → 400 malformed_request", async () => {
+    const { server } = buildServer();
+    const agent = await claimed(server);
+    await expect(
+      server.handleKeyReKey(reKeyReq(agent.did, agent.did), ownerSession()),
+    ).rejects.toMatchObject({ code: "malformed_request", status: 400 });
+  });
+
+  it("re-key to a DID that already names an account → 409 already_claimed (collision guard)", async () => {
+    const { server } = buildServer();
+    const agentA = await claimed(server);
+    // A second existing account to collide with.
+    const agentB = await Agent.generate();
+    await server.handleAccountIntrospection(
+      await toRequest(await agentB.buildAccountIntrospection({ baseUrl: BASE_URL })),
+    );
+    await expect(
+      server.handleKeyReKey(reKeyReq(agentA.did, agentB.did), ownerSession()),
+    ).rejects.toMatchObject({ code: "already_claimed", status: 409 });
+  });
+
+  // ----- revoke (§8.4) -----
+
+  it("owner revoke → 200 then the agent key is locked out (401 revoked_key)", async () => {
+    const { server, accounts } = buildServer();
+    const agent = await claimed(server);
+    const resp = await server.handleKeyRevocation(revokeReq(agent.did), ownerSession());
+    expect(resp.status).toBe(200);
+    expect((await accounts.get(agent.did))?.revoked).toBe(true);
+    await expect(
+      server.handleAccountIntrospection(
+        await toRequest(await agent.buildAccountIntrospection({ baseUrl: BASE_URL })),
+      ),
+    ).rejects.toMatchObject({ code: "revoked_key", status: 401 });
+  });
+
+  it("owner revoke is idempotent (re-revoke → 200)", async () => {
+    const { server } = buildServer();
+    const agent = await claimed(server);
+    expect((await server.handleKeyRevocation(revokeReq(agent.did), ownerSession())).status).toBe(200);
+    expect((await server.handleKeyRevocation(revokeReq(agent.did), ownerSession())).status).toBe(200);
+  });
+
+  it("revoke: stale session → 403, non-owner → 403 (and account NOT revoked), unknown → 404, UNCLAIMED → 409", async () => {
+    const { server, accounts } = buildServer();
+    const agent = await claimed(server);
+
+    await expect(
+      server.handleKeyRevocation(revokeReq(agent.did), ownerSession("usr_alice", 10_000)),
+    ).rejects.toMatchObject({ code: "owner_session_too_stale", status: 403 });
+
+    await expect(
+      server.handleKeyRevocation(revokeReq(agent.did), ownerSession("usr_mallory")),
+    ).rejects.toMatchObject({ code: "owner_authentication_required", status: 403 });
+    expect((await accounts.get(agent.did))?.revoked).toBeFalsy(); // not revoked by the impostor
+
+    await expect(
+      server.handleKeyRevocation(revokeReq("did:key:zNope"), ownerSession()),
+    ).rejects.toMatchObject({ code: "unknown_account", status: 404 });
+
+    const unclaimed = await Agent.generate();
+    await server.handleAccountIntrospection(
+      await toRequest(await unclaimed.buildAccountIntrospection({ baseUrl: BASE_URL })),
+    );
+    await expect(
+      server.handleKeyRevocation(revokeReq(unclaimed.did), ownerSession()),
+    ).rejects.toMatchObject({ code: "not_claimed", status: 409 });
+  });
+});

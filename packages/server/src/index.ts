@@ -147,6 +147,19 @@ export interface AccountStore {
   ): Promise<Account | null>;
   rotateKey(oldDid: Did, newDid: Did, rotatedAt: string): Promise<Account>;
   revoke(did: Did, revokedAt: string): Promise<Account>;
+  /**
+   * Owner-initiated re-key resume (§8.2): atomically install `newDid` in
+   * place of `oldDid` AND clear the `revoked` flag, in a single write /
+   * transaction. This is the resume half of revoke → re-key — a revoked
+   * CLAIMED account comes back under a fresh key. Doing the clear in the
+   * SAME atomic step as the rotate is the whole point: a `rotateKey`
+   * followed by a separate clear would, on a crash/interleave (notably on
+   * D1, where each is its own transaction), leave the new DID live but
+   * still flagged revoked. Carries the owner binding and state forward;
+   * throws `unknown_account` if `oldDid` is absent. The caller is
+   * responsible for guarding against a `newDid` that already exists.
+   */
+  reKey(oldDid: Did, newDid: Did, reKeyedAt: string): Promise<Account>;
 }
 
 /**
@@ -301,6 +314,35 @@ export class MemoryAccountStore implements SweepableAccountStore {
       if (tokenEntry) tokenEntry.did = newDid;
     }
     return rotated;
+  }
+
+  async reKey(oldDid: Did, newDid: Did, _reKeyedAt: string): Promise<Account> {
+    const account = this.accounts.get(oldDid);
+    if (!account) {
+      throw new AFAuthError("unknown_account", 404, `account ${oldDid} does not exist`);
+    }
+    // Rotate + clear `revoked` atomically. Building the new record
+    // field-by-field (rather than spreading `account`) is deliberate:
+    // it OMITS `revoked`, which is exactly the carry-forward that
+    // rotateKey's spread leaves behind.
+    const rekeyed: Account = {
+      did: newDid,
+      state: account.state,
+      createdAt: account.createdAt,
+      ...(account.owner ? { owner: account.owner } : {}),
+      ...(account.pendingRecipient ? { pendingRecipient: account.pendingRecipient } : {}),
+    };
+    this.accounts.delete(oldDid);
+    this.accounts.set(newDid, rekeyed);
+    // Migrate the pending-token reference (if any), mirroring rotateKey.
+    const tok = this.didToToken.get(oldDid);
+    if (tok !== undefined) {
+      this.didToToken.delete(oldDid);
+      this.didToToken.set(newDid, tok);
+      const tokenEntry = this.tokens.get(tok);
+      if (tokenEntry) tokenEntry.did = newDid;
+    }
+    return rekeyed;
   }
 
   async revoke(did: Did, _revokedAt: string): Promise<Account> {
@@ -1315,6 +1357,12 @@ export interface ServerRateLimits {
   claim_completion?: RateLimitConfig;
   /** §8.1 / §8.2 key rotation. Keyed by agent DID. */
   key_rotation?: RateLimitConfig;
+  /**
+   * §8.2 owner re-key + §8.4 owner revoke (the owner-gated key
+   * endpoints). Keyed by owner `userId`, not agent DID — these are
+   * owner-authenticated, not agent-signed.
+   */
+  owner_key_operation?: RateLimitConfig;
 }
 
 // ---------- Verifier (§5.5) ----------
@@ -1664,6 +1712,12 @@ export interface ServerOptions extends VerifierOptions {
    * paths and audit logging).
    */
   attestor?: Attestor;
+  /**
+   * §7.5 freshness floor (seconds) for the owner-gated key endpoints
+   * (`handleKeyReKey`, `handleKeyRevocation`). Default 300 — the top of
+   * the §7.5 60–300s band. Lower it for higher-assurance services.
+   */
+  ownerSessionMaxAgeSeconds?: number;
 }
 
 // Default invitation TTL: 24 hours (§7.3 says "service-defined";
@@ -1700,6 +1754,7 @@ export class Server {
   private readonly rateLimits: ServerRateLimits;
   private readonly attestor?: Attestor;
   private readonly serviceDid: Did;
+  private readonly ownerSessionMaxAgeSeconds: number;
 
   constructor(opts: ServerOptions) {
     // Verifier already defaults a missing revocationList to
@@ -1720,6 +1775,7 @@ export class Server {
     this.rateLimits = opts.rateLimits ?? {};
     this.attestor = opts.attestor;
     this.serviceDid = opts.serviceDid;
+    this.ownerSessionMaxAgeSeconds = opts.ownerSessionMaxAgeSeconds ?? 300;
   }
 
   /**
@@ -2122,13 +2178,14 @@ export class Server {
         "account exceeded unclaimed_ttl_seconds and is no longer operable",
       );
     }
-    // M3 scope: pre-claim rotation only. §8.2 (post-claim with owner
-    // confirmation) is a separate ceremony tracked for later.
+    // Pre-claim rotation only. Post-claim key changes are owner-binding
+    // operations and cannot be driven by the agent signature alone — the
+    // owner re-keys via the owner-session-gated `handleKeyReKey` (§8.2).
     if (account.state === "CLAIMED") {
       throw new AFAuthError(
         "owner_authentication_required",
         403,
-        "post-claim key rotation (§8.2) requires owner confirmation and is not implemented in v0.1",
+        "post-claim key changes require an owner-authenticated session; use the owner re-key endpoint (§8.2)",
       );
     }
 
@@ -2145,6 +2202,91 @@ export class Server {
       },
       200,
     );
+  }
+
+  // ----- Owner-initiated re-key (§8.2) -----
+
+  /**
+   * §8.2 owner-initiated re-key — the resume half of revoke → re-key.
+   * The OWNER (not the agent) installs a fresh key on a CLAIMED account.
+   * Owner-session-gated and NOT agent-signed: the old key may be stolen,
+   * so this never calls `verifier.verify`. The account is named in the
+   * body (there is no verified agentDid) and ownership is checked against
+   * the session — that check is the sole multi-tenant guard on this path.
+   *
+   * Under did:key the account identifier necessarily changes (the DID is
+   * the key); the new DID is returned. The owner binding and `sub_h`
+   * carry forward via `AccountStore.reKey`, which also clears the revoked
+   * flag atomically.
+   */
+  async handleKeyReKey(req: Request, session: OwnerSession): Promise<Response> {
+    if (req.method !== "POST") {
+      throw new AFAuthError("malformed_request", 405, `method ${req.method} not allowed`);
+    }
+    // §7.5 freshness floor — re-keying is an owner-binding operation.
+    assertFreshOwnerSession(session, { maxAgeSeconds: this.ownerSessionMaxAgeSeconds });
+    await this.enforceRateLimit("owner_key_operation", session.userId);
+
+    const bodyBytes = new Uint8Array(await req.arrayBuffer());
+    let parsed: { current_account_did?: string; new_account_did?: string };
+    try {
+      parsed = JSON.parse(new TextDecoder().decode(bodyBytes)) as typeof parsed;
+    } catch {
+      throw new AFAuthError("malformed_request", 400, "request body is not valid JSON");
+    }
+    const currentDid = parsed.current_account_did;
+    const newDid = parsed.new_account_did;
+    if (typeof currentDid !== "string" || currentDid.length === 0) {
+      throw new AFAuthError("malformed_request", 400, "missing `current_account_did`");
+    }
+    if (typeof newDid !== "string" || newDid.length === 0) {
+      throw new AFAuthError("malformed_request", 400, "missing `new_account_did`");
+    }
+    if (newDid === currentDid) {
+      throw new AFAuthError(
+        "malformed_request",
+        400,
+        "new_account_did must differ from current_account_did",
+      );
+    }
+    try {
+      decodeDidKey(newDid);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : "unknown";
+      throw new AFAuthError("malformed_request", 400, `new_account_did is not a valid did:key: ${reason}`);
+    }
+
+    const account = await this.accounts.get(currentDid);
+    if (!account) {
+      throw new AFAuthError("unknown_account", 404, "account not found");
+    }
+    if (account.state === "EXPIRED") {
+      throw new AFAuthError("account_expired", 410, "account is EXPIRED and cannot be re-keyed");
+    }
+    if (account.state !== "CLAIMED") {
+      throw new AFAuthError("not_claimed", 409, "owner re-key applies only to CLAIMED accounts (§8.2)");
+    }
+    // The sole multi-tenant guard on this non-agent-signed path: the
+    // session owner MUST match the account owner. `owner` is always set
+    // for CLAIMED, but guard defensively so an undefined owner can never
+    // match a real userId.
+    if (!account.owner || session.userId !== account.owner.userId) {
+      throw new AFAuthError("owner_authentication_required", 403, "owner session does not own this account");
+    }
+    // Collision guard: refuse a new DID that already names an account
+    // (Memory would silently clobber it; D1 would throw a raw PK error).
+    if (await this.accounts.get(newDid)) {
+      throw new AFAuthError("already_claimed", 409, "new_account_did already names an existing account");
+    }
+
+    const reKeyedAt = new Date().toISOString();
+    await this.accounts.reKey(currentDid, newDid, reKeyedAt);
+    // Lock out the old key for defense-in-depth (its account row is
+    // already gone, but listing it makes the old key fail fast at the
+    // Verifier).
+    await this.revocationList.add(currentDid, reKeyedAt);
+
+    return jsonResponse({ account_did: newDid, old_revoked_at: reKeyedAt, state: "CLAIMED" }, 200);
   }
 
   // ----- Owner-initiated revocation (§8.4) -----
@@ -2171,6 +2313,57 @@ export class Server {
     const revokedAt = new Date().toISOString();
     await this.accounts.revoke(did, revokedAt);
     await this.revocationList.add(did, revokedAt);
+  }
+
+  /**
+   * §8.4 owner-initiated revocation as an owner-session-gated wire
+   * endpoint — the turnkey form of the `examples/recipes/revoke.ts`
+   * pattern. NOT agent-signed. The bare `Server.revoke(did)` primitive
+   * above stays available for un-gated abuse tooling.
+   *
+   * Idempotent: re-revoking an already-revoked account returns 200.
+   */
+  async handleKeyRevocation(req: Request, session: OwnerSession): Promise<Response> {
+    if (req.method !== "POST") {
+      throw new AFAuthError("malformed_request", 405, `method ${req.method} not allowed`);
+    }
+    assertFreshOwnerSession(session, { maxAgeSeconds: this.ownerSessionMaxAgeSeconds });
+    await this.enforceRateLimit("owner_key_operation", session.userId);
+
+    const bodyBytes = new Uint8Array(await req.arrayBuffer());
+    let parsed: { account_did?: string };
+    try {
+      parsed = JSON.parse(new TextDecoder().decode(bodyBytes)) as typeof parsed;
+    } catch {
+      throw new AFAuthError("malformed_request", 400, "request body is not valid JSON");
+    }
+    const accountDid = parsed.account_did;
+    if (typeof accountDid !== "string" || accountDid.length === 0) {
+      throw new AFAuthError("malformed_request", 400, "missing `account_did`");
+    }
+
+    const account = await this.accounts.get(accountDid);
+    if (!account) {
+      throw new AFAuthError("unknown_account", 404, "account not found");
+    }
+    if (account.state === "EXPIRED") {
+      throw new AFAuthError("account_expired", 410, "account is EXPIRED");
+    }
+    if (account.state !== "CLAIMED") {
+      // §8.4 is "the owner of a CLAIMED account MAY revoke". A pre-claim
+      // account has no owner to authenticate, so there is nothing to
+      // owner-revoke.
+      throw new AFAuthError("not_claimed", 409, "owner revocation applies only to CLAIMED accounts (§8.4)");
+    }
+    if (!account.owner || session.userId !== account.owner.userId) {
+      throw new AFAuthError("owner_authentication_required", 403, "owner session does not own this account");
+    }
+
+    const revokedAt = new Date().toISOString();
+    await this.accounts.revoke(accountDid, revokedAt);
+    await this.revocationList.add(accountDid, revokedAt);
+
+    return jsonResponse({ account_did: accountDid, revoked_at: revokedAt }, 200);
   }
 
   // ----- Account introspection (§6.5) -----
