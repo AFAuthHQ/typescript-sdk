@@ -8,13 +8,11 @@
  * (Appendix E). The `Server` class wraps a `Verifier` to add endpoint
  * handlers; if you don't need those, `Verifier` is enough.
  *
- * The default DID resolver is `did:key`-only. Pass a
- * `CompositeDidResolver` to also accept `did:web` keyids (§3.1.2).
+ * Agent account identifiers are `did:key`, so the Verifier resolves the
+ * signing key straight from the DID — no network, no registry, no I/O.
  */
 
-import { CompositeDidResolver, DidKeyResolver } from "@afauthhq/core";
 import {
-  DidWebResolver,
   MemoryNonceStore,
   MemoryRevocationList,
   Verifier,
@@ -27,12 +25,8 @@ const verifier = new Verifier({
   // defaults to an in-memory list with a one-time warning if omitted;
   // production deployments MUST supply a durable one.
   revocationList: new MemoryRevocationList(),
-  // Accept both did:key and did:web keyids. Omit `didResolver` for
-  // did:key-only (the v0.1 reference default).
-  didResolver: new CompositeDidResolver({
-    key: new DidKeyResolver(),
-    web: new DidWebResolver(),
-  }),
+  // No `didResolver` needed: agent identifiers are did:key, so the
+  // default resolver decodes the key straight from the DID.
 });
 
 /**

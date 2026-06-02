@@ -80,11 +80,6 @@ const server = new Server({
   directly as an edge plugin (Appendix E) or as the front half of
   `Server`. Accepts an optional `didResolver` — default is
   `did:key`-only.
-- **`DidWebResolver`** — §3.1.2 resolver. Fetches and validates
-  `https://<host>/.well-known/did.json`; TLS-only; configurable
-  positive + negative cache. Compose with `did:key` via
-  `CompositeDidResolver` from `@afauthhq/core` to accept both methods
-  in one `Verifier`.
 - **`assertFreshOwnerSession(session, { maxAgeSeconds })`** —
   §7.5 freshness floor for post-claim owner-binding routes
   (revoke, rotate, change-credential, add-recovery-contact, ...).

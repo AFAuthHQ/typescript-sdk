@@ -13,9 +13,9 @@ example Worker.
 
 | Package | Purpose |
 |---|---|
-| [`@afauthhq/core`](packages/core) | Shared primitives: `did:key` codec, `DidResolver` + `DidKeyResolver` + `CompositeDidResolver`, RFC 9421 canonicalisation, SHA-256 content-digest, `Recipient` types, `AFAuthError` envelope, `deriveInvitationId`, `normaliseRecipient` |
+| [`@afauthhq/core`](packages/core) | Shared primitives: `did:key` codec, `DidResolver` + `DidKeyResolver`, RFC 9421 canonicalisation, SHA-256 content-digest, `Recipient` types, `AFAuthError` envelope, `deriveInvitationId`, `normaliseRecipient` |
 | [`@afauthhq/agent`](packages/agent) | `Agent.generate()` / `fromPrivateKey()`, `signRequest`, protocol-aware builders (owner invitation, key rotation, account introspection), `fetchDiscovery` + `assertDiscoveryDocument`, **AFAP-0006 `TrustClient`** (link flow + per-service JWT minting against `afauth-trust`) |
-| [`@afauthhq/server`](packages/server) | **`defineService` factory** (spam-resistant defaults), `Verifier` (§5.5/§5.6), `Server` (five endpoint handlers + `revoke`), `DidWebResolver` (§3.1.2), `RateLimiter` + `MemoryRateLimiter` (§11.3), `Attestor` + `HmacAttestor`/`JwksAttestor`/`MultiAttestor` + `trustAttestor()` factory (§10), `assertFreshOwnerSession` (§7.5), `SweepableAccountStore` + `sweepExpiredAccounts()`, Memory stores, reference `consoleEmailHandler` |
+| [`@afauthhq/server`](packages/server) | **`defineService` factory** (spam-resistant defaults), `Verifier` (§5.5/§5.6), `Server` (endpoint handlers + `revoke` / `handleKeyReKey` / `handleKeyRevocation`), `RateLimiter` + `MemoryRateLimiter` (§11.3), `Attestor` + `HmacAttestor`/`JwksAttestor`/`MultiAttestor` + `trustAttestor()` factory (§10), `assertFreshOwnerSession` (§7.5), `SweepableAccountStore` + `sweepExpiredAccounts()`, Memory stores, reference `consoleEmailHandler` |
 | [`@afauthhq/worker`](packages/worker) | Cloudflare Workers bindings: `createWorker`, `KvNonceStore`, `DurableObjectNonceStore`/`createNonceDurableObject`, `KvRevocationList`, `KvRateLimiter`, `D1AccountStore` (+ `migrations/0001_init.sql`, implements `SweepableAccountStore`) |
 | [`examples/worker`](examples/worker) | Reference Cloudflare Worker composing the above |
 
@@ -25,9 +25,8 @@ example Worker.
 
 The SDK implements milestones M0–M5 of the v0.1 spec — the full
 ceremony surface plus rotation, revocation, and full §11 error envelope
-coverage — plus four hardening additions:
+coverage — plus three hardening additions:
 
-- **`did:web` resolver** (§3.1.2) with TLS-only fetch, schema validation, positive + negative caching.
 - **Rate-limit helper** (§11.3 `rate_limit_exceeded`) — per-route configs, `Retry-After` on the 429.
 - **Attestation JWT verifier** (§10) — `HmacAttestor`, `JwksAttestor`, `MultiAttestor`; §9.2 `attested_only` enforcement.
 - **`D1AccountStore`** — durable AccountStore on Cloudflare D1 with ADR-0004 atomic ops via `D1.batch()`.
@@ -49,7 +48,7 @@ is a snapshot of the vectors from
 |---|---|
 | `@afauthhq/core` | 62 (codec roundtrips, canonical input vs §C.1, content-digest, §C.4 recipient normalisation, §C.5 envelopes) |
 | `@afauthhq/agent` | 40 (discovery validation, §C.3 corpus, `TrustClient` link flow + token caching) |
-| `@afauthhq/server` | 135 (nonce store, conformance vectors via `Verifier.verify`, ceremony, claim completion, rotation, replay-window §C.6, body shapes, verifier edge cases, did:web resolver, rate-limit gates, attestation incl. `trustAttestor()` + audience binding, owner-session freshness, account expiry) |
+| `@afauthhq/server` | 135 (nonce store, conformance vectors via `Verifier.verify`, ceremony, claim completion, rotation, replay-window §C.6, body shapes, verifier edge cases, rate-limit gates, attestation incl. `trustAttestor()` + audience binding, owner-session freshness, account expiry) |
 | `@afauthhq/worker` | 42 (D1AccountStore: §7.3 atomic supersession, claim, rotate, revoke, sweep; `createWorker` routing; KV stores) |
 | **Total** | **279 tests, all green in CI** |
 
@@ -159,12 +158,11 @@ The headline decisions for v0.1 are:
   pluggable; the SDK ships `MemoryNonceStore` and `KvNonceStore`.
 - **No router framework** (ADR-0002) — `createWorker` uses a small
   in-house router; no Hono, no itty-router in the runtime dep tree.
-- **DID resolver in v0.1** (ADR-0003, amended) — the SDK ships both
-  `DidKeyResolver` (in `@afauthhq/core`) and `DidWebResolver` (in
-  `@afauthhq/server`). `Verifier`'s default is `did:key`-only for
-  backward compat; pass
-  `didResolver: new CompositeDidResolver({ key: new DidKeyResolver(), web: new DidWebResolver({}) })`
-  to also accept `did:web` keyids.
+- **DID resolver in v0.1** (ADR-0003) — agent account identifiers are
+  `did:key`, so the SDK ships `DidKeyResolver` and the `Verifier`
+  resolves the signing key straight from the DID with no I/O. The
+  `didResolver` option remains for services that choose to accept
+  additional agent DID methods.
 - **SDK API shape** (ADR-0004) — `AccountStore` exposes named atomic
   operations (not generic CRUD); `Server.handleClaimCompletion` takes
   an explicit `session` parameter; `Agent.signRequest` is public with

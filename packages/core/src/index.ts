@@ -11,7 +11,7 @@ import { sha256 } from "@noble/hashes/sha2.js";
 
 // ---------- Identifiers (§3) ----------
 
-/** A W3C DID. v0.1 supports `did:key:...` only; `did:web:...` recognised in types. */
+/** A W3C DID. Agent account identifiers are `did:key:...` in v0.1. (`did:web:...` is still used for service identities and owner recipients, not agent accounts.) */
 export type Did = string;
 
 /** Raw 32-byte Ed25519 public key. */
@@ -127,10 +127,9 @@ export function decodeDidKey(did: Did): Ed25519PublicKey {
  * failure (network error, schema violation, unsupported method, missing
  * key) so the Verifier can pass the error envelope straight through.
  *
- * The reference impls in this SDK are `DidKeyResolver` (in this
- * module) and `DidWebResolver` (in `@afauthhq/server`, since it needs
- * HTTP). Compose them with `CompositeDidResolver` to support multiple
- * methods on the same Verifier.
+ * The reference implementation in this SDK is `DidKeyResolver` (below).
+ * Agent account identifiers are `did:key` in v0.1; a service that
+ * chooses to accept additional methods may supply its own `DidResolver`.
  */
 export interface DidResolver {
   resolve(did: Did): Promise<Ed25519PublicKey>;
@@ -151,43 +150,6 @@ export class DidKeyResolver implements DidResolver {
       );
     }
     return decodeDidKey(did);
-  }
-}
-
-/**
- * Dispatches to per-method resolvers based on the DID's method
- * identifier (the substring between the first two colons of `did:<method>:...`).
- *
- *   new CompositeDidResolver({
- *     key: new DidKeyResolver(),
- *     web: new DidWebResolver({ ... }),
- *   })
- *
- * Throws `invalid_signature` for unsupported methods so the §11
- * envelope drops out unchanged from the Verifier.
- */
-export class CompositeDidResolver implements DidResolver {
-  constructor(private readonly resolvers: Readonly<Record<string, DidResolver>>) {}
-
-  async resolve(did: Did): Promise<Ed25519PublicKey> {
-    if (!did.startsWith("did:")) {
-      throw new AFAuthError("invalid_signature", 401, `not a DID: ${did}`);
-    }
-    const rest = did.slice("did:".length);
-    const colon = rest.indexOf(":");
-    if (colon < 0) {
-      throw new AFAuthError("invalid_signature", 401, `malformed DID (no method-id separator): ${did}`);
-    }
-    const method = rest.slice(0, colon);
-    const resolver = this.resolvers[method];
-    if (!resolver) {
-      throw new AFAuthError(
-        "invalid_signature",
-        401,
-        `unsupported DID method "${method}"; resolver has [${Object.keys(this.resolvers).join(", ")}]`,
-      );
-    }
-    return resolver.resolve(did);
   }
 }
 
