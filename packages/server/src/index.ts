@@ -147,6 +147,19 @@ export interface AccountStore {
   ): Promise<Account | null>;
   rotateKey(oldDid: Did, newDid: Did, rotatedAt: string): Promise<Account>;
   revoke(did: Did, revokedAt: string): Promise<Account>;
+  /**
+   * Owner-initiated re-key resume (§8.2): atomically install `newDid` in
+   * place of `oldDid` AND clear the `revoked` flag, in a single write /
+   * transaction. This is the resume half of revoke → re-key — a revoked
+   * CLAIMED account comes back under a fresh key. Doing the clear in the
+   * SAME atomic step as the rotate is the whole point: a `rotateKey`
+   * followed by a separate clear would, on a crash/interleave (notably on
+   * D1, where each is its own transaction), leave the new DID live but
+   * still flagged revoked. Carries the owner binding and state forward;
+   * throws `unknown_account` if `oldDid` is absent. The caller is
+   * responsible for guarding against a `newDid` that already exists.
+   */
+  reKey(oldDid: Did, newDid: Did, reKeyedAt: string): Promise<Account>;
 }
 
 /**
@@ -301,6 +314,35 @@ export class MemoryAccountStore implements SweepableAccountStore {
       if (tokenEntry) tokenEntry.did = newDid;
     }
     return rotated;
+  }
+
+  async reKey(oldDid: Did, newDid: Did, _reKeyedAt: string): Promise<Account> {
+    const account = this.accounts.get(oldDid);
+    if (!account) {
+      throw new AFAuthError("unknown_account", 404, `account ${oldDid} does not exist`);
+    }
+    // Rotate + clear `revoked` atomically. Building the new record
+    // field-by-field (rather than spreading `account`) is deliberate:
+    // it OMITS `revoked`, which is exactly the carry-forward that
+    // rotateKey's spread leaves behind.
+    const rekeyed: Account = {
+      did: newDid,
+      state: account.state,
+      createdAt: account.createdAt,
+      ...(account.owner ? { owner: account.owner } : {}),
+      ...(account.pendingRecipient ? { pendingRecipient: account.pendingRecipient } : {}),
+    };
+    this.accounts.delete(oldDid);
+    this.accounts.set(newDid, rekeyed);
+    // Migrate the pending-token reference (if any), mirroring rotateKey.
+    const tok = this.didToToken.get(oldDid);
+    if (tok !== undefined) {
+      this.didToToken.delete(oldDid);
+      this.didToToken.set(newDid, tok);
+      const tokenEntry = this.tokens.get(tok);
+      if (tokenEntry) tokenEntry.did = newDid;
+    }
+    return rekeyed;
   }
 
   async revoke(did: Did, _revokedAt: string): Promise<Account> {

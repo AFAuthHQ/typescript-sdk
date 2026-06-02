@@ -549,6 +549,36 @@ export class D1AccountStore implements SweepableAccountStore {
     return out;
   }
 
+  async reKey(oldDid: Did, newDid: Did, reKeyedAt: string): Promise<Account> {
+    const old = await this.db
+      .prepare("SELECT * FROM afauth_accounts WHERE did = ?")
+      .bind(oldDid)
+      .first<AccountRow>();
+    if (!old) {
+      throw new AFAuthError("unknown_account", 404, `account ${oldDid} does not exist`);
+    }
+    // One batch() = one transaction: INSERT the new row with revoked
+    // cleared (0), re-point any invitation FK, DELETE the old row. Doing
+    // the clear in the SAME transaction as the rotate is what avoids the
+    // bricking window a rotateKey + separate clear would leave on a
+    // crash/interleave (each batch is its own D1 transaction).
+    await this.db.batch([
+      this.db
+        .prepare(
+          "INSERT INTO afauth_accounts (did, state, created_at, updated_at, owner_json, revoked) VALUES (?, ?, ?, ?, ?, 0)",
+        )
+        .bind(newDid, old.state, old.created_at, reKeyedAt, old.owner_json),
+      this.db
+        .prepare("UPDATE afauth_invitations SET account_did = ? WHERE account_did = ?")
+        .bind(newDid, oldDid),
+      this.db.prepare("DELETE FROM afauth_accounts WHERE did = ?").bind(oldDid),
+    ]);
+    const out: Account = { did: newDid, state: old.state, createdAt: old.created_at };
+    // Note: `revoked` intentionally omitted — reKey clears it.
+    if (old.owner_json) out.owner = JSON.parse(old.owner_json) as Account["owner"];
+    return out;
+  }
+
   async revoke(did: Did, revokedAt: string): Promise<Account> {
     const existing = await this.db
       .prepare("SELECT * FROM afauth_accounts WHERE did = ?")

@@ -256,4 +256,47 @@ describe("D1AccountStore", () => {
       );
     });
   });
+
+  describe("reKey (§8.2 owner re-key resume)", () => {
+    async function claimedThenRevoked() {
+      const exp = new Date(Date.now() + 3600_000).toISOString();
+      await store.createUnclaimed("did:key:zOld");
+      await store.setPendingInvitation("did:key:zOld", aliceEmail, "tok", exp);
+      const owner: NonNullable<Account["owner"]> = {
+        identity: aliceEmail,
+        userId: "usr_alice",
+        claimedAt: new Date().toISOString(),
+      };
+      await store.completeClaimByToken("tok", owner);
+      await store.revoke("did:key:zOld", new Date().toISOString());
+      return owner;
+    }
+
+    it("the bug reKey fixes: a plain rotateKey carries revoked=true onto the new DID", async () => {
+      await claimedThenRevoked();
+      await store.rotateKey("did:key:zOld", "did:key:zRot", new Date().toISOString());
+      expect((await store.get("did:key:zRot"))?.revoked).toBe(true);
+    });
+
+    it("reKey swaps the DID in one batch, clears revoked, preserves owner, drops the old DID", async () => {
+      const owner = await claimedThenRevoked();
+      const out = await store.reKey("did:key:zOld", "did:key:zNew", new Date().toISOString());
+      expect(out.did).toBe("did:key:zNew");
+      expect(out.state).toBe("CLAIMED");
+      // The row flag is cleared (the genuine carry-forward bug), in the
+      // SAME transaction as the swap — no window where the new DID exists
+      // but is still flagged revoked.
+      expect(out.revoked).toBeFalsy();
+      const fresh = await store.get("did:key:zNew");
+      expect(fresh?.revoked).toBeFalsy();
+      expect(fresh?.owner).toEqual(owner);
+      expect(await store.get("did:key:zOld")).toBeNull();
+    });
+
+    it("reKey on an unknown account throws unknown_account", async () => {
+      await expect(
+        store.reKey("did:key:zGhost", "did:key:zNew", new Date().toISOString()),
+      ).rejects.toThrow(/does not exist/);
+    });
+  });
 });

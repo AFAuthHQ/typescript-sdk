@@ -305,3 +305,65 @@ describe("Verifier without a revocation list (backward compat)", () => {
     expect(resp.status).toBe(200);
   });
 });
+
+describe("MemoryAccountStore.reKey — §8.2 owner re-key resume", () => {
+  const alice: Recipient = { type: "email", value: "alice@example.com" };
+
+  async function claimedThenRevoked() {
+    const accounts = new MemoryAccountStore();
+    const exp = new Date(Date.now() + 3600_000).toISOString();
+    await accounts.createUnclaimed("did:key:zOld");
+    await accounts.setPendingInvitation("did:key:zOld", alice, "tok", exp);
+    const owner = {
+      identity: alice,
+      userId: "usr_alice",
+      claimedAt: new Date().toISOString(),
+    };
+    await accounts.completeClaimByToken("tok", owner);
+    await accounts.revoke("did:key:zOld", new Date().toISOString());
+    return { accounts, owner };
+  }
+
+  it("the bug reKey fixes: a plain rotateKey carries revoked=true onto the new DID", async () => {
+    const { accounts } = await claimedThenRevoked();
+    await accounts.rotateKey("did:key:zOld", "did:key:zRot", new Date().toISOString());
+    // Why reKey exists: rotate alone spreads the old row forward, so a
+    // "revoke then install new key" via rotateKey leaves the new DID
+    // still flagged revoked.
+    expect((await accounts.get("did:key:zRot"))?.revoked).toBe(true);
+  });
+
+  it("reKey installs the new DID, CLEARS revoked, preserves owner, drops the old DID", async () => {
+    const { accounts, owner } = await claimedThenRevoked();
+    const out = await accounts.reKey("did:key:zOld", "did:key:zNew", new Date().toISOString());
+
+    expect(out.did).toBe("did:key:zNew");
+    expect(out.state).toBe("CLAIMED");
+    // The load-bearing assertion is the ROW flag — NOT "the Verifier
+    // accepts the new key", which is true regardless because the new DID
+    // is never added to the revocation list.
+    expect(out.revoked).toBeFalsy();
+    expect((await accounts.get("did:key:zNew"))?.revoked).toBeFalsy();
+    // Owner binding carries forward — the same human keeps the account.
+    expect((await accounts.get("did:key:zNew"))?.owner).toEqual(owner);
+    // Old DID is gone.
+    expect(await accounts.get("did:key:zOld")).toBeNull();
+    // A flag-reading surface agrees it is clean: setPendingInvitation no
+    // longer short-circuits on `revoked` (it now hits the CLAIMED guard).
+    await expect(
+      accounts.setPendingInvitation(
+        "did:key:zNew",
+        alice,
+        "t2",
+        new Date(Date.now() + 3600_000).toISOString(),
+      ),
+    ).rejects.toThrow(/already claimed/);
+  });
+
+  it("reKey on an unknown account → 404 unknown_account", async () => {
+    const accounts = new MemoryAccountStore();
+    await expect(
+      accounts.reKey("did:key:zGhost", "did:key:zNew", new Date().toISOString()),
+    ).rejects.toMatchObject({ code: "unknown_account", status: 404 });
+  });
+});
