@@ -1,5 +1,44 @@
 # @afauthhq/server
 
+## 0.4.0
+
+### Minor Changes
+
+- Attested sessions (§10.7) — let an attestor-side revoke reach already-signed-up agents, without paying for per-request attestation.
+
+  An `attested_only` service used to face a hard choice. Re-verify an attestation on **every** request and the attestor sits on every call's critical path; check it **once at signup** and thereafter trust the agent's signature, and revoking that agent's binding at the attestor **never reaches you** — the stolen key keeps working until your own revocation list catches it (the §8.5 blind spot). Attested sessions are the middle ground: the service keeps a _currently-valid_ attestation **on file** per account and challenges with `401 attestation_required` only once that freshness window lapses. Revoke the binding at the attestor and the agent can no longer mint a replacement, so every attested-session service drops the account within its window. It is the OAuth refresh pattern applied to attestation — the binding is the refresh token, the attestation is the short-lived access token.
+
+  **`@afauthhq/server` — new.** `server.verifyAttested(req, body?)` gates your own authenticated endpoints (not the protocol endpoints, which self-verify): it always checks the RFC 9421 request signature, and when the request carries an `AFAuth-Attestation` header it verifies that token — audience-pinned to your `serviceDid` — and slides the freshness window; it throws `401 attestation_required` once no valid attestation is on file. Turn it on with the new `attestedSession: { store, mode, sessionTtlSeconds? }` option. Two modes: **`strict`** (default — the window is the attestation's own `exp`, ≤ 15 min, so you never serve past a token's expiry) and **`extended`** (the window is `sessionTtlSeconds`, refreshed on each presentation — relief from re-mint cadence in exchange for a longer revocation latency you choose). Also exported: `AttestedSessionGate`, the `AttestedFreshnessStore` interface, and `MemoryAttestedFreshnessStore`. Advertise the capability with the new `attested_session` value in your discovery document's `features`.
+
+  **`@afauthhq/worker` — new.** `KvAttestedFreshnessStore`, a Cloudflare KV-backed `AttestedFreshnessStore`. It sets each KV entry's TTL to the remaining window, so lapsed sessions self-evict — the gate is reactive, with no background sweep. Wire it as `attestedSession: { store: new KvAttestedFreshnessStore(env.AFAUTH_ATTESTED) }`.
+
+  **`@afauthhq/agent` — new.** `AttestedFetcher` runs the agent side of the loop for you: it signs each request and, on `401 attestation_required`, mints a fresh attestation via `TrustClient` and retries once (re-signing with a new nonce). Reactive by default — steady-state requests carry no attestation header; pass `proactive: true` to attach a cached attestation up front and skip the extra round-trip at each window boundary. A refused mint surfaces as a terminal `TrustHttpError` (`isBindingRevoked()` / `isBindingExpired()`): re-link the agent, don't retry.
+
+  **`@afauthhq/core`.** The `DiscoveryDocument` `features` union now accepts `"attested_session"`.
+
+  Guide: https://docs.afauth.org/guides/keep-attested-access-live · model: https://docs.afauth.org/concepts/revocation
+
+- BREAKING: remove `did:web` as an agent account DID method.
+
+  Agents typically run on user machines behind home routers and cannot host a persistent web domain, so `did:web` is not a viable _agent_ identity. Agent account identifiers are `did:key` only.
+
+  Removed:
+
+  - `DidWebResolver` and `DidWebResolverOptions` (`@afauthhq/server`)
+  - `CompositeDidResolver` (`@afauthhq/core`) — it existed only to compose `did:key` + `did:web`; with one agent method it has no purpose. Supply a custom `DidResolver` if you ever accept additional methods.
+
+  Unchanged (still `did:web`): the service's own `service_did`, owner-recipient DIDs (`--type did`), and service-audience identifiers. `DidKeyResolver`, the `DidResolver` interface, and the `Verifier`'s `didResolver` option remain.
+
+### Patch Changes
+
+- Fix: agent-signed post-claim key rotation now returns `owner_binding_blocked` (403), not `owner_authentication_required`.
+
+  §11.3 reserves `owner_binding_blocked` for an agent-signed request attempting an owner-binding operation after claim — distinct from `owner_authentication_required` ("supply an owner session"), whose remedy can never complete this agent-signed path. The code was defined but never emitted; `handleKeyRotation`'s `CLAIMED` branch emitted the wrong one. Recovery clients can now distinguish "stop — the owner must re-key out-of-band (§8.2)" from "authenticate." Status is unchanged (403→403); the owner-gated re-key/revoke endpoints' own `owner_authentication_required` responses are unaffected.
+
+- Updated dependencies
+- Updated dependencies
+  - @afauthhq/core@0.2.0
+
 ## 0.2.0
 
 ### Minor Changes
