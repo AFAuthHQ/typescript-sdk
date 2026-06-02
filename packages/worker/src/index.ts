@@ -23,6 +23,7 @@ import {
   type RateLimitConfig,
   type RateLimitDecision,
   type RateLimiter,
+  type AttestedFreshnessStore,
   type RevocationList,
   type ServerOptions,
 } from "@afauthhq/server";
@@ -370,6 +371,37 @@ export class KvRevocationList implements RevocationList {
 
   async add(did: Did, revokedAt: string): Promise<void> {
     await this.namespace.put(`revoked:${did}`, revokedAt);
+  }
+}
+
+/**
+ * Cloudflare KV–backed `AttestedFreshnessStore` (§10.7). Stores each
+ * account's `attestedUntil` (unix seconds) as the value, and sets the KV
+ * entry's own TTL to the remaining window so lapsed sessions self-evict.
+ * The gate still compares against the stored value, so KV's eventual
+ * consistency only ever errs toward an earlier challenge, never a later
+ * one (fail-closed).
+ */
+export class KvAttestedFreshnessStore implements AttestedFreshnessStore {
+  constructor(private readonly namespace: KVNamespace) {}
+
+  async get(did: Did): Promise<number | null> {
+    const v = await this.namespace.get(`attested:${did}`);
+    if (v === null) return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  async set(did: Did, attestedUntilSeconds: number): Promise<void> {
+    // KV requires expirationTtl ≥ 60s; floor at 60 so a short window
+    // still persists. The stored value remains the precise attestedUntil.
+    const remaining = attestedUntilSeconds - Math.floor(Date.now() / 1000);
+    const expirationTtl = Math.max(60, remaining);
+    await this.namespace.put(`attested:${did}`, String(attestedUntilSeconds), { expirationTtl });
+  }
+
+  async clear(did: Did): Promise<void> {
+    await this.namespace.delete(`attested:${did}`);
   }
 }
 

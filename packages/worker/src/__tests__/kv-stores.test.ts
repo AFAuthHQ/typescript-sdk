@@ -13,7 +13,7 @@
 import { Miniflare } from "miniflare";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { KvNonceStore, KvRateLimiter, KvRevocationList } from "../index.js";
+import { KvAttestedFreshnessStore, KvNonceStore, KvRateLimiter, KvRevocationList } from "../index.js";
 
 let mf: Miniflare;
 let kv: KVNamespace;
@@ -118,5 +118,38 @@ describe("KvRateLimiter", () => {
     expect(first.ok && first.remaining).toBe(2);
     expect(second.ok && second.remaining).toBe(1);
     expect(third.ok && third.remaining).toBe(0);
+  });
+});
+
+describe("KvAttestedFreshnessStore", () => {
+  it("get is null for an unknown DID", async () => {
+    const store = new KvAttestedFreshnessStore(kv);
+    expect(await store.get("did:key:zNone")).toBeNull();
+  });
+
+  it("set → get round-trips the attestedUntil seconds", async () => {
+    const store = new KvAttestedFreshnessStore(kv);
+    const until = Math.floor(Date.now() / 1000) + 1800;
+    await store.set("did:key:zA", until);
+    expect(await store.get("did:key:zA")).toBe(until);
+    // Distinct DIDs have no session.
+    expect(await store.get("did:key:zB")).toBeNull();
+  });
+
+  it("clear removes the session", async () => {
+    const store = new KvAttestedFreshnessStore(kv);
+    await store.set("did:key:zC", Math.floor(Date.now() / 1000) + 1800);
+    await store.clear("did:key:zC");
+    expect(await store.get("did:key:zC")).toBeNull();
+  });
+
+  it("tolerates a short window by flooring the KV TTL to 60s", async () => {
+    // attestedUntil only ~5s out → remaining < 60 → the store floors
+    // expirationTtl to 60 so KV's put() doesn't throw, while the stored
+    // value remains the precise attestedUntil the gate compares against.
+    const store = new KvAttestedFreshnessStore(kv);
+    const until = Math.floor(Date.now() / 1000) + 5;
+    await expect(store.set("did:key:zShort", until)).resolves.toBeUndefined();
+    expect(await store.get("did:key:zShort")).toBe(until);
   });
 });
