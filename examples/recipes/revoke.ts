@@ -1,19 +1,25 @@
 /**
- * Recipe: owner-driven revocation (§8.4).
+ * Recipe: owner-driven revocation + re-key (§8.4 / §8.2).
  *
- * `Server.revoke(did)` adds the DID to the revocation list and marks
- * the account row revoked. After this, every signed request from
- * that DID will fail with `401 revoked_key` at the `Verifier`.
+ * Two layers, pick the one that fits your service:
  *
- * This method is NOT itself an AFAuth-signed endpoint — there is no
- * `/.well-known` route for it. You call it from your own
- * **owner-authenticated** route. The protocol's two-step verify
- * invariant (§7.1) means an agent's key MUST NOT be able to revoke
- * its own account; gate this route on a fresh owner session per §7.5.
+ *  1. TURNKEY wire handlers — `Server.handleKeyRevocation(req, session)`
+ *     and `Server.handleKeyReKey(req, session)`. You extract the owner
+ *     session from your own auth layer and hand the request straight to
+ *     the SDK; it parses the body, enforces the §7.5 freshness floor,
+ *     checks that the session owns the account, and (for re-key) installs
+ *     the new key while clearing the revoked flag atomically. This is the
+ *     path the worker routes `key_revocation` / `key_rekey` to.
  *
- * §7.5 freshness floor (60-300s) applies because revoking the agent
- * is an owner-binding operation — it changes which credentials can
- * authenticate as the account.
+ *  2. BARE primitive — `Server.revoke(did)`. Un-gated; mutates the
+ *     account row + revocation list directly. Use it for abuse-handling
+ *     staff tooling, NOT for owner-facing routes (it skips the §7.5
+ *     gate, so YOU must gate it — see `revokeByDidDirect` below).
+ *
+ * None of these is an AFAuth-signed endpoint: the agent's key may be
+ * stolen, so the two-step-verify invariant (§7.1) means the agent MUST
+ * NOT be able to revoke or re-key its own account. They are
+ * owner-authenticated.
  */
 
 import {
@@ -34,6 +40,8 @@ const server = new Server({
   accounts: new MemoryAccountStore(),
   recipients: { email: consoleEmailHandler },
   baseUrl: "https://api.example.com",
+  // Top of the §7.5 60–300s band; lower it for higher-assurance services.
+  ownerSessionMaxAgeSeconds: 300,
   discovery: {
     afauth_version: "0.1",
     service_did: "did:web:api.example.com",
@@ -43,6 +51,8 @@ const server = new Server({
       claim_page: "/claim",
       claim_completion: "/afauth/v1/claim",
       key_rotation: "/afauth/v1/accounts/me/keys/rotate",
+      key_rekey: "/afauth/v1/accounts/me/keys/rekey",
+      key_revocation: "/afauth/v1/accounts/me/keys/revoke",
     },
     signature_algorithms: ["ed25519"],
     recipient_types: ["email"],
@@ -50,18 +60,37 @@ const server = new Server({
 });
 
 /**
- * Service-defined route: revoke this agent's key. Owner-authenticated,
- * fresh-session-required. Not an AFAuth wire endpoint.
+ * Turnkey owner revoke. Your route extracts the owner session, then
+ * hands the request to the SDK. The body carries `{ account_did }`.
+ * Response: 200 `{ account_did, revoked_at }`; thereafter requests
+ * signed by that key fail with 401 `revoked_key`.
  */
-export async function handleOwnerRevokeAgent(
-  did: Did,
+export async function handleOwnerRevoke(
+  req: Request,
   session: OwnerSession,
-): Promise<void> {
-  // §7.5: require evidence of a fresh authentication event (60-300s).
-  // The window is service-defined; 120s is a reasonable default.
-  assertFreshOwnerSession(session, { maxAgeSeconds: 120 });
+): Promise<Response> {
+  return server.handleKeyRevocation(req, session);
+}
 
-  // Storage-level mutation + revocation list update. Subsequent
-  // requests signed by `did` will fail with 401 revoked_key.
+/**
+ * Turnkey owner re-key (the resume half). Body carries
+ * `{ current_account_did, new_account_did }`. Under did:key the account
+ * identifier changes; the response returns the new DID. The owner
+ * binding and `sub_h` carry forward.
+ */
+export async function handleOwnerReKey(
+  req: Request,
+  session: OwnerSession,
+): Promise<Response> {
+  return server.handleKeyReKey(req, session);
+}
+
+/**
+ * Bare primitive, gated by hand. Use when you already hold the DID (not
+ * a request body) — e.g. an internal admin/abuse tool. Still gate on a
+ * fresh owner session for any owner-facing surface.
+ */
+export async function revokeByDidDirect(did: Did, session: OwnerSession): Promise<void> {
+  assertFreshOwnerSession(session, { maxAgeSeconds: 120 });
   await server.revoke(did);
 }

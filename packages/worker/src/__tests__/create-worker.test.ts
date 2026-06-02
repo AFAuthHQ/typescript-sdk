@@ -322,3 +322,110 @@ describe("createWorker — error envelope passthrough", () => {
     }
   });
 });
+
+describe("createWorker — owner-gated key endpoints (§8.2 re-key, §8.4 revoke)", () => {
+  const REKEY_DISCOVERY: DiscoveryDocument = {
+    ...DISCOVERY,
+    endpoints: {
+      ...DISCOVERY.endpoints,
+      key_rekey: "/afauth/v1/accounts/me/keys/rekey",
+      key_revocation: "/afauth/v1/accounts/me/keys/revoke",
+    },
+  };
+
+  function freshSession(): OwnerSession {
+    return {
+      authenticated: { type: "email", value: "alice@example.com" },
+      userId: "usr_alice",
+      authenticatedAt: new Date().toISOString(),
+    };
+  }
+
+  /** Walk an agent to CLAIMED through the worker, then return the harness. */
+  async function claimedHarness() {
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const harness = buildWorker({ discovery: REKEY_DISCOVERY });
+    const agent = await Agent.generate();
+    await harness.fetch(await toRequest(await agent.buildAccountIntrospection({ baseUrl: BASE_URL })));
+    await harness.fetch(
+      await toRequest(
+        await agent.buildOwnerInvitation({
+          baseUrl: BASE_URL,
+          recipient: { type: "email", value: "alice@example.com" },
+        }),
+      ),
+    );
+    const token = consoleErrorSpy.mock.calls
+      .flat()
+      .map((a) => (typeof a === "string" ? a : ""))
+      .join("\n")
+      .match(/token=([A-Za-z0-9_-]+)/)![1];
+    harness.setOwnerSession({
+      authenticated: { type: "email", value: "alice@example.com" },
+      userId: "usr_alice",
+    });
+    await harness.fetch(new Request(`${BASE_URL}/afauth/v1/claim/${token}`, { method: "POST" }));
+    consoleErrorSpy.mockRestore();
+    return { harness, agent };
+  }
+
+  it("routes a re-key POST to the handler (account moves to the new DID)", async () => {
+    const { harness, agent } = await claimedHarness();
+    harness.setOwnerSession(freshSession());
+    const newAgent = await Agent.generate();
+    const res = await harness.fetch(
+      new Request(`${BASE_URL}/afauth/v1/accounts/me/keys/rekey`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ current_account_did: agent.did, new_account_did: newAgent.did }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect(await harness.accounts.get(agent.did)).toBeNull();
+    expect((await harness.accounts.get(newAgent.did))?.state).toBe("CLAIMED");
+  });
+
+  it("routes a revoke POST to the handler", async () => {
+    const { harness, agent } = await claimedHarness();
+    harness.setOwnerSession(freshSession());
+    const res = await harness.fetch(
+      new Request(`${BASE_URL}/afauth/v1/accounts/me/keys/revoke`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ account_did: agent.did }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect((await harness.accounts.get(agent.did))?.revoked).toBe(true);
+  });
+
+  it("re-key / revoke with no owner session → 401 owner_authentication_required", async () => {
+    const harness = buildWorker({ discovery: REKEY_DISCOVERY }); // session null by default
+    for (const path of ["rekey", "revoke"]) {
+      const res = await harness.fetch(
+        new Request(`${BASE_URL}/afauth/v1/accounts/me/keys/${path}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: "{}",
+        }),
+      );
+      expect(res.status).toBe(401);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe(
+        "owner_authentication_required",
+      );
+    }
+  });
+
+  it("skips re-key / revoke routing when discovery omits the endpoints", async () => {
+    const harness = buildWorker(); // base DISCOVERY has neither endpoint
+    harness.setOwnerSession(freshSession());
+    const res = await harness.fetch(
+      new Request(`${BASE_URL}/afauth/v1/accounts/me/keys/rekey`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      }),
+    );
+    expect(res.status).toBe(404);
+  });
+});

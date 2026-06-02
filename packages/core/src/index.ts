@@ -395,6 +395,10 @@ export interface DiscoveryDocument {
     claim_page: string;
     claim_completion: string;
     key_rotation?: string;
+    /** §8.2 owner-initiated re-key (owner-session-gated). */
+    key_rekey?: string;
+    /** §8.4 owner-initiated revoke (owner-session-gated). */
+    key_revocation?: string;
   };
   signature_algorithms: readonly "ed25519"[];
   features?: readonly ("attestation" | "key_rotation")[];

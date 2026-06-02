@@ -42,6 +42,8 @@ interface Resolved {
   ownerInvitationPath: string;
   claimCompletionPathPrefix: string;
   keyRotationPath?: string;
+  keyReKeyPath?: string;
+  keyRevocationPath?: string;
   accountsPath: string;
 }
 
@@ -76,6 +78,12 @@ export function createWorker(opts: WorkerOptions): ExportedHandler {
           claimCompletionPathPrefix: pathOf(discovery.endpoints.claim_completion),
           ...(discovery.endpoints.key_rotation
             ? { keyRotationPath: pathOf(discovery.endpoints.key_rotation) }
+            : {}),
+          ...(discovery.endpoints.key_rekey
+            ? { keyReKeyPath: pathOf(discovery.endpoints.key_rekey) }
+            : {}),
+          ...(discovery.endpoints.key_revocation
+            ? { keyRevocationPath: pathOf(discovery.endpoints.key_revocation) }
             : {}),
           accountsPath: pathOf(discovery.endpoints.accounts),
         };
@@ -115,6 +123,36 @@ export function createWorker(opts: WorkerOptions): ExportedHandler {
 
         if (routes.keyRotationPath && path === routes.keyRotationPath && req.method === "POST") {
           return await server.handleKeyRotation(req);
+        }
+
+        // Owner-gated key endpoints (§8.2 re-key, §8.4 revoke). These are
+        // NOT agent-signed — they depend on an owner-authenticated session
+        // (the agent key may be stolen), so they extract the session like
+        // claim-completion does. A missing session is 401 (no credential
+        // presented); a present-but-wrong owner is 403, returned by the
+        // handler.
+        if (routes.keyReKeyPath && path === routes.keyReKeyPath && req.method === "POST") {
+          const session = await opts.extractOwnerSession(req);
+          if (!session) {
+            throw new AFAuthError(
+              "owner_authentication_required",
+              401,
+              "owner re-key requires an owner-authenticated session",
+            );
+          }
+          return await server.handleKeyReKey(req, session);
+        }
+
+        if (routes.keyRevocationPath && path === routes.keyRevocationPath && req.method === "POST") {
+          const session = await opts.extractOwnerSession(req);
+          if (!session) {
+            throw new AFAuthError(
+              "owner_authentication_required",
+              401,
+              "owner revocation requires an owner-authenticated session",
+            );
+          }
+          return await server.handleKeyRevocation(req, session);
         }
 
         // /afauth/v1/accounts/me — account introspection.
