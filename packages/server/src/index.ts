@@ -2182,10 +2182,15 @@ export class Server {
     // operations and cannot be driven by the agent signature alone — the
     // owner re-keys via the owner-session-gated `handleKeyReKey` (§8.2).
     if (account.state === "CLAIMED") {
+      // §11.3: an agent-signed owner-binding operation post-claim is
+      // `owner_binding_blocked`, NOT `owner_authentication_required`. The
+      // distinction is load-bearing for recovery clients — this path can
+      // never complete with any session (the agent signature is the wrong
+      // actor); the owner must drive the owner-session-gated re-key (§8.2).
       throw new AFAuthError(
-        "owner_authentication_required",
+        "owner_binding_blocked",
         403,
-        "post-claim key changes require an owner-authenticated session; use the owner re-key endpoint (§8.2)",
+        "post-claim key changes are owner-binding; the agent signature cannot complete them — the owner must re-key via the owner-session-gated endpoint (§8.2)",
       );
     }
 
