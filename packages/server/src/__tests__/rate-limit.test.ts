@@ -113,7 +113,15 @@ describe("MemoryRateLimiter", () => {
 
 describe("Server.handleOwnerInvitation enforces rate limits", () => {
   it("returns 429 + Retry-After + §11.1 envelope when limit exceeded", async () => {
-    const { server, accounts } = newServer({ limit: 2, windowSeconds: 3600 });
+    // Freeze the clock: owner-invitation signing (async crypto) runs between
+    // requests, so a real wall-clock second can tick by before the over-limit
+    // request and make Retry-After 3599. The window itself is unchanged, so pin
+    // `now` to assert the exact value deterministically (was a CI flake).
+    const { server, accounts } = newServer({
+      limit: 2,
+      windowSeconds: 3600,
+      now: () => 1_700_000_000,
+    });
     const agent = await Agent.generate();
     await accounts.createUnclaimed(agent.did);
 
