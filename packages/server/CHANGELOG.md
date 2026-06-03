@@ -1,5 +1,30 @@
 # @afauthhq/server
 
+## 0.5.0
+
+### Minor Changes
+
+- Multi-agent accounts — "one account, many devices" (§10.4.4). Replaces the single-DID account model: an account is now an opaque, stable `accountId` that groups every agent credential of one human, rather than being identified by a single `did:key`.
+
+  How it works: in attested mode, `signupAgent({ did, principal })` groups agents by the verified `(iss, sub_h)` principal — a human's PC and phone agents resolve to the SAME `accountId`. Agents with no `sub_h` (attestation `off`/`optional`, or a runtime-only attestation) each get a distinct singleton account. This is how §10.4.4's "same human, same bucket" is now enforced — by grouping a second signup onto the existing account, not by rejecting it.
+
+  **Breaking — `@afauthhq/server`:**
+
+  - `Account` is reworked to `{ accountId, principal?: { iss, subH }, agents: AccountAgent[], state, owner?, … }` — no longer keyed on a DID. New `AccountAgent { did, addedAt, revoked? }`, one per device.
+  - `AccountStore` is reworked: reads `getByAgentDid` / `getById` / `findByPrincipal(iss, subH)`; mutations `signupAgent({ did, principal }): SignupResult` (find-or-create + attach), `attachAgent`, `revokeAgent` (per-device), `revoke(accountId)` (whole-account), `rotateAgent(oldDid, newDid)` and `reKey(oldDid, newDid)`. `accountId` stays stable across rotation and re-key — the central simplification. Custom `AccountStore` / `SweepableAccountStore` implementations must adopt the new interface; the bundled `MemoryAccountStore` already does.
+  - Owner binding is bound once and shared by every device on the account; whole-account `Account.revoked` is distinct from a single credential's `AccountAgent.revoked`.
+
+  **Breaking — `@afauthhq/worker`:**
+
+  - `D1AccountStore` implements the multi-agent model.
+  - The D1 schema (`migrations/0001_init.sql`) is reworked: `afauth_accounts` (`account_id` PRIMARY KEY, `UNIQUE (iss, sub_h)`), `afauth_account_agents` (`agent_did` PRIMARY KEY → account), and `afauth_invitations`. The change is to `0001_init.sql` itself, so it does NOT re-migrate in place — **existing D1 databases provisioned on the previous single-DID schema must be recreated.**
+
+### Patch Changes
+
+- Security: the verifier now rejects a signature whose covered components omit a required component (`@method` or `@target-uri`), per §5.2 / §5.5 step 1 and `conformance.md` ("reject requests with … missing components").
+
+  Previously the verifier rejected unknown/extra components and enforced the required signature _parameters_, but never checked that the always-required _components_ were present. A signature that omitted `@target-uri` therefore verified against any URL, silently losing the §12.2 cross-service replay binding for any under-covering signer (portable DIDs are the §3.3/D.1 default). First-party `Agent` signers always cover both components and were unaffected; this closes the gap for third-party signers and brings the verifier into conformance.
+
 ## 0.4.0
 
 ### Minor Changes
@@ -9,7 +34,7 @@
 
 ### Patch Changes
 
-- **Fix:** an agent that tries to rotate a *claimed* account's key now gets the correct `owner_binding_blocked` error instead of `owner_authentication_required`, so recovery tools can tell "the owner must step in" apart from "just sign in."
+- **Fix:** an agent that tries to rotate a _claimed_ account's key now gets the correct `owner_binding_blocked` error instead of `owner_authentication_required`, so recovery tools can tell "the owner must step in" apart from "just sign in."
 - Updated dependency `@afauthhq/core@0.2.0`.
 
 ## 0.2.0
