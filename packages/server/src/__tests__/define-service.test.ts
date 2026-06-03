@@ -209,4 +209,36 @@ describe("defineService — signup enforcement", () => {
     expect(resp.status).toBe(200);
     expect(await accounts.get(agent.did)).not.toBeNull();
   });
+
+  // §10.4.4 — `subHUniqueness: false` opts out of per-principal uniqueness
+  // while still requiring attestation (fleet operators: many agents, one
+  // human). Both same-sub_h signups succeed.
+  it("required + subHUniqueness:false → two agents sharing a sub_h both sign up", async () => {
+    const SUB_H = "8f3cZ_K9qWmA-LpQ7tVnRsxBcD2yE0HfJgIuYpXoNkM";
+    const server = defineService({
+      ...baseOpts(),
+      attestor: new HmacAttestor({ iss: "test-attestor", secret: SECRET }),
+      subHUniqueness: false,
+    });
+    async function tokenFor(sub: string): Promise<string> {
+      return new SignJWT({ verification: "oauth", sub_h: SUB_H })
+        .setProtectedHeader({ alg: "HS256" })
+        .setIssuer("test-attestor")
+        .setSubject(sub)
+        .setIssuedAt(Math.floor(Date.now() / 1000))
+        .setExpirationTime(Math.floor(Date.now() / 1000) + 60)
+        .setAudience(SERVICE_DID)
+        .sign(SECRET);
+    }
+    for (const _ of [0, 1]) {
+      const agent = await Agent.generate();
+      const signed = await agent.buildAccountIntrospection({ baseUrl: BASE_URL });
+      const headers = new Headers(signed.headers);
+      headers.set("afauth-attestation", await tokenFor(agent.did));
+      const resp = await server.handleAccountIntrospection(
+        new Request(signed.url, { method: signed.method, headers }),
+      );
+      expect(resp.status).toBe(200);
+    }
+  });
 });

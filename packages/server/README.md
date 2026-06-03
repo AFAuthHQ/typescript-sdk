@@ -27,12 +27,17 @@ const server = defineService({
 });
 ```
 
-`defineService` flips two protocol switches ON by default: it advertises
-`attested_only` in the discovery doc (§9.2) and configures
-`trustAttestor()` as the verifier (§10). The net effect is
-spam-resistance out of the box — un-attested implicit signups are
-rejected with 401 `attestation_required`, and downstream anti-abuse
-state can key off the per-service human pseudonym `sub_h` (§10.4).
+`defineService` flips three protocol switches ON by default: it advertises
+`attested_only` in the discovery doc (§9.2), configures `trustAttestor()`
+as the verifier (§10), and enforces **per-principal uniqueness** (§10.4.4).
+The net effect is spam-resistance out of the box — un-attested implicit
+signups are rejected with `401 attestation_required`, and a second account
+for a human who already has one (same `(iss, sub_h)`) is rejected with
+`409 principal_already_registered`. "Same human, same bucket" holds by
+default. The default slot is a process-local `MemorySubHUniquenessStore`, so
+supply a durable, atomic `SubHUniquenessStore` (`D1SubHUniquenessStore`) in
+production — or pass `subHUniqueness: false` to allow many agents per human
+(fleet operators).
 
 For `MultiAttestor` setups, custom `HmacAttestor`, or fully custom
 discovery, use `new Server({...})` — see [Advanced configuration](#advanced-configuration).
@@ -105,13 +110,23 @@ const server = new Server({
   `AttestedSessionGate` is the standalone primitive. Stores:
   `AttestedFreshnessStore` + `MemoryAttestedFreshnessStore` here,
   `KvAttestedFreshnessStore` in [`@afauthhq/worker`](../worker/).
+- **Per-principal uniqueness** (§10.4.4) — `SubHUniquenessStore` +
+  `MemorySubHUniquenessStore` enforce "at most one account per human":
+  a signup whose verified `(iss, sub_h)` already holds an account is
+  rejected with `409 principal_already_registered`. ON by default in
+  `defineService` `required` mode. Pass `subHUniqueness` a durable,
+  atomic store (`D1SubHUniquenessStore` in
+  [`@afauthhq/worker`](../worker/)) for production, or `false` to allow
+  agent fleets. The slot follows key rotations (§8.1/§8.2) and is
+  released on account expiry — pass the store to `sweepExpiredAccounts`
+  (`server.subHUniquenessStore` exposes the configured instance).
 - **Stores** — `NonceStore` + `MemoryNonceStore` (lazy GC on every
   Nth insert), `AccountStore` + `MemoryAccountStore` (atomic
   invitation supersession with O(1) reverse index),
   `RevocationList` + `MemoryRevocationList`. Production-grade
   durable stores ship in [`@afauthhq/worker`](../worker/)
-  (`D1AccountStore`, `KvNonceStore`, `KvRevocationList`,
-  `KvAttestedFreshnessStore`, `KvRateLimiter`).
+  (`D1AccountStore`, `D1SubHUniquenessStore`, `KvNonceStore`,
+  `KvRevocationList`, `KvAttestedFreshnessStore`, `KvRateLimiter`).
 - **Recipient handlers** — `RecipientHandler<R>` interface; ships
   `consoleEmailHandler` for local development (logs the magic link
   to `console.error`).

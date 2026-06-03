@@ -37,7 +37,9 @@ coverage — plus three hardening additions:
 - **`trustAttestor()`** factory in `@afauthhq/server` — one-line `Server` config that pre-pins `iss: "afauth-trust"`, the AFAP JWKS URL, and EdDSA. Audience binding threaded through `Attestor.verify`.
 - **Account expiry** — `Account.createdAt` is now required; `EXPIRED` state enforced with `HTTP 410 account_expired`. `SweepableAccountStore` + `sweepExpiredAccounts()` give services a hook for periodic cleanup. `D1AccountStore` implements the sweep interface (no migration — schema already had `created_at`).
 
-`@afauthhq/server@0.3.0` adds **`defineService`** — an opinionated factory that wires `attestation: "required"` defaults (discovery `unclaimed_mode: "attested_only"` + bundled `trustAttestor()`). Spam-resistance becomes the SDK happy path: un-attested implicit signups are rejected at the wire, and downstream anti-abuse state keys off the per-service human pseudonym `sub_h` (§10.4). Override with `attestation: "optional"` (migration path) or `"off"` (read-only / paid-only). `@afauthhq/worker@0.3.0` republishes against the new server.
+`@afauthhq/server@0.3.0` adds **`defineService`** — an opinionated factory that wires `attestation: "required"` defaults (discovery `unclaimed_mode: "attested_only"` + bundled `trustAttestor()`). Spam-resistance becomes the SDK happy path: un-attested implicit signups are rejected at the wire, and downstream anti-abuse state can key off the per-service human pseudonym `sub_h` (§10.4). Override with `attestation: "optional"` (migration path) or `"off"` (read-only / paid-only). `@afauthhq/worker@0.3.0` republishes against the new server.
+
+`@afauthhq/server@0.5.0` makes **"same human, same bucket" true by default** (§10.4.4). `attested_only` on its own only proves a signup carries *some* valid attestation; it does not stop one human from minting many agent keypairs and burning many free tiers. `defineService` now enforces **per-principal uniqueness**: an attested signup whose `(iss, sub_h)` already holds an account is rejected with `409 principal_already_registered`. A new `SubHUniquenessStore` (default in-memory `MemorySubHUniquenessStore`; `D1SubHUniquenessStore` in `@afauthhq/worker` for atomic, durable claims) backs the slot, which follows key rotations and is released on account expiry. Opt out with `subHUniqueness: false` (fleet operators: many agents, one human). `@afauthhq/worker@0.5.0` ships `D1SubHUniquenessStore` (migration `0002_subh_uniqueness.sql`).
 
 Conformance is verified against the spec's test vectors (Appendix
 C.1–C.6) — see [`vendor/spec-vectors/`](vendor/spec-vectors/), which
@@ -48,9 +50,9 @@ is a snapshot of the vectors from
 |---|---|
 | `@afauthhq/core` | 62 (codec roundtrips, canonical input vs §C.1, content-digest, §C.4 recipient normalisation, §C.5 envelopes) |
 | `@afauthhq/agent` | 46 (discovery validation, §C.3 corpus, `TrustClient` link flow + token caching, `AttestedFetcher` §10.7 refresh-on-challenge) |
-| `@afauthhq/server` | 162 (nonce store, conformance vectors via `Verifier.verify`, ceremony, claim completion, rotation, replay-window §C.6, body shapes, verifier edge cases, rate-limit gates, attestation incl. `trustAttestor()` + audience binding, §10.7 attested-session gate + cross-component E2E, owner-session freshness, account expiry) |
-| `@afauthhq/worker` | 53 (D1AccountStore: §7.3 atomic supersession, claim, rotate, revoke, sweep; `createWorker` routing; KV stores incl. `KvAttestedFreshnessStore`) |
-| **Total** | **323 tests, all green in CI** |
+| `@afauthhq/server` | 175 (nonce store, conformance vectors via `Verifier.verify`, ceremony, claim completion, rotation, replay-window §C.6, body shapes, verifier edge cases, rate-limit gates, attestation incl. `trustAttestor()` + audience binding, §10.4.4 per-principal uniqueness, §10.7 attested-session gate + cross-component E2E, owner-session freshness, account expiry) |
+| `@afauthhq/worker` | 59 (D1AccountStore: §7.3 atomic supersession, claim, rotate, revoke, sweep; `D1SubHUniquenessStore` atomic claim; `createWorker` routing; KV stores incl. `KvAttestedFreshnessStore`) |
+| **Total** | **342 tests, all green in CI** |
 
 ## Quickstart — agent
 

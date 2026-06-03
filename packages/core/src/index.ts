@@ -420,7 +420,13 @@ export type AFAuthErrorCode =
   // its most recent authentication event predates the service's
   // freshness window. Distinct from `owner_authentication_required`
   // (no session) and `owner_binding_blocked` (agent-signed op).
-  | "owner_session_too_stale";
+  | "owner_session_too_stale"
+  // §10.4.4 per-principal uniqueness. An attested signup was rejected
+  // because the principal it identifies — keyed by `(iss, sub_h)` —
+  // already holds an account at this service, and the service enforces
+  // at most one account per principal ("same human, same bucket").
+  // Returned with `409 Conflict`.
+  | "principal_already_registered";
 
 export class AFAuthError extends Error {
   readonly code: AFAuthErrorCode;

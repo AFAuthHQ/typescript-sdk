@@ -411,6 +411,14 @@ export interface SweepOptions {
    * Defaults to `() => new Date()`.
    */
   now?: () => Date;
+  /**
+   * §10.4.4: optional per-principal uniqueness store. When supplied, each
+   * account transitioned to EXPIRED also has its `(iss, sub_h)` slot
+   * released, so the principal can sign up afresh. Pass
+   * `server.subHUniquenessStore` here. Omit it and slots are never freed —
+   * the policy degrades to "one account per principal, ever".
+   */
+  subHUniqueness?: SubHUniquenessStore;
 }
 
 export interface SweepResult {
@@ -475,6 +483,11 @@ export async function sweepExpiredAccounts(
     if (!Number.isFinite(createdMs)) continue;
     if (createdMs <= cutoffMs) {
       await store.expire(account.did, expiredAt);
+      // §10.4.4: the account is terminally gone — free its per-principal
+      // slot so the human can sign up again. Done after the EXPIRED
+      // transition commits; releasing a slot for a still-open account
+      // would re-open the Sybil hole.
+      if (opts.subHUniqueness) await opts.subHUniqueness.releaseByDid(account.did);
       expired.push(account.did);
     }
   }
@@ -1124,6 +1137,123 @@ export class AttestedSessionGate {
   }
 }
 
+// ---------- Per-principal uniqueness (§10.4.4) ----------
+//
+// §9.2 `attested_only` guarantees a signup carries a VALID attestation; it
+// does NOT, on its own, stop one human from minting many agent keypairs and
+// opening many free accounts. The anti-Sybil property the protocol leans on
+// is the pairwise human pseudonym `sub_h` (§10.4): every attestation the
+// trust attestor issues for the same human at the same service carries the
+// SAME `sub_h`, regardless of which agent DID presents it. A service turns
+// "same human, same bucket" into a real guarantee by keying a uniqueness
+// slot on `(iss, sub_h)` and refusing a second account for a slot already
+// held.
+//
+// This store is that slot. `Server` consults it at signup (when the verified
+// attestation carries a `sub_h`) and rejects a second principal with
+// `409 principal_already_registered`. Runtime-only attestations — no binding,
+// no `sub_h` (§10.4.1) — assert no human and bypass the gate. `defineService`
+// wires a `MemorySubHUniquenessStore` ON by default in `required` mode.
+//
+// Multi-attestor note: the slot is keyed on `(iss, sub_h)` — the §10.4.4
+// scoping. Different attestors derive independent pseudonym spaces for the
+// same human and so occupy independent slots; the spec does not (and cannot)
+// enforce uniqueness across attestors.
+
+export interface SubHClaimResult {
+  /** True iff the slot is now held by `did` (newly claimed, or already held by it). */
+  ok: boolean;
+  /**
+   * When `ok` is false, the account DID that currently holds the
+   * `(iss, sub_h)` slot — surfaced for the service's own logging / account
+   * merge logic. Intentionally NOT returned to the requester on the wire
+   * (it would leak one of the human's other agent DIDs to another).
+   */
+  existingDid?: Did;
+}
+
+export interface SubHUniquenessStore {
+  /**
+   * Atomically reserve the `(iss, sub_h)` slot for `did`:
+   *   - slot free            → bind to `did`, return `{ ok: true }`.
+   *   - slot already `did`   → idempotent, return `{ ok: true }`.
+   *   - slot held by another → return `{ ok: false, existingDid }`.
+   *
+   * MUST be atomic: a correct production impl (e.g. a UNIQUE index on
+   * `(iss, sub_h)`) decides a single winner under concurrent claims for the
+   * same slot with different DIDs. A non-atomic impl re-opens the very
+   * Sybil race this gate exists to close.
+   */
+  claim(iss: string, subH: string, did: Did): Promise<SubHClaimResult>;
+  /**
+   * Move the slot held by `oldDid` to `newDid`, following a key rotation
+   * (§8.1) or owner re-key (§8.2): the account is the same principal, only
+   * its DID changed. `sub_h` is keyed on the principal, not the key, so the
+   * slot must track the live DID. No-op if `oldDid` holds no slot.
+   */
+  rekey(oldDid: Did, newDid: Did): Promise<void>;
+  /**
+   * Release whatever slot `did` holds, so the principal can sign up afresh.
+   * Called when an account is terminally gone — the §6.1 EXPIRED transition,
+   * via `sweepExpiredAccounts`. No-op if `did` holds no slot.
+   *
+   * If a service never runs the sweep, slots are never released and the
+   * policy degrades to "one account per principal, ever" — still safe, just
+   * stricter than "one live account per principal".
+   */
+  releaseByDid(did: Did): Promise<void>;
+}
+
+/**
+ * Single-process in-memory `SubHUniquenessStore`. Keeps a forward
+ * `(iss,sub_h) → did` map and a `did → (iss,sub_h)` reverse index so
+ * `rekey` / `releaseByDid` work from a DID alone. Suitable for tests and
+ * single-process services; horizontally-scaled deployments need a shared,
+ * atomic backend (e.g. `D1SubHUniquenessStore` in `@afauthhq/worker`, whose
+ * UNIQUE index gives a cross-isolate atomic claim).
+ *
+ * Single-attestor assumption: a given `did` is tracked under one
+ * `(iss,sub_h)` at a time. A DID that presents two different attestors'
+ * tokens (rare — and a distinct principal per §10.4.4) keeps only its most
+ * recently claimed slot in the reverse index.
+ */
+export class MemorySubHUniquenessStore implements SubHUniquenessStore {
+  private readonly forward = new Map<string, Did>();
+  private readonly reverse = new Map<Did, string>();
+
+  private static key(iss: string, subH: string): string {
+    return `${iss}\x00${subH}`;
+  }
+
+  async claim(iss: string, subH: string, did: Did): Promise<SubHClaimResult> {
+    const key = MemorySubHUniquenessStore.key(iss, subH);
+    const held = this.forward.get(key);
+    if (held !== undefined && held !== did) {
+      return { ok: false, existingDid: held };
+    }
+    this.forward.set(key, did);
+    this.reverse.set(did, key);
+    return { ok: true };
+  }
+
+  async rekey(oldDid: Did, newDid: Did): Promise<void> {
+    const key = this.reverse.get(oldDid);
+    if (key === undefined) return;
+    this.reverse.delete(oldDid);
+    this.reverse.set(newDid, key);
+    this.forward.set(key, newDid);
+  }
+
+  async releaseByDid(did: Did): Promise<void> {
+    const key = this.reverse.get(did);
+    if (key === undefined) return;
+    this.reverse.delete(did);
+    // Only clear the forward entry if it still points at `did`: a
+    // concurrent re-claim by another DID must not be clobbered.
+    if (this.forward.get(key) === did) this.forward.delete(key);
+  }
+}
+
 // ---------- Rate limiter (§11.3 rate_limit_exceeded) ----------
 //
 // The protocol reserves `rate_limit_exceeded` (429) in §11.3 but takes
@@ -1597,6 +1727,20 @@ export interface ServerOptions extends VerifierOptions {
     /** Window length for `"extended"` mode (seconds). */
     sessionTtlSeconds?: number;
   };
+  /**
+   * §10.4.4: optional per-principal uniqueness gate. When set, an attested
+   * signup whose verified `(iss, sub_h)` already holds an account is
+   * rejected with `409 principal_already_registered` — enforcing "at most
+   * one account per human" ("same human, same bucket"). Consulted only when
+   * the attestation carries a `sub_h`; runtime-only attestations (no
+   * principal asserted) bypass it. Effective only alongside an `attestor`.
+   *
+   * `new Server({...})` does NOT default this — the low-level path makes no
+   * policy assumptions. `defineService` defaults a process-local
+   * `MemorySubHUniquenessStore` in `required` mode; supply a durable,
+   * atomic store (e.g. `D1SubHUniquenessStore`) in production.
+   */
+  subHUniqueness?: SubHUniquenessStore;
 }
 
 // Default invitation TTL: 24 hours (§7.3 says "service-defined";
@@ -1635,6 +1779,7 @@ export class Server {
   private readonly serviceDid: Did;
   private readonly ownerSessionMaxAgeSeconds: number;
   private readonly attestedGate?: AttestedSessionGate;
+  private readonly subHUniqueness?: SubHUniquenessStore;
 
   constructor(opts: ServerOptions) {
     // Verifier already defaults a missing revocationList to
@@ -1656,6 +1801,7 @@ export class Server {
     this.attestor = opts.attestor;
     this.serviceDid = opts.serviceDid;
     this.ownerSessionMaxAgeSeconds = opts.ownerSessionMaxAgeSeconds ?? 300;
+    this.subHUniqueness = opts.subHUniqueness;
 
     if (opts.attestedSession) {
       if (!this.attestor) {
@@ -1716,11 +1862,18 @@ export class Server {
    *   - other modes:
    *     * if header present, validate; reject on invalid (`401 invalid_attestation`)
    *     * if header absent, silently allow
+   *
+   * Returns the verified `AttestationClaims` (so the caller can apply the
+   * §10.4.4 per-principal uniqueness gate via `claimPrincipalSlot`), or
+   * `null` when no attestation was processed (absent header in a lax mode).
+   * Does NOT itself mutate any store — keeping the verify/claim split lets
+   * the caller order the slot claim AFTER rate-limiting, right before the
+   * account row is created.
    */
   private async enforceAttestationOnSignup(
     req: Request,
     agentDid: Did,
-  ): Promise<void> {
+  ): Promise<AttestationClaims | null> {
     const disc = await this.resolveDiscovery();
     const required = disc.billing?.unclaimed_mode === "attested_only";
     const header = req.headers.get("afauth-attestation");
@@ -1748,7 +1901,39 @@ export class Server {
       // it MUST for the afauth-trust attestor, and platform/commerce
       // attestors all benefit from the same defense against
       // cross-service token replay.
-      await this.attestor.verify(header, agentDid, { audience: this.serviceDid });
+      return await this.attestor.verify(header, agentDid, { audience: this.serviceDid });
+    }
+    return null;
+  }
+
+  /**
+   * §10.4.4 per-principal uniqueness gate. Given the verified attestation
+   * `claims` for an about-to-be-created account, reserve the `(iss, sub_h)`
+   * slot for `agentDid`. Throws `409 principal_already_registered` if the
+   * slot is already held by a different account ("same human, same bucket").
+   *
+   * No-op when no uniqueness store is configured, or when the attestation
+   * carries no `sub_h` (a runtime-only attestation asserts no principal, so
+   * there is nothing to dedupe on). Call this AFTER rate-limiting and
+   * IMMEDIATELY before `createUnclaimed`, so a rejected principal never
+   * leaves an account-row side-effect (mirrors the §9.2 "reject before any
+   * state transition" rule).
+   */
+  private async claimPrincipalSlot(
+    claims: AttestationClaims | null,
+    agentDid: Did,
+  ): Promise<void> {
+    if (!this.subHUniqueness || !claims || typeof claims.sub_h !== "string") return;
+    const result = await this.subHUniqueness.claim(claims.iss, claims.sub_h, agentDid);
+    if (!result.ok) {
+      // Do NOT echo `result.existingDid` on the wire: it would reveal one
+      // of the principal's other agent DIDs at this service. The service
+      // MAY read it from the store for its own logging / account merge.
+      throw new AFAuthError(
+        "principal_already_registered",
+        409,
+        "an account already exists for this principal at this service (at most one account per human; §10.4.4)",
+      );
     }
   }
 
@@ -1782,6 +1967,16 @@ export class Server {
   // (e.g. account-introspection on GET).
   get verifierInstance(): Verifier {
     return this.verifier;
+  }
+
+  /**
+   * The §10.4.4 per-principal uniqueness store, if one is configured.
+   * Exposed so the operator can pass it to `sweepExpiredAccounts` (to
+   * release slots when accounts expire) — important for `defineService`
+   * deployments, where the default store is created internally.
+   */
+  get subHUniquenessStore(): SubHUniquenessStore | undefined {
+    return this.subHUniqueness;
   }
 
   // ----- Discovery (§4) -----
@@ -1915,6 +2110,12 @@ export class Server {
       if (!this.implicitSignup) {
         throw new AFAuthError("unknown_account", 404, "account does not exist (implicit signup disabled)");
       }
+      // §9.2 / §10.4.4: owner-invitation against an unknown account is an
+      // implicit signup too. Gate it on attestation and per-principal
+      // uniqueness exactly like introspection — otherwise `attested_only`
+      // (and the uniqueness slot) could be bypassed by inviting first.
+      const claims = await this.enforceAttestationOnSignup(req, verified.agentDid);
+      await this.claimPrincipalSlot(claims, verified.agentDid);
       account = await this.accounts.createUnclaimed(verified.agentDid);
     }
     if (account.revoked) {
@@ -2125,6 +2326,9 @@ export class Server {
     // §8.3: register the old DID on the local revocation list so
     // subsequent requests signed by the old key are rejected.
     await this.revocationList.add(verified.agentDid, rotatedAt);
+    // §10.4.4: the per-principal slot is keyed on the principal, not the
+    // verification key — follow the rotation so the live DID holds it.
+    if (this.subHUniqueness) await this.subHUniqueness.rekey(verified.agentDid, newDid);
 
     return jsonResponse(
       {
@@ -2216,6 +2420,9 @@ export class Server {
     // already gone, but listing it makes the old key fail fast at the
     // Verifier).
     await this.revocationList.add(currentDid, reKeyedAt);
+    // §10.4.4: carry the per-principal slot to the new DID — the docstring
+    // above promises `sub_h` carries forward across the re-key.
+    if (this.subHUniqueness) await this.subHUniqueness.rekey(currentDid, newDid);
 
     return jsonResponse({ account_did: newDid, old_revoked_at: reKeyedAt, state: "CLAIMED" }, 200);
   }
@@ -2319,10 +2526,14 @@ export class Server {
       // §9.2: enforce attested_only mode (and validate any present
       // header in lax mode) BEFORE creating the account row. A
       // rejected attestation MUST NOT leave a side-effect.
-      await this.enforceAttestationOnSignup(req, verified.agentDid);
+      const claims = await this.enforceAttestationOnSignup(req, verified.agentDid);
       // Implicit signup also goes through the `accounts` rate-limit
       // bucket since it creates an account row.
       await this.enforceRateLimit("accounts", verified.agentDid);
+      // §10.4.4 per-principal uniqueness — reserve the (iss, sub_h) slot
+      // before the row is created so a duplicate principal leaves no
+      // side-effect ("same human, same bucket").
+      await this.claimPrincipalSlot(claims, verified.agentDid);
       account = await this.accounts.createUnclaimed(verified.agentDid);
     }
 
@@ -2404,6 +2615,17 @@ export interface DefineServiceOptions {
    */
   attestor?: Attestor;
   /**
+   * §10.4.4 per-principal uniqueness ("at most one account per human",
+   * "same human, same bucket"). In `required` mode this defaults to a
+   * process-local `MemorySubHUniquenessStore` so the one-call recipe
+   * actually delivers the guarantee. Supply your own durable, atomic store
+   * (e.g. `D1SubHUniquenessStore`) for production. Set `false` to allow many
+   * agents per human (fleet operators) while still requiring attestation.
+   * Not defaulted in `optional` / `off` mode — pass a store explicitly to
+   * dedupe attested signups under `optional`.
+   */
+  subHUniqueness?: SubHUniquenessStore | false;
+  /**
    * Partial discovery overrides merged on top of the synthesized
    * document. Use this to customize endpoint paths, advertise extra
    * `accepted_attestors`, declare `limits`, etc.
@@ -2436,11 +2658,33 @@ export interface DefineServiceOptions {
  * `accepted_attestors: ['afauth-trust']`, and `attestor: trustAttestor()`
  * by hand. Override `attestation: 'off'` to opt out.
  */
+let warnedAboutDefaultUniqueness = false;
+
 export function defineService(opts: DefineServiceOptions): Server {
   const mode: AttestationMode = opts.attestation ?? "required";
 
   const attestor: Attestor | undefined =
     opts.attestor ?? (mode === "off" ? undefined : trustAttestor());
+
+  // §10.4.4: "same human, same bucket" is ON by default in `required` mode
+  // so the recommended path is actually Sybil-resistant. `optional` is the
+  // migration path (existing fleets may legitimately run many agents per
+  // human) and `off` has no attestor to key on, so neither defaults it.
+  let subHUniqueness: SubHUniquenessStore | undefined;
+  if (opts.subHUniqueness === false) {
+    subHUniqueness = undefined; // explicit opt-out (fleet operators)
+  } else if (opts.subHUniqueness) {
+    subHUniqueness = opts.subHUniqueness; // caller-supplied (durable) store
+  } else if (mode === "required") {
+    subHUniqueness = new MemorySubHUniquenessStore();
+    if (!warnedAboutDefaultUniqueness) {
+      warnedAboutDefaultUniqueness = true;
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[afauth] defineService defaulted to MemorySubHUniquenessStore for per-principal uniqueness (§10.4.4; process-local, lost on restart, NOT atomic across instances). Supply DefineServiceOptions.subHUniqueness with a durable, atomic store (e.g. D1SubHUniquenessStore) for production, or pass `false` to allow many agents per human.",
+      );
+    }
+  }
 
   const discovery = synthesizeDiscovery({
     baseUrl: opts.baseUrl,
@@ -2466,6 +2710,7 @@ export function defineService(opts: DefineServiceOptions): Server {
     maxSignatureLifetimeSeconds: opts.maxSignatureLifetimeSeconds,
     now: opts.now,
     ...(attestor ? { attestor } : {}),
+    ...(subHUniqueness ? { subHUniqueness } : {}),
   });
 }
 

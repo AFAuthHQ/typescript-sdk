@@ -26,6 +26,8 @@ import {
   type AttestedFreshnessStore,
   type RevocationList,
   type ServerOptions,
+  type SubHUniquenessStore,
+  type SubHClaimResult,
 } from "@afauthhq/server";
 
 export interface WorkerOptions extends ServerOptions {
@@ -706,6 +708,72 @@ export class D1AccountStore implements SweepableAccountStore {
     ]);
     const row: AccountRow = { ...existing, state: "EXPIRED", updated_at: expiredAt };
     return rowToAccount(row);
+  }
+}
+
+// ---------- D1SubHUniquenessStore (§10.4.4) ----------
+//
+// Production-grade `SubHUniquenessStore` backed by Cloudflare D1, living
+// in the SAME database as `D1AccountStore`. The schema is
+// migrations/0002_subh_uniqueness.sql; apply it after 0001.
+//
+// The composite PRIMARY KEY `(iss, sub_h)` is what makes `claim()` atomic:
+// `INSERT ... ON CONFLICT DO NOTHING` lets exactly one concurrent claimant
+// win the slot, so the cross-isolate Sybil race the gate exists to close
+// stays closed (unlike a KV get-then-put, which can let two writers both
+// observe an empty slot). This is why there is no `KvSubHUniquenessStore`:
+// per-principal uniqueness needs an atomic claim, and KV cannot provide one.
+
+interface SubHRow {
+  iss: string;
+  sub_h: string;
+  did: string;
+}
+
+/**
+ * Cloudflare D1–backed `SubHUniquenessStore`. Construct with the same D1
+ * binding as `D1AccountStore`:
+ *
+ *   new D1SubHUniquenessStore(env.AFAUTH_DB)
+ *
+ * Schema: migrations/0002_subh_uniqueness.sql. Run `wrangler d1 migrations
+ * apply <db-name>` before first use.
+ */
+export class D1SubHUniquenessStore implements SubHUniquenessStore {
+  constructor(private readonly db: D1Database) {}
+
+  async claim(iss: string, subH: string, did: Did): Promise<SubHClaimResult> {
+    const claimedAt = new Date().toISOString();
+    // Atomic reserve: ON CONFLICT DO NOTHING means the first writer for a
+    // given (iss, sub_h) wins; later writers no-op. We then read back the
+    // single surviving row to learn the winner.
+    await this.db
+      .prepare(
+        "INSERT INTO afauth_subh_uniqueness (iss, sub_h, did, claimed_at) VALUES (?, ?, ?, ?) ON CONFLICT (iss, sub_h) DO NOTHING",
+      )
+      .bind(iss, subH, did, claimedAt)
+      .run();
+    const row = await this.db
+      .prepare("SELECT did FROM afauth_subh_uniqueness WHERE iss = ? AND sub_h = ?")
+      .bind(iss, subH)
+      .first<Pick<SubHRow, "did">>();
+    // Row is guaranteed to exist (we just inserted or it pre-existed).
+    if (row && row.did === did) return { ok: true };
+    return { ok: false, existingDid: row?.did };
+  }
+
+  async rekey(oldDid: Did, newDid: Did): Promise<void> {
+    await this.db
+      .prepare("UPDATE afauth_subh_uniqueness SET did = ? WHERE did = ?")
+      .bind(newDid, oldDid)
+      .run();
+  }
+
+  async releaseByDid(did: Did): Promise<void> {
+    await this.db
+      .prepare("DELETE FROM afauth_subh_uniqueness WHERE did = ?")
+      .bind(did)
+      .run();
   }
 }
 

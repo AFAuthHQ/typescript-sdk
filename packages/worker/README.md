@@ -84,12 +84,21 @@ createWorker({
   /* ... */
   attestor: trustAttestor(),
   discovery,
+  // §10.4.4 "same human, same bucket". Because `createWorker` mirrors
+  // `new Server` (not `defineService`), per-principal uniqueness is NOT
+  // defaulted — pass it explicitly. `D1SubHUniquenessStore` gives an
+  // atomic, durable claim via its UNIQUE index:
+  subHUniqueness: new D1SubHUniquenessStore(env.AFAUTH_DB),
 });
 ```
 
 Agents that haven't run `afauth trust link` will be rejected with
 `401 attestation_required`; the [`afauth signup`](https://github.com/AFAuthHQ/cli#usage)
-CLI guides them through the link flow on that error.
+CLI guides them through the link flow on that error. A second agent for a
+human who already has an account here is rejected with
+`409 principal_already_registered`. To free a human's slot when their
+unclaimed account expires, pass the same store to `sweepExpiredAccounts`
+(`subHUniqueness`).
 
 ## Nonce store: pick DO, not KV
 
@@ -139,6 +148,15 @@ agent share an actor and serialize against each other.
   via `wrangler d1 migrations apply <db-name>` before first use.
   Schema is portable to standard Postgres/MySQL with minor
   syntactic changes.
+- **`D1SubHUniquenessStore`** — `SubHUniquenessStore` backed by
+  Cloudflare D1 (§10.4.4), in the same database as `D1AccountStore`.
+  Enforces "at most one account per human": `claim()` is atomic via the
+  composite PRIMARY KEY `(iss, sub_h)` (`INSERT … ON CONFLICT DO
+  NOTHING`), which a `KvNonceStore`-style get-then-put could not give —
+  so there is no KV variant. Schema lives at
+  [`migrations/0002_subh_uniqueness.sql`](migrations/0002_subh_uniqueness.sql);
+  apply after `0001`. Pass via `subHUniqueness` (and to
+  `sweepExpiredAccounts` to release slots on expiry).
 - **`WorkerOptions`** — extends `ServerOptions` with the required
   `extractOwnerSession` callback for the claim-completion route.
 

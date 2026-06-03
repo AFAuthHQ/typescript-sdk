@@ -2,25 +2,36 @@
  * Recipe: spam-resistant service in one call.
  *
  * `defineService` is the opinionated convenience wrapper for new
- * AFAuth integrations. It flips two protocol switches ON by default:
+ * AFAuth integrations. It flips three protocol switches ON by default:
  *
  *   1. `billing.unclaimed_mode: "attested_only"` in the discovery doc
  *      (§9.2), so un-attested signups are rejected at the wire.
  *   2. `attestor: trustAttestor()` (AFAP-0006 §10), so the bundled
  *      afauth-trust attestor verifies incoming attestations offline
  *      against its published JWKS.
+ *   3. `subHUniqueness` (§10.4.4) — a per-principal uniqueness slot
+ *      keyed on `(iss, sub_h)`, so one human holds at most one account.
  *
- * The combination means: a bad actor cannot mint 10,000 throwaway
- * agent keypairs and burn through 10,000 free tiers, because every
- * signup must carry a trust attestation that ties the agent back to
- * a verified human via a per-service pseudonym `sub_h` (§10.4).
- * Service code keys its anti-abuse state off `sub_h` — same human,
- * same bucket.
+ * The combination means: a bad actor cannot mint 10,000 throwaway agent
+ * keypairs and burn through 10,000 free tiers. Every signup must carry a
+ * trust attestation tying the agent back to a verified human via a
+ * per-service pseudonym `sub_h` (§10.4) — and because all of that human's
+ * agents present the SAME `sub_h`, the second account is rejected with
+ * `409 principal_already_registered`. Same human, same bucket — enforced,
+ * not just advertised.
+ *
+ * The default slot is a process-local `MemorySubHUniquenessStore`. In
+ * production, supply a durable, atomic store — `D1SubHUniquenessStore`
+ * from `@afauthhq/worker` — and release slots on expiry by passing the
+ * store to `sweepExpiredAccounts` (see `sweep()` below). Pass
+ * `subHUniqueness: false` to allow many agents per human (fleet operators).
  *
  * Opt out (`attestation: "off"`) for read-only or paid-only services
  * where a human signal is overkill. Use `"optional"` while migrating
  * an existing fleet: attestations are verified when present but not
- * required, so existing un-linked agents keep working.
+ * required, so existing un-linked agents keep working. (Uniqueness is
+ * NOT defaulted in `optional` mode — a migrating fleet may legitimately
+ * run many agents per human.)
  */
 
 import {
@@ -29,21 +40,29 @@ import {
   MemoryRevocationList,
   consoleEmailHandler,
   defineService,
+  sweepExpiredAccounts,
 } from "@afauthhq/server";
 
 // --- Spam-resistant by default (the recommended path) -----------------
 
+// Hoisted so the periodic `sweep()` below can reference the same store.
+const accounts = new MemoryAccountStore();
+
 const server = defineService({
   baseUrl: "https://api.example.com",
   serviceDid: "did:web:api.example.com",
-  accounts: new MemoryAccountStore(),
+  accounts,
   recipients: { email: consoleEmailHandler },
-  // attestation: "required" is the default — wires trustAttestor() and
-  // sets discovery.billing.unclaimed_mode = "attested_only".
+  // attestation: "required" is the default — wires trustAttestor(), sets
+  // discovery.billing.unclaimed_mode = "attested_only", AND enforces
+  // §10.4.4 per-principal uniqueness (default: process-local
+  // MemorySubHUniquenessStore).
   //
-  // Production deployments should also supply persistent stores:
+  // Production deployments should supply persistent, atomic stores:
   nonceStore: new MemoryNonceStore(),
   revocationList: new MemoryRevocationList(),
+  // subHUniqueness: new D1SubHUniquenessStore(env.AFAUTH_DB), // durable + atomic
+  // subHUniqueness: false,                                    // allow agent fleets
 });
 
 // --- Per-route hook-up (framework-agnostic Fetch handlers) ------------
@@ -58,6 +77,19 @@ export async function fetch(req: Request): Promise<Response> {
     default:
       return new Response("not found", { status: 404 });
   }
+}
+
+// --- Periodic expiry sweep (frees per-principal slots) ----------------
+//
+// Run from your scheduler (cron / Workers scheduled trigger / Lambda).
+// Passing `server.subHUniquenessStore` releases each expired account's
+// `(iss, sub_h)` slot, so a human whose unclaimed trial lapsed can sign up
+// again. Omit it and the policy hardens to "one account per human, ever".
+export async function sweep(): Promise<void> {
+  await sweepExpiredAccounts(accounts, {
+    unclaimedTtlSeconds: 24 * 60 * 60,
+    subHUniqueness: server.subHUniquenessStore,
+  });
 }
 
 // --- Opt-out variants -------------------------------------------------
