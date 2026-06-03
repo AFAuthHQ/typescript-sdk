@@ -66,7 +66,6 @@ async function setup(trustOpts: { fail?: { status: number; code: string } } = {}
     agentPrivateKey: agent.exportPrivateKey(),
     binding: {
       binding_id: "bind-1",
-      binding_token: "tok",
       binding_token_expires_at: Math.floor(Date.now() / 1000) + 100_000,
     },
     fetch: tf.impl,

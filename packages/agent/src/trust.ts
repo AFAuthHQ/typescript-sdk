@@ -18,10 +18,9 @@
  *
  * The agent's Ed25519 keypair is therefore the only secret to persist
  * (the AFAuth CLI stores it under `~/.afauth/` with chmod 600). The
- * `binding` record returned by `linkPoll()` records that the agent has
- * linked; its `binding_token` is retained only for backward
- * compatibility with attestors that have not yet enabled keyless mint,
- * and is no longer presented by `token()`.
+ * `binding` record returned by `linkPoll()` carries only the binding id
+ * and its expiry — there is no bearer token. It records that the agent
+ * has linked; `token()` authenticates each mint by signing with the key.
  */
 
 import { ed25519 } from "@noble/curves/ed25519.js";
@@ -50,9 +49,11 @@ export interface TrustLinkStart {
 
 export interface TrustBinding {
   binding_id: string;
-  /** Opaque bearer token. Treat like a password — persist with care. */
-  binding_token: string;
-  /** Unix seconds the binding token stops being accepted. */
+  /**
+   * Unix seconds when the binding expires; the agent must re-link after
+   * this. There is no bearer token — the agent authenticates mints by
+   * signing `/v1/token` with its account key (§3.1 keyless mint).
+   */
   binding_token_expires_at: number;
 }
 
@@ -158,7 +159,6 @@ export class TrustClient {
     if (body.state === "pending") return undefined;
     this.binding = {
       binding_id: body.binding_id,
-      binding_token: body.binding_token,
       binding_token_expires_at: body.binding_token_expires_at,
     };
     return this.binding;

@@ -123,8 +123,8 @@ describe("§3.1 E2E: keyless signed mint → reference Verifier → Server.verif
       agentDid: agent.did,
       agentPublicKey: agent.publicKey,
       agentPrivateKey: agent.exportPrivateKey(),
-      // Phase-1 linked marker; its binding_token is NOT used by token().
-      binding: { binding_id: "bind-1", binding_token: "legacy-unused", binding_token_expires_at: nowS + 86_400 },
+      // Linked marker — binding id + expiry only, no bearer token.
+      binding: { binding_id: "bind-1", binding_token_expires_at: nowS + 86_400 },
       baseUrl: TRUST_BASE, // the agent signs `${TRUST_BASE}/v1/token`
       fetch: attestor.fetch,
       now: clock,

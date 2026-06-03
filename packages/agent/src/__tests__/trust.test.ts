@@ -71,7 +71,6 @@ describe("TrustClient", () => {
         body: {
           state: "confirmed",
           binding_id: "bind-1",
-          binding_token: "secret-binding-token",
           binding_token_expires_at: Math.floor(Date.now() / 1000) + 86400,
         },
         assertBody: (b) => {
@@ -85,7 +84,7 @@ describe("TrustClient", () => {
     const binding = await c.linkPoll("req-1");
     expect(binding?.binding_id).toBe("bind-1");
     expect(c.isLinked()).toBe(true);
-    expect(c.getBinding()?.binding_token).toBe("secret-binding-token");
+    expect(c.getBinding()?.binding_token_expires_at).toBeGreaterThan(Math.floor(Date.now() / 1000));
   });
 
   it("linkPoll returns undefined when state=pending", async () => {
@@ -111,7 +110,6 @@ describe("TrustClient", () => {
       fetch: impl,
       binding: {
         binding_id: "bind-1",
-        binding_token: "tok",
         binding_token_expires_at: expires,
       },
     });
