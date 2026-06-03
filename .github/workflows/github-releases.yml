@@ -1,0 +1,60 @@
+name: GitHub Releases
+
+# `pnpm release` (changeset publish, run locally) publishes to npm and creates
+# per-package git tags like `@afauthhq/server@0.4.0`, but NOT GitHub Releases.
+# This workflow fills that gap: when such a tag is pushed, it creates a GitHub
+# Release whose body is that package's CHANGELOG.md section for the version.
+# No npm token or PR creation needed — it only reads the repo and writes a
+# Release (contents: write), so it works within the org's Actions policy.
+
+on:
+  push:
+    tags:
+      - "@afauthhq/**"
+
+permissions:
+  contents: write
+
+jobs:
+  github-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble release notes from CHANGELOG
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # TAG looks like "@afauthhq/server@0.4.0"
+          pkg="${TAG%@*}"        # @afauthhq/server
+          ver="${TAG##*@}"       # 0.4.0
+          short="${pkg##*/}"     # server
+          changelog="packages/$short/CHANGELOG.md"
+          echo "tag=$TAG pkg=$pkg ver=$ver changelog=$changelog"
+
+          {
+            printf '**npm:** https://www.npmjs.com/package/%s/v/%s\n\n' "$pkg" "$ver"
+            printf '```bash\nnpm i %s@%s\n```\n\n---\n\n' "$pkg" "$ver"
+            if [ -f "$changelog" ]; then
+              # Print the section under the exact "## <ver>" heading, up to the next "## ".
+              awk -v h="## $ver" '$0==h{g=1;next} g&&/^## /{exit} g{print}' "$changelog"
+            else
+              echo "_No CHANGELOG found for ${pkg}._"
+            fi
+          } > NOTES.md
+
+          echo "----- NOTES.md -----"
+          cat NOTES.md
+
+      - name: Create or update the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file NOTES.md
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file NOTES.md --verify-tag
+          fi
