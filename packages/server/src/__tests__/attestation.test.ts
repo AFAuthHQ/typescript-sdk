@@ -404,7 +404,7 @@ describe("Server attested_only enforcement (§9.2)", () => {
     const body = await resp.json() as { error: { code: string } };
     expect(body.error.code).toBe("attestation_required");
     // No account row should have been created.
-    expect(await accounts.get(agent.did)).toBeNull();
+    expect(await accounts.getByAgentDid(agent.did)).toBeNull();
   });
 
   it("attested_only + valid token → 200 + account created", async () => {
@@ -422,7 +422,7 @@ describe("Server attested_only enforcement (§9.2)", () => {
       method: signed.method, headers,
     }));
     expect(resp.status).toBe(200);
-    expect(await accounts.get(agent.did)).not.toBeNull();
+    expect(await accounts.getByAgentDid(agent.did)).not.toBeNull();
   });
 
   it("attested_only + token with wrong aud → 401 (cross-service replay defense)", async () => {
@@ -460,7 +460,7 @@ describe("Server attested_only enforcement (§9.2)", () => {
     expect(resp.status).toBe(401);
     const body = await resp.json() as { error: { code: string } };
     expect(body.error.code).toBe("invalid_attestation");
-    expect(await accounts.get(agent.did)).toBeNull();
+    expect(await accounts.getByAgentDid(agent.did)).toBeNull();
   });
 
   it("attested_only declared, header present, but no attestor configured → 503 (server misconfig)", async () => {

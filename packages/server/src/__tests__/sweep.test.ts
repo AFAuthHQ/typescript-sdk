@@ -74,20 +74,20 @@ describe("sweepExpiredAccounts", () => {
     const oldDid = "did:key:zOld";
     const newDid = "did:key:zNew";
 
-    const before = await accounts.createUnclaimed(oldDid);
+    const before = await accounts.signupAgent({ did: oldDid }).then((r) => r.account);
     // Rewrite createdAt to look 2 hours old.
     (before as { createdAt: string }).createdAt = new Date(
       Date.now() - 2 * 60 * 60 * 1000,
     ).toISOString();
 
-    await accounts.createUnclaimed(newDid); // fresh — createdAt = now
+    await accounts.signupAgent({ did: newDid }).then((r) => r.account); // fresh — createdAt = now
 
     const result = await sweepExpiredAccounts(accounts, { unclaimedTtlSeconds: 3600 });
     expect(result.scanned).toBe(2);
-    expect(result.expired).toEqual([oldDid]);
+    expect(result.expired).toEqual([before.accountId]);
 
-    expect((await accounts.get(oldDid))?.state).toBe("EXPIRED");
-    expect((await accounts.get(newDid))?.state).toBe("UNCLAIMED");
+    expect((await accounts.getByAgentDid(oldDid))?.state).toBe("EXPIRED");
+    expect((await accounts.getByAgentDid(newDid))?.state).toBe("UNCLAIMED");
   });
 
   it("expires both UNCLAIMED and INVITED accounts past the TTL", async () => {
@@ -95,22 +95,22 @@ describe("sweepExpiredAccounts", () => {
     const unclaimedDid = "did:key:zUnclaimed";
     const invitedDid = "did:key:zInvited";
 
-    const a = await accounts.createUnclaimed(unclaimedDid);
+    const a = await accounts.signupAgent({ did: unclaimedDid }).then((r) => r.account);
     (a as { createdAt: string }).createdAt = new Date(Date.now() - 10000 * 1000).toISOString();
 
-    const b = await accounts.createUnclaimed(invitedDid);
+    const b = await accounts.signupAgent({ did: invitedDid }).then((r) => r.account);
     (b as { createdAt: string }).createdAt = new Date(Date.now() - 10000 * 1000).toISOString();
     await accounts.setPendingInvitation(
-      invitedDid,
+      b.accountId,
       { type: "email", value: "alice@example.com" },
       "token-xyz",
       new Date(Date.now() + 3600 * 1000).toISOString(),
     );
 
     const result = await sweepExpiredAccounts(accounts, { unclaimedTtlSeconds: 3600 });
-    expect(result.expired.sort()).toEqual([invitedDid, unclaimedDid].sort());
+    expect(result.expired.sort()).toEqual([a.accountId, b.accountId].sort());
 
-    const inv = await accounts.get(invitedDid);
+    const inv = await accounts.getByAgentDid(invitedDid);
     expect(inv?.state).toBe("EXPIRED");
     // The pending invitation has been dropped — the token no longer resolves.
     expect(await accounts.findByPendingToken("token-xyz")).toBeNull();
@@ -139,7 +139,7 @@ describe("sweepExpiredAccounts", () => {
 
     // Force createdAt back so the sweep would target this account
     // if it didn't skip CLAIMED.
-    const claimed = (await accounts.get(agent.did))!;
+    const claimed = (await accounts.getByAgentDid(agent.did))!;
     (claimed as { createdAt: string }).createdAt = new Date(
       Date.now() - 24 * 60 * 60 * 1000,
     ).toISOString();
@@ -148,17 +148,17 @@ describe("sweepExpiredAccounts", () => {
     // CLAIMED accounts aren't even returned by listOpenAccounts.
     expect(result.scanned).toBe(0);
     expect(result.expired).toEqual([]);
-    expect((await accounts.get(agent.did))?.state).toBe("CLAIMED");
+    expect((await accounts.getByAgentDid(agent.did))?.state).toBe("CLAIMED");
   });
 
   it("is idempotent — a second sweep is a no-op", async () => {
     const accounts = new MemoryAccountStore();
     const did = "did:key:zStale";
-    const acc = await accounts.createUnclaimed(did);
+    const acc = await accounts.signupAgent({ did: did }).then((r) => r.account);
     (acc as { createdAt: string }).createdAt = new Date(Date.now() - 7200 * 1000).toISOString();
 
     const first = await sweepExpiredAccounts(accounts, { unclaimedTtlSeconds: 3600 });
-    expect(first.expired).toEqual([did]);
+    expect(first.expired).toEqual([acc.accountId]);
 
     const second = await sweepExpiredAccounts(accounts, { unclaimedTtlSeconds: 3600 });
     expect(second.expired).toEqual([]);
@@ -168,7 +168,7 @@ describe("sweepExpiredAccounts", () => {
   it("respects the `now` injection for deterministic time", async () => {
     const accounts = new MemoryAccountStore();
     const did = "did:key:zPredict";
-    await accounts.createUnclaimed(did);
+    const acc = await accounts.signupAgent({ did: did }).then((r) => r.account);
 
     // With now == account.createdAt, the account is 0s old; ttl=3600 → not expired.
     const fakeNow = new Date();
@@ -184,12 +184,12 @@ describe("sweepExpiredAccounts", () => {
       unclaimedTtlSeconds: 3600,
       now: () => future,
     });
-    expect(swept.expired).toEqual([did]);
+    expect(swept.expired).toEqual([acc.accountId]);
   });
 
   it("rejects non-positive unclaimedTtlSeconds before mutating", async () => {
     const accounts = new MemoryAccountStore();
-    await accounts.createUnclaimed("did:key:zAny");
+    await accounts.signupAgent({ did: "did:key:zAny" }).then((r) => r.account);
     await expect(
       sweepExpiredAccounts(accounts, { unclaimedTtlSeconds: 0 }),
     ).rejects.toThrow(/positive number/);
@@ -197,16 +197,16 @@ describe("sweepExpiredAccounts", () => {
       sweepExpiredAccounts(accounts, { unclaimedTtlSeconds: -1 }),
     ).rejects.toThrow(/positive number/);
     // The account was untouched.
-    expect((await accounts.get("did:key:zAny"))?.state).toBe("UNCLAIMED");
+    expect((await accounts.getByAgentDid("did:key:zAny"))?.state).toBe("UNCLAIMED");
   });
 });
 
 describe("MemoryAccountStore.expire", () => {
   it("idempotent on already-EXPIRED accounts", async () => {
     const store = new MemoryAccountStore();
-    await store.createUnclaimed("did:key:zX");
-    await store.expire("did:key:zX", new Date().toISOString());
-    const second = await store.expire("did:key:zX", new Date().toISOString());
+    const acc = await store.signupAgent({ did: "did:key:zX" }).then((r) => r.account);
+    await store.expire(acc.accountId, new Date().toISOString());
+    const second = await store.expire(acc.accountId, new Date().toISOString());
     expect(second.state).toBe("EXPIRED");
   });
 
@@ -229,7 +229,8 @@ describe("MemoryAccountStore.expire", () => {
       consoleSpy.mockRestore();
     }
 
-    await expect(accounts.expire(agent.did, new Date().toISOString())).rejects.toMatchObject({
+    const claimedId = (await accounts.getByAgentDid(agent.did))!.accountId;
+    await expect(accounts.expire(claimedId, new Date().toISOString())).rejects.toMatchObject({
       code: "already_claimed",
       status: 409,
     });
@@ -248,8 +249,8 @@ describe("EXPIRED rejection in Server handlers", () => {
   async function buildExpired(): Promise<{ server: Server; agent: Agent }> {
     const { server, accounts } = buildServer();
     const agent = await Agent.generate();
-    await accounts.createUnclaimed(agent.did);
-    await accounts.expire(agent.did, new Date().toISOString());
+    const { account } = await accounts.signupAgent({ did: agent.did });
+    await accounts.expire(account.accountId, new Date().toISOString());
     return { server, agent };
   }
 
@@ -280,8 +281,8 @@ describe("EXPIRED rejection in Server handlers", () => {
     const signed = await agent.buildAccountIntrospection({ baseUrl: BASE_URL });
     const resp = await server.handleAccountIntrospection(await toRequest(signed));
     expect(resp.status).toBe(200);
-    const body = (await resp.json()) as { account_did: string; state: string };
+    const body = (await resp.json()) as { account_id: string; agent_did: string; state: string };
     expect(body.state).toBe("EXPIRED");
-    expect(body.account_did).toBe(agent.did);
+    expect(body.agent_did).toBe(agent.did);
   });
 });

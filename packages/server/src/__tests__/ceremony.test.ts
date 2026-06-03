@@ -102,7 +102,7 @@ describe("M2 owner-invitation + claim-completion ceremony", () => {
     expect(token, "magic link should carry a token").toBeTruthy();
 
     // Account state pre-claim: INVITED, no owner yet, has pendingRecipient.
-    const pre = await accounts.get(agent.did);
+    const pre = await accounts.getByAgentDid(agent.did);
     expect(pre?.state).toBe("INVITED");
     expect(pre?.owner).toBeUndefined();
     expect(pre?.pendingRecipient).toEqual(recipient);
@@ -116,17 +116,17 @@ describe("M2 owner-invitation + claim-completion ceremony", () => {
 
     expect(claimResp.status).toBe(200);
     const claimBody = (await claimResp.json()) as {
-      account_did: string;
+      account_id: string;
       state: string;
       owner: { identity: Recipient; user_id: string; claimed_at: string };
     };
     expect(claimBody.state).toBe("CLAIMED");
-    expect(claimBody.account_did).toBe(agent.did);
+    expect(claimBody.account_id).toMatch(/^acct_/);
     expect(claimBody.owner.identity).toEqual(recipient);
     expect(claimBody.owner.user_id).toBe("usr_alice");
 
     // Account state post-claim: CLAIMED, owner present, pending cleared.
-    const post = await accounts.get(agent.did);
+    const post = await accounts.getByAgentDid(agent.did);
     expect(post?.state).toBe("CLAIMED");
     expect(post?.owner?.identity).toEqual(recipient);
     expect(post?.pendingRecipient).toBeUndefined();
@@ -255,13 +255,14 @@ describe("M2 owner-invitation + claim-completion ceremony", () => {
 
     const resp = await server.handleAccountIntrospection(await toRequest(signed));
     expect(resp.status).toBe(200);
-    const body = (await resp.json()) as { account_did: string; state: string; owner?: unknown };
-    expect(body.account_did).toBe(agent.did);
+    const body = (await resp.json()) as { account_id: string; agent_did: string; state: string; owner?: unknown };
+    expect(body.agent_did).toBe(agent.did);
+    expect(body.account_id).toMatch(/^acct_/);
     expect(body.state).toBe("UNCLAIMED");
     expect(body.owner).toBeUndefined();
 
     // The account is now persisted.
-    const stored = await accounts.get(agent.did);
+    const stored = await accounts.getByAgentDid(agent.did);
     expect(stored?.state).toBe("UNCLAIMED");
   });
 

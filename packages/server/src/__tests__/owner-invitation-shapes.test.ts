@@ -107,7 +107,7 @@ describe("§7.2 recipient body shapes", () => {
     const resp = await server.handleOwnerInvitation(await toRequest(signed));
     expect(resp.status).toBe(202);
 
-    const pre = await accounts.get(agent.did);
+    const pre = await accounts.getByAgentDid(agent.did);
     expect(pre?.pendingRecipient).toEqual(recipient);
   });
 
@@ -126,7 +126,7 @@ describe("§7.2 recipient body shapes", () => {
     expect(resp.status).toBe(202);
 
     // The account should now hold the typed-recipient form.
-    const acct = await accounts.get(agent.did);
+    const acct = await accounts.getByAgentDid(agent.did);
     expect(acct?.pendingRecipient).toEqual({ type: "email", value: "alice@example.com" });
   });
 

@@ -65,7 +65,7 @@ describe("assertFreshOwnerSession", () => {
   it("documented usage: composes with Server.revoke", async () => {
     const { MemoryAccountStore, Server, MemoryNonceStore, MemoryRevocationList } = await import("../index.js");
     const accounts = new MemoryAccountStore();
-    await accounts.createUnclaimed("did:key:zVictim");
+    await accounts.signupAgent({ did: "did:key:zVictim" }).then((r) => r.account);
     const server = new Server({
       nonceStore: new MemoryNonceStore(),
       revocationList: new MemoryRevocationList(),
@@ -98,6 +98,6 @@ describe("assertFreshOwnerSession", () => {
     ).toThrow(expect.objectContaining({ code: "owner_session_too_stale" }));
 
     // Account is unchanged — the check fired before any storage mutation.
-    expect((await accounts.get("did:key:zVictim"))?.revoked).toBeUndefined();
+    expect((await accounts.getByAgentDid("did:key:zVictim"))?.revoked).toBeUndefined();
   });
 });

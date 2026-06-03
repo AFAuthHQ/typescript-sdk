@@ -78,13 +78,14 @@ describe("M3 pre-claim key rotation (§8.1)", () => {
     const rotation = await oldAgent.buildKeyRotation({ baseUrl: BASE_URL, newDid: newAgent.did });
     const resp = await server.handleKeyRotation(await toRequest(rotation));
     expect(resp.status).toBe(200);
-    const body = (await resp.json()) as { account_did: string; old_revoked_at: string };
-    expect(body.account_did).toBe(newAgent.did);
+    const body = (await resp.json()) as { account_id: string; agent_did: string; old_revoked_at: string };
+    expect(body.agent_did).toBe(newAgent.did);
+    expect(body.account_id).toMatch(/^acct_/);
     expect(body.old_revoked_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
 
     // Account is now under the new DID; old DID is gone.
-    expect(await accounts.get(oldAgent.did)).toBeNull();
-    const updated = await accounts.get(newAgent.did);
+    expect(await accounts.getByAgentDid(oldAgent.did)).toBeNull();
+    const updated = await accounts.getByAgentDid(newAgent.did);
     expect(updated?.state).toBe("UNCLAIMED");
   });
 
@@ -123,8 +124,8 @@ describe("M3 pre-claim key rotation (§8.1)", () => {
 
     const fresh = await newAgent.buildAccountIntrospection({ baseUrl: BASE_URL });
     const resp = await server.handleAccountIntrospection(await toRequest(fresh));
-    const body = (await resp.json()) as { account_did: string; state: string };
-    expect(body.account_did).toBe(newAgent.did);
+    const body = (await resp.json()) as { account_id: string; agent_did: string; state: string };
+    expect(body.agent_did).toBe(newAgent.did);
     expect(body.state).toBe("UNCLAIMED");
   });
 
@@ -140,7 +141,7 @@ describe("M3 pre-claim key rotation (§8.1)", () => {
       await toRequest(await oldAgent.buildOwnerInvitation({ baseUrl: BASE_URL, recipient })),
     );
 
-    const preRotate = await accounts.get(oldAgent.did);
+    const preRotate = await accounts.getByAgentDid(oldAgent.did);
     expect(preRotate?.state).toBe("INVITED");
 
     // Rotate while INVITED.
@@ -148,7 +149,7 @@ describe("M3 pre-claim key rotation (§8.1)", () => {
       await toRequest(await oldAgent.buildKeyRotation({ baseUrl: BASE_URL, newDid: newAgent.did })),
     );
 
-    const postRotate = await accounts.get(newAgent.did);
+    const postRotate = await accounts.getByAgentDid(newAgent.did);
     expect(postRotate?.state).toBe("INVITED");
     expect(postRotate?.pendingRecipient).toEqual(recipient);
 
@@ -161,7 +162,7 @@ describe("M3 pre-claim key rotation (§8.1)", () => {
       userId: "usr_alice",
     });
     expect(claimResp.status).toBe(200);
-    const final = await accounts.get(newAgent.did);
+    const final = await accounts.getByAgentDid(newAgent.did);
     expect(final?.state).toBe("CLAIMED");
 
     spy.mockRestore();
@@ -257,21 +258,21 @@ describe("M3 owner-initiated revocation (§8.4)", () => {
       { authenticated: recipient, userId: "usr_alice" },
     );
 
-    // Owner revokes.
-    await server.revoke(agent.did);
+    // Owner revokes the whole account (resolved from the agent's credential).
+    await server.revoke((await accounts.getByAgentDid(agent.did))!.accountId);
 
-    expect((await accounts.get(agent.did))?.revoked).toBe(true);
+    expect((await accounts.getByAgentDid(agent.did))?.revoked).toBe(true);
     expect(await revocationList.isRevoked(agent.did)).toBe(true);
   });
 
   it("post-revocation request returns 401 revoked_key", async () => {
-    const { server } = buildServer();
+    const { server, accounts } = buildServer();
     const agent = await Agent.generate();
     await server.handleAccountIntrospection(
       await toRequest(await agent.buildAccountIntrospection({ baseUrl: BASE_URL })),
     );
 
-    await server.revoke(agent.did);
+    await server.revoke((await accounts.getByAgentDid(agent.did))!.accountId);
 
     const fresh = await agent.buildAccountIntrospection({ baseUrl: BASE_URL });
     await expect(server.handleAccountIntrospection(await toRequest(fresh))).rejects.toMatchObject({
@@ -316,47 +317,47 @@ describe("MemoryAccountStore.reKey — §8.2 owner re-key resume", () => {
   async function claimedThenRevoked() {
     const accounts = new MemoryAccountStore();
     const exp = new Date(Date.now() + 3600_000).toISOString();
-    await accounts.createUnclaimed("did:key:zOld");
-    await accounts.setPendingInvitation("did:key:zOld", alice, "tok", exp);
+    const { account } = await accounts.signupAgent({ did: "did:key:zOld" });
+    await accounts.setPendingInvitation(account.accountId, alice, "tok", exp);
     const owner = {
       identity: alice,
       userId: "usr_alice",
       claimedAt: new Date().toISOString(),
     };
     await accounts.completeClaimByToken("tok", owner);
-    await accounts.revoke("did:key:zOld", new Date().toISOString());
-    return { accounts, owner };
+    await accounts.revoke(account.accountId, new Date().toISOString());
+    return { accounts, owner, accountId: account.accountId };
   }
 
-  it("the bug reKey fixes: a plain rotateKey carries revoked=true onto the new DID", async () => {
+  it("the bug reKey fixes: a plain rotateAgent leaves the account flagged revoked", async () => {
     const { accounts } = await claimedThenRevoked();
-    await accounts.rotateKey("did:key:zOld", "did:key:zRot", new Date().toISOString());
-    // Why reKey exists: rotate alone spreads the old row forward, so a
-    // "revoke then install new key" via rotateKey leaves the new DID
-    // still flagged revoked.
-    expect((await accounts.get("did:key:zRot"))?.revoked).toBe(true);
+    await accounts.rotateAgent("did:key:zOld", "did:key:zRot", new Date().toISOString());
+    // Why reKey exists: rotateAgent only swaps the credential, so a
+    // "revoke then install new key" via rotateAgent leaves the account
+    // (and thus the new credential's view) still flagged revoked.
+    expect((await accounts.getByAgentDid("did:key:zRot"))?.revoked).toBe(true);
   });
 
   it("reKey installs the new DID, CLEARS revoked, preserves owner, drops the old DID", async () => {
     const { accounts, owner } = await claimedThenRevoked();
     const out = await accounts.reKey("did:key:zOld", "did:key:zNew", new Date().toISOString());
 
-    expect(out.did).toBe("did:key:zNew");
+    expect(out.agents.map((a) => a.did)).toContain("did:key:zNew");
     expect(out.state).toBe("CLAIMED");
-    // The load-bearing assertion is the ROW flag — NOT "the Verifier
+    // The load-bearing assertion is the account flag — NOT "the Verifier
     // accepts the new key", which is true regardless because the new DID
     // is never added to the revocation list.
     expect(out.revoked).toBeFalsy();
-    expect((await accounts.get("did:key:zNew"))?.revoked).toBeFalsy();
+    expect((await accounts.getByAgentDid("did:key:zNew"))?.revoked).toBeFalsy();
     // Owner binding carries forward — the same human keeps the account.
-    expect((await accounts.get("did:key:zNew"))?.owner).toEqual(owner);
-    // Old DID is gone.
-    expect(await accounts.get("did:key:zOld")).toBeNull();
+    expect((await accounts.getByAgentDid("did:key:zNew"))?.owner).toEqual(owner);
+    // Old credential is gone.
+    expect(await accounts.getByAgentDid("did:key:zOld")).toBeNull();
     // A flag-reading surface agrees it is clean: setPendingInvitation no
     // longer short-circuits on `revoked` (it now hits the CLAIMED guard).
     await expect(
       accounts.setPendingInvitation(
-        "did:key:zNew",
+        out.accountId,
         alice,
         "t2",
         new Date(Date.now() + 3600_000).toISOString(),
@@ -415,11 +416,12 @@ describe("Server.handleKeyReKey + handleKeyRevocation — owner-gated (§8.2 / �
     });
   }
 
-  function revokeReq(accountDid: string): Request {
+  function revokeReq(agentDid: string): Request {
     return new Request(`${BASE_URL}/afauth/v1/accounts/me/keys/revoke`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ account_did: accountDid }),
+      // Name the account by one of its agent credentials (§8.4 convenience).
+      body: JSON.stringify({ agent_did: agentDid }),
     });
   }
 
@@ -430,20 +432,20 @@ describe("Server.handleKeyReKey + handleKeyRevocation — owner-gated (§8.2 / �
     const oldAgent = await claimed(server);
     const newAgent = await Agent.generate();
 
-    await server.revoke(oldAgent.did); // owner suspects compromise → revoke
+    await server.revoke((await accounts.getByAgentDid(oldAgent.did))!.accountId); // owner suspects compromise → revoke
 
     const resp = await server.handleKeyReKey(
       reKeyReq(oldAgent.did, newAgent.did),
       ownerSession(),
     );
     expect(resp.status).toBe(200);
-    const body = (await resp.json()) as { account_did: string; state: string };
-    expect(body.account_did).toBe(newAgent.did);
+    const body = (await resp.json()) as { account_id: string; agent_did: string; state: string };
+    expect(body.agent_did).toBe(newAgent.did);
     expect(body.state).toBe("CLAIMED");
 
     // Account lives under the new DID, revoked cleared, old DID gone.
-    expect((await accounts.get(newAgent.did))?.revoked).toBeFalsy();
-    expect(await accounts.get(oldAgent.did)).toBeNull();
+    expect((await accounts.getByAgentDid(newAgent.did))?.revoked).toBeFalsy();
+    expect(await accounts.getByAgentDid(oldAgent.did)).toBeNull();
     // Old key is locked out at the Verifier.
     expect(await revocationList.isRevoked(oldAgent.did)).toBe(true);
     await expect(
@@ -464,7 +466,7 @@ describe("Server.handleKeyReKey + handleKeyRevocation — owner-gated (§8.2 / �
     const newAgent = await Agent.generate();
     const resp = await server.handleKeyReKey(reKeyReq(oldAgent.did, newAgent.did), ownerSession());
     expect(resp.status).toBe(200);
-    expect((await accounts.get(newAgent.did))?.revoked).toBeFalsy();
+    expect((await accounts.getByAgentDid(newAgent.did))?.revoked).toBeFalsy();
   });
 
   it("stale owner session → 403 owner_session_too_stale", async () => {
@@ -484,8 +486,8 @@ describe("Server.handleKeyReKey + handleKeyRevocation — owner-gated (§8.2 / �
       server.handleKeyReKey(reKeyReq(oldAgent.did, newAgent.did), ownerSession("usr_mallory")),
     ).rejects.toMatchObject({ code: "owner_authentication_required", status: 403 });
     // Victim account is byte-for-byte unchanged; the attacker's DID never materialised.
-    expect((await accounts.get(oldAgent.did))?.owner?.userId).toBe("usr_alice");
-    expect(await accounts.get(newAgent.did)).toBeNull();
+    expect((await accounts.getByAgentDid(oldAgent.did))?.owner?.userId).toBe("usr_alice");
+    expect(await accounts.getByAgentDid(newAgent.did)).toBeNull();
   });
 
   it("re-key on an UNCLAIMED account → 409 not_claimed", async () => {
@@ -528,7 +530,7 @@ describe("Server.handleKeyReKey + handleKeyRevocation — owner-gated (§8.2 / �
     const agent = await claimed(server);
     const resp = await server.handleKeyRevocation(revokeReq(agent.did), ownerSession());
     expect(resp.status).toBe(200);
-    expect((await accounts.get(agent.did))?.revoked).toBe(true);
+    expect((await accounts.getByAgentDid(agent.did))?.revoked).toBe(true);
     await expect(
       server.handleAccountIntrospection(
         await toRequest(await agent.buildAccountIntrospection({ baseUrl: BASE_URL })),
@@ -554,7 +556,7 @@ describe("Server.handleKeyReKey + handleKeyRevocation — owner-gated (§8.2 / �
     await expect(
       server.handleKeyRevocation(revokeReq(agent.did), ownerSession("usr_mallory")),
     ).rejects.toMatchObject({ code: "owner_authentication_required", status: 403 });
-    expect((await accounts.get(agent.did))?.revoked).toBeFalsy(); // not revoked by the impostor
+    expect((await accounts.getByAgentDid(agent.did))?.revoked).toBeFalsy(); // not revoked by the impostor
 
     await expect(
       server.handleKeyRevocation(revokeReq("did:key:zNope"), ownerSession()),

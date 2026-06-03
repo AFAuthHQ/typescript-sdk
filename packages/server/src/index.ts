@@ -298,19 +298,19 @@ export class MemoryAccountStore implements SweepableAccountStore {
     const accountId = this.agentToAccount.get(did);
     if (accountId === undefined) return null;
     const a = this.accounts.get(accountId);
-    return a ? { ...a, agents: [...a.agents] } : null;
+    return a ?? null;
   }
 
   async getById(accountId: string): Promise<Account | null> {
     const a = this.accounts.get(accountId);
-    return a ? { ...a, agents: [...a.agents] } : null;
+    return a ?? null;
   }
 
   async findByPrincipal(iss: string, subH: string): Promise<Account | null> {
     const accountId = this.principalToAccount.get(principalKey(iss, subH));
     if (accountId === undefined) return null;
     const a = this.accounts.get(accountId);
-    return a ? { ...a, agents: [...a.agents] } : null;
+    return a ?? null;
   }
 
   async findByPendingToken(token: string): Promise<Account | null> {
@@ -321,7 +321,7 @@ export class MemoryAccountStore implements SweepableAccountStore {
       return null;
     }
     const a = this.accounts.get(entry.accountId);
-    return a ? { ...a, agents: [...a.agents] } : null;
+    return a ?? null;
   }
 
   async signupAgent(input: {
@@ -332,7 +332,7 @@ export class MemoryAccountStore implements SweepableAccountStore {
     // Idempotent: a credential already attached returns its account.
     const known = this.agentToAccount.get(did);
     if (known !== undefined) {
-      return { account: { ...this.accounts.get(known)! }, attached: false };
+      return { account: this.accounts.get(known)!, attached: false };
     }
     // Group by principal when present.
     if (principal) {
@@ -342,7 +342,7 @@ export class MemoryAccountStore implements SweepableAccountStore {
         const account = this.accounts.get(existingId)!;
         account.agents.push({ did, addedAt: new Date().toISOString() });
         this.agentToAccount.set(did, existingId);
-        return { account: { ...account, agents: [...account.agents] }, attached: true };
+        return { account, attached: true };
       }
     }
     // Create a fresh account with `did` as its first credential.
@@ -358,7 +358,7 @@ export class MemoryAccountStore implements SweepableAccountStore {
     if (principal) {
       this.principalToAccount.set(principalKey(principal.iss, principal.subH), account.accountId);
     }
-    return { account: { ...account, agents: [...account.agents] }, attached: false };
+    return { account, attached: false };
   }
 
   async attachAgent(accountId: string, did: Did, addedAt: string): Promise<Account> {
@@ -2420,18 +2420,23 @@ export class Server {
     await this.enforceRateLimit("owner_key_operation", session.userId);
 
     const bodyBytes = new Uint8Array(await req.arrayBuffer());
-    let parsed: { account_id?: string };
+    let parsed: { account_id?: string; agent_did?: string };
     try {
       parsed = JSON.parse(new TextDecoder().decode(bodyBytes)) as typeof parsed;
     } catch {
       throw new AFAuthError("malformed_request", 400, "request body is not valid JSON");
     }
+    // Name the account directly by `account_id`, or by any of its agent
+    // credentials via `agent_did` (revoke the account a device belongs to).
     const accountId = parsed.account_id;
-    if (typeof accountId !== "string" || accountId.length === 0) {
-      throw new AFAuthError("malformed_request", 400, "missing `account_id`");
+    const agentDid = parsed.agent_did;
+    if ((typeof accountId !== "string" || !accountId) && (typeof agentDid !== "string" || !agentDid)) {
+      throw new AFAuthError("malformed_request", 400, "missing `account_id` (or `agent_did`)");
     }
 
-    const account = await this.accounts.getById(accountId);
+    const account = accountId
+      ? await this.accounts.getById(accountId)
+      : await this.accounts.getByAgentDid(agentDid!);
     if (!account) {
       throw new AFAuthError("unknown_account", 404, "account not found");
     }
@@ -2449,11 +2454,11 @@ export class Server {
     }
 
     const revokedAt = new Date().toISOString();
-    await this.accounts.revoke(accountId, revokedAt);
+    await this.accounts.revoke(account.accountId, revokedAt);
     // Block every credential (device) of the account at the Verifier (§8.3).
     for (const agent of account.agents) await this.revocationList.add(agent.did, revokedAt);
 
-    return jsonResponse({ account_id: accountId, revoked_at: revokedAt }, 200);
+    return jsonResponse({ account_id: account.accountId, revoked_at: revokedAt }, 200);
   }
 
   // ----- Account introspection (§6.5) -----

@@ -269,13 +269,13 @@ describe("MemoryAccountStore reverse index", () => {
     const { MemoryAccountStore } = await import("../index.js");
     const accounts = new MemoryAccountStore();
     const did = "did:key:zAlice";
-    await accounts.createUnclaimed(did);
+    const { account } = await accounts.signupAgent({ did: did });
 
     // Issue 10 supersessions; the most recent token wins.
     for (let i = 0; i < 10; i++) {
       const expiresAt = new Date(Date.now() + 3600_000).toISOString();
       await accounts.setPendingInvitation(
-        did,
+        account.accountId,
         { type: "email", value: "alice@example.com" },
         `tok${i}`,
         expiresAt,
@@ -286,6 +286,8 @@ describe("MemoryAccountStore reverse index", () => {
     for (let i = 0; i < 9; i++) {
       expect(await accounts.findByPendingToken(`tok${i}`)).toBeNull();
     }
-    expect(await accounts.findByPendingToken("tok9")).toMatchObject({ did, state: "INVITED" });
+    const resolved = (await accounts.findByPendingToken("tok9"))!;
+    expect(resolved.state).toBe("INVITED");
+    expect(resolved.agents.map((a) => a.did)).toContain(did);
   });
 });

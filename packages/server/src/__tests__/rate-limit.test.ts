@@ -123,7 +123,7 @@ describe("Server.handleOwnerInvitation enforces rate limits", () => {
       now: () => 1_700_000_000,
     });
     const agent = await Agent.generate();
-    await accounts.createUnclaimed(agent.did);
+    await accounts.signupAgent({ did: agent.did }).then((r) => r.account);
 
     async function sendInvite() {
       const signed = await agent.buildOwnerInvitation({
@@ -165,8 +165,8 @@ describe("Server.handleOwnerInvitation enforces rate limits", () => {
     const { server, accounts } = newServer({ limit: 1, windowSeconds: 3600 });
     const alice = await Agent.generate();
     const bob = await Agent.generate();
-    await accounts.createUnclaimed(alice.did);
-    await accounts.createUnclaimed(bob.did);
+    await accounts.signupAgent({ did: alice.did }).then((r) => r.account);
+    await accounts.signupAgent({ did: bob.did }).then((r) => r.account);
 
     async function inviteAs(agent: Agent) {
       const signed = await agent.buildOwnerInvitation({
@@ -206,7 +206,7 @@ describe("Server.handleOwnerInvitation enforces rate limits", () => {
       // no rateLimiter / rateLimits
     });
     const agent = await Agent.generate();
-    await accounts.createUnclaimed(agent.did);
+    await accounts.signupAgent({ did: agent.did }).then((r) => r.account);
     for (let i = 0; i < 5; i++) {
       const signed = await agent.buildOwnerInvitation({
         baseUrl: BASE_URL,
@@ -237,7 +237,7 @@ describe("Server.handleOwnerInvitation enforces rate limits", () => {
       },
     });
     const agent = await Agent.generate();
-    await accounts.createUnclaimed(agent.did);
+    await accounts.signupAgent({ did: agent.did }).then((r) => r.account);
     for (let i = 0; i < 3; i++) {
       const signed = await agent.buildOwnerInvitation({
         baseUrl: BASE_URL,

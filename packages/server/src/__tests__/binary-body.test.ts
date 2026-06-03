@@ -290,7 +290,7 @@ describe("Server.handle* handlers do not corrupt non-UTF-8 bodies", () => {
     const { secretKey, publicKey } = ed25519.keygen();
     const did = encodeDidKey(publicKey);
     const accounts = new MemoryAccountStore();
-    await accounts.createUnclaimed(did);
+    await accounts.signupAgent({ did: did }).then((r) => r.account);
     const server = new Server({
       nonceStore: new MemoryNonceStore(),
       serviceDid: DISCOVERY.service_did,
