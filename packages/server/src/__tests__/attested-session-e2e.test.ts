@@ -103,7 +103,7 @@ describe("§10.7 E2E: attest → access → expire → re-mint → attestor revo
       agentDid: agent.did,
       agentPublicKey: agent.publicKey,
       agentPrivateKey: agent.exportPrivateKey(),
-      binding: { binding_id: "bind-1", binding_token: "tok", binding_token_expires_at: nowS + 86_400 },
+      binding: { binding_id: "bind-1", binding_token_expires_at: nowS + 86_400 },
       fetch: trustFetch,
       now: clock,
     });
