@@ -693,6 +693,24 @@ function parseSignatureInput(header: string): ParsedSignatureInput {
     }
   }
 
+  // §5.2 / §5.5 step 1: `@method` and `@target-uri` are REQUIRED covered
+  // components ("Required when: Always"). The verifier MUST enforce their
+  // presence rather than trust the signer to self-select which
+  // security-critical inputs are bound. A signature that omits
+  // `@target-uri` verifies against ANY URL, silently defeating the §12.2
+  // cross-service replay binding for any under-covering signer (portable
+  // DIDs are the §3.3/D.1 default). conformance.md requires rejecting
+  // "missing components".
+  for (const required of ["@method", "@target-uri"] as const) {
+    if (!covered.includes(required)) {
+      throw new AFAuthError(
+        "invalid_signature",
+        401,
+        `missing required covered component: ${required} (§5.2)`,
+      );
+    }
+  }
+
   const partial: Partial<SignatureParams> = {};
   for (const part of paramsStr.split(";").map((p) => p.trim()).filter(Boolean)) {
     const eq = part.indexOf("=");
