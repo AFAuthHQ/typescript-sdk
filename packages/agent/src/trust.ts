@@ -11,18 +11,26 @@
  *      long-lived binding token.
  *
  *   2. Mint short-lived, audience-bound §10 attestation JWTs by
- *      calling `token(serviceDid)`. Tokens are cached in memory by
- *      audience and refreshed at 80% of TTL.
+ *      calling `token(serviceDid)`. The mint request is signed per §5
+ *      with the agent's account key (§3.1 keyless mint) — the keypair is
+ *      the sole credential and no bearer token is sent. Minted JWTs are
+ *      cached in memory by audience and refreshed near TTL.
  *
- * The binding token is the agent's secret credential at the trust
- * attestor. It should be persisted by the caller (the AFAuth CLI
- * stores it at `~/.afauth/trust.json` with chmod 600).
+ * The agent's Ed25519 keypair is therefore the only secret to persist
+ * (the AFAuth CLI stores it under `~/.afauth/` with chmod 600). The
+ * `binding` record returned by `linkPoll()` records that the agent has
+ * linked; its `binding_token` is retained only for backward
+ * compatibility with attestors that have not yet enabled keyless mint,
+ * and is no longer presented by `token()`.
  */
 
 import { ed25519 } from "@noble/curves/ed25519.js";
 import {
   AFAuthError,
+  buildCanonicalInput,
   encodeDidKey,
+  sha256ContentDigest,
+  type CoveredComponent,
   type Did,
   type Ed25519PrivateKey,
 } from "@afauthhq/core";
@@ -157,15 +165,20 @@ export class TrustClient {
   }
 
   /**
-   * Mint a §10 attestation JWT for `serviceDid`. Cached in-memory by
-   * audience and refreshed at 80% of TTL.
+   * Mint a §10 attestation JWT for `serviceDid`. The mint request is
+   * signed per §5 with the agent key (§3.1 keyless mint); no bearer token
+   * is sent. Cached in-memory by audience and refreshed near TTL.
+   *
+   * The agent signs `${baseUrl}/v1/token`, which MUST equal the
+   * attestor's configured public base URL (the default
+   * `https://trust.afauth.org` matches out of the box).
    */
   async token(serviceDid: string): Promise<TrustToken> {
     if (!this.binding) {
       throw new AFAuthError(
         "invalid_attestation",
         401,
-        "TrustClient: no binding — run linkStart()/linkPoll() first or pass `binding` to the constructor",
+        "TrustClient: not linked — run linkStart()/linkPoll() first or pass `binding` to the constructor",
       );
     }
 
@@ -182,13 +195,46 @@ export class TrustClient {
       };
     }
 
-    const body = (await this.postJson(
-      "/v1/token",
-      { aud: serviceDid },
-      { authorization: `Bearer ${this.binding.binding_token}` },
-    )) as TrustToken;
+    const path = "/v1/token";
+    const url = `${this.baseUrl}${path}`;
+    const bodyStr = JSON.stringify({ aud: serviceDid });
+    const r = await this.fetchImpl(url, {
+      method: "POST",
+      headers: this.signMintHeaders(url, bodyStr),
+      body: bodyStr,
+    });
+    await this.ensureOk(r, path);
+    const body = (await r.json()) as TrustToken;
     this.cache.set(serviceDid, { ...body });
     return body;
+  }
+
+  /**
+   * Builds the §5 (RFC 9421) signed headers for a `/v1/token` mint POST,
+   * signed with the agent's account key. Covers `@method`, `@target-uri`,
+   * and `content-digest`; `keyid` is the agent DID.
+   */
+  private signMintHeaders(url: string, bodyStr: string): Record<string, string> {
+    const created = this.now();
+    const expires = created + 60;
+    const nonce = randomHex(16);
+    const contentDigest = sha256ContentDigest(bodyStr);
+    const covered: readonly CoveredComponent[] = ["@method", "@target-uri", "content-digest"];
+    const canonicalInput = buildCanonicalInput(
+      { method: "POST", targetUri: url, contentDigest },
+      { created, expires, nonce, keyid: this.agentDid, alg: "ed25519" },
+      covered,
+    );
+    const sig = ed25519.sign(new TextEncoder().encode(canonicalInput), this.agentPrivateKey);
+    const componentList = covered.map((c) => `"${c}"`).join(" ");
+    return {
+      "content-type": "application/json",
+      "content-digest": contentDigest,
+      "signature-input":
+        `sig1=(${componentList});created=${created};expires=${expires};` +
+        `nonce="${nonce}";keyid="${this.agentDid}";alg="ed25519"`,
+      signature: `sig1=:${bytesToBase64(sig)}:`,
+    };
   }
 
   /** Forget the cached token for a specific audience (or all). */
@@ -199,41 +245,37 @@ export class TrustClient {
 
   // -------------------------------------------------------------------
 
-  private async postJson(
-    path: string,
-    payload: unknown,
-    extraHeaders: Record<string, string> = {},
-  ): Promise<unknown> {
+  private async postJson(path: string, payload: unknown): Promise<unknown> {
     const r = await this.fetchImpl(`${this.baseUrl}${path}`, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        ...extraHeaders,
-      },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
     });
-    if (!r.ok) {
-      let upstreamCode: string | undefined;
-      let detail = `${r.status} ${r.statusText}`;
-      try {
-        const j = await r.json();
-        if (j && typeof j === "object" && "error" in j) {
-          const err = (j as { error?: { code?: string; message?: string } }).error;
-          if (err) {
-            upstreamCode = err.code;
-            detail = `${err.code ?? "error"}: ${err.message ?? detail}`;
-          }
-        }
-      } catch {
-        // Ignore body-parse errors and keep the status line.
-      }
-      throw new TrustHttpError(
-        `trust ${path} failed: ${detail}`,
-        r.status,
-        upstreamCode,
-      );
-    }
+    await this.ensureOk(r, path);
     return r.json();
+  }
+
+  /**
+   * Throw a `TrustHttpError` (preserving the upstream error code) when
+   * `r` is not 2xx. Shared by `postJson` and the signed `token()` flow.
+   */
+  private async ensureOk(r: Response, path: string): Promise<void> {
+    if (r.ok) return;
+    let upstreamCode: string | undefined;
+    let detail = `${r.status} ${r.statusText}`;
+    try {
+      const j = await r.json();
+      if (j && typeof j === "object" && "error" in j) {
+        const err = (j as { error?: { code?: string; message?: string } }).error;
+        if (err) {
+          upstreamCode = err.code;
+          detail = `${err.code ?? "error"}: ${err.message ?? detail}`;
+        }
+      }
+    } catch {
+      // Ignore body-parse errors and keep the status line.
+    }
+    throw new TrustHttpError(`trust ${path} failed: ${detail}`, r.status, upstreamCode);
   }
 }
 
@@ -271,4 +313,17 @@ function bytesToBase64Url(bytes: Uint8Array): string {
   let binary = "";
   for (const b of bytes) binary += String.fromCharCode(b);
   return btoa(binary).replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
+}
+
+/** Standard base64 (with padding) — the encoding RFC 9421 uses in the `Signature` header. */
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary);
+}
+
+function randomHex(byteLen: number): string {
+  const bytes = new Uint8Array(byteLen);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }

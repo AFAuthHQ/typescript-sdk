@@ -98,12 +98,13 @@ describe("TrustClient", () => {
     expect(c.isLinked()).toBe(false);
   });
 
-  it("token() bearers the binding token and caches by audience", async () => {
+  it("token() signs the mint request with the agent key (§3.1, no bearer token) and caches by audience", async () => {
     const expires = Math.floor(Date.now() / 1000) + 900;
     const { impl, calls } = mockFetch([
       {
         path: "/v1/token",
         body: { jwt: "jwt-1", expires_at: expires, verification: "email" },
+        assertBody: (b) => expect((b as { aud: string }).aud).toBe("did:web:svc.example"),
       },
     ]);
     const c = new TrustClient({
@@ -117,16 +118,23 @@ describe("TrustClient", () => {
     const t1 = await c.token("did:web:svc.example");
     expect(t1.jwt).toBe("jwt-1");
     expect(t1.verification).toBe("email");
-    expect(calls[0]!.init.headers).toMatchObject({ authorization: "Bearer tok" });
 
-    // Second call for the same audience hits cache.
+    // §3.1: the mint call is §5-signed with the agent key, NOT bearer.
+    const headers = calls[0]!.init.headers as Record<string, string>;
+    expect(headers.authorization).toBeUndefined();
+    expect(headers["signature-input"]).toContain(`keyid="${c.agentDid}"`);
+    expect(headers["signature-input"]).toContain('"@method" "@target-uri" "content-digest"');
+    expect(headers["signature"]).toMatch(/^sig1=:.+:$/);
+    expect(headers["content-digest"]).toMatch(/^sha-256=:.+:$/);
+
+    // Second call for the same audience hits cache (no second fetch).
     const t2 = await c.token("did:web:svc.example");
     expect(t2.jwt).toBe("jwt-1");
     expect(calls.length).toBe(1);
   });
 
-  it("token() refuses without a binding", async () => {
+  it("token() refuses when the agent has not linked", async () => {
     const c = new TrustClient();
-    await expect(c.token("did:web:svc.example")).rejects.toThrow(/no binding/);
+    await expect(c.token("did:web:svc.example")).rejects.toThrow(/not linked/);
   });
 });
