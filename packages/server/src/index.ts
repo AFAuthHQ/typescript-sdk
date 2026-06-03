@@ -106,22 +106,73 @@ export class MemoryNonceStore implements NonceStore {
 
 export type AccountState = "UNCLAIMED" | "INVITED" | "CLAIMED" | "EXPIRED";
 
-export interface Account {
+/**
+ * A single agent credential (a `did:key` — one "device") attached to an
+ * account. A human's PC and phone agents are two `AccountAgent`s on the
+ * same `Account` (§10.4.4): same human, same account, many devices.
+ */
+export interface AccountAgent {
   did: Did;
+  /** ISO-8601 timestamp this credential was attached (§6.4). */
+  addedAt: string;
+  /** Set once this specific credential is revoked (§8.4); the account survives. */
+  revoked?: boolean;
+}
+
+export interface Account {
+  /**
+   * Opaque, service-local, stable identifier for the account — NOT a DID.
+   * One account groups every agent credential of a single human (§10.4.4),
+   * so the account identity is decoupled from any one verification key.
+   */
+  accountId: string;
+  /**
+   * Per-service human pseudonym this account is grouped under, present iff
+   * the account was created from an attested binding (§10.4). Absent for
+   * singleton accounts (attestation `off`/`optional`, or a runtime-only
+   * attestation that carries no `sub_h`). The `(iss, subH)` pair is the
+   * grouping key — a second agent presenting the same pair joins THIS
+   * account rather than creating a new one.
+   */
+  principal?: { iss: string; subH: string };
+  /** Attached agent credentials (devices). At least one while the account is live. */
+  agents: AccountAgent[];
   state: AccountState;
   /** ISO-8601 timestamp the account was first materialised (§6.4/§6.5). */
   createdAt: string;
   pendingRecipient?: Recipient;
+  /** Owner binding (§7) — bound once, shared by every device on the account. */
   owner?: { identity: Recipient; userId: string; claimedAt: string };
+  /** Whole-account revoke (§8.4) — distinct from a single credential's `AccountAgent.revoked`. */
   revoked?: boolean;
+}
+
+/** Result of `AccountStore.signupAgent`. */
+export interface SignupResult {
+  account: Account;
+  /**
+   * `true` if `did` attached to an account that already existed (a second
+   * device of a known human); `false` if this call created the account.
+   */
+  attached: boolean;
 }
 
 /**
  * Storage contract for AFAuth accounts. See ADR-0004.
+ *
+ * Accounts are keyed on an opaque `accountId` and resolved from a request
+ * via `getByAgentDid` (the signature's `keyid` authenticates a credential,
+ * which resolves to its account). Multiple agent DIDs may attach to one
+ * account; `signupAgent` groups them by the `(iss, sub_h)` principal.
  */
 export interface AccountStore {
   // ----- Reads -----
-  get(did: Did): Promise<Account | null>;
+  /** Resolve the account that `did` is a credential of, or null. */
+  getByAgentDid(did: Did): Promise<Account | null>;
+  /** Fetch by opaque account id, or null. */
+  getById(accountId: string): Promise<Account | null>;
+  /** Find the account grouped under `(iss, subH)`, or null (the §10.4.4 grouping key). */
+  findByPrincipal(iss: string, subH: string): Promise<Account | null>;
 
   /**
    * Read-only lookup by pending invitation token. Returns the account
@@ -133,9 +184,25 @@ export interface AccountStore {
   findByPendingToken(token: string): Promise<Account | null>;
 
   // ----- Atomic mutations -----
-  createUnclaimed(did: Did): Promise<Account>;
+  /**
+   * Find-or-create + attach `did`, atomically on the `(iss, subH)` key:
+   *   - `principal` given and an account exists for it → attach `did`
+   *     (a new device of a known human) and return `{ attached: true }`.
+   *   - otherwise → create a new UNCLAIMED account (carrying `principal`
+   *     if given) with `did` as its first credential, `{ attached: false }`.
+   * Idempotent: re-signing-up an already-attached `did` is a no-op.
+   */
+  signupAgent(input: {
+    did: Did;
+    principal?: { iss: string; subH: string };
+  }): Promise<SignupResult>;
+  /** Attach another credential (device) to an existing account. Idempotent on `did`. */
+  attachAgent(accountId: string, did: Did, addedAt: string): Promise<Account>;
+  /** Revoke a single credential (§8.4 per-device); the account survives if others remain. */
+  revokeAgent(did: Did, revokedAt: string): Promise<Account>;
+
   setPendingInvitation(
-    did: Did,
+    accountId: string,
     recipient: Recipient,
     token: string,
     expiresAt: string,
@@ -144,19 +211,25 @@ export interface AccountStore {
     token: string,
     owner: NonNullable<Account["owner"]>,
   ): Promise<Account | null>;
-  rotateKey(oldDid: Did, newDid: Did, rotatedAt: string): Promise<Account>;
-  revoke(did: Did, revokedAt: string): Promise<Account>;
   /**
-   * Owner-initiated re-key resume (§8.2): atomically install `newDid` in
-   * place of `oldDid` AND clear the `revoked` flag, in a single write /
-   * transaction. This is the resume half of revoke → re-key — a revoked
+   * §8.1 rotation: swap credential `oldDid` for `newDid` within its account.
+   * The `accountId` is STABLE across rotation (the account is no longer the
+   * DID), which is the key simplification of the multi-agent model.
+   */
+  rotateAgent(oldDid: Did, newDid: Did, rotatedAt: string): Promise<Account>;
+  /** Whole-account revoke (§8.4). */
+  revoke(accountId: string, revokedAt: string): Promise<Account>;
+  /**
+   * Owner-initiated re-key resume (§8.2): atomically swap credential
+   * `oldDid` for `newDid` AND clear the account `revoked` flag, in a single
+   * write / transaction. The resume half of revoke → re-key — a revoked
    * CLAIMED account comes back under a fresh key. Doing the clear in the
-   * SAME atomic step as the rotate is the whole point: a `rotateKey`
+   * SAME atomic step as the swap is the whole point: a `rotateAgent`
    * followed by a separate clear would, on a crash/interleave (notably on
    * D1, where each is its own transaction), leave the new DID live but
-   * still flagged revoked. Carries the owner binding and state forward;
-   * throws `unknown_account` if `oldDid` is absent. The caller is
-   * responsible for guarding against a `newDid` that already exists.
+   * still flagged revoked. `accountId` is stable; throws `unknown_account`
+   * if `oldDid` is absent. The caller guards against a `newDid` that
+   * already names a credential.
    */
   reKey(oldDid: Did, newDid: Did, reKeyedAt: string): Promise<Account>;
 }
@@ -188,11 +261,24 @@ export interface SweepableAccountStore extends AccountStore {
   listOpenAccounts(): Promise<Account[]>;
 
   /**
-   * Transition the account to `EXPIRED`. Idempotent — calling on an
-   * already-EXPIRED account is a no-op. Calling on a CLAIMED or
-   * unknown account throws (the spec forbids CLAIMED → EXPIRED).
+   * Transition the account (by `accountId`) to `EXPIRED`. Idempotent —
+   * calling on an already-EXPIRED account is a no-op. Calling on a CLAIMED
+   * or unknown account throws (the spec forbids CLAIMED → EXPIRED).
    */
-  expire(did: Did, expiredAt: string): Promise<Account>;
+  expire(accountId: string, expiredAt: string): Promise<Account>;
+}
+
+/** Generate an opaque, service-local account id (`acct_<22-char base64url>`). */
+function generateAccountId(): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return "acct_" + btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function principalKey(iss: string, subH: string): string {
+  return `${iss}\x00${subH}`;
 }
 
 /**
@@ -201,15 +287,30 @@ export interface SweepableAccountStore extends AccountStore {
  * durable backend (e.g. a KV-backed implementation).
  */
 export class MemoryAccountStore implements SweepableAccountStore {
-  private readonly accounts = new Map<Did, Account>();
-  private readonly tokens = new Map<string, { did: Did; expiresAt: string }>();
-  /** Reverse index: did → its current pending-invitation token, if any.
-   *  Lets §7.3 atomic supersession run in O(1) instead of scanning
-   *  every token on every new invitation. */
-  private readonly didToToken = new Map<Did, string>();
+  private readonly accounts = new Map<string, Account>(); // accountId → Account
+  private readonly agentToAccount = new Map<Did, string>(); // credential did → accountId
+  private readonly principalToAccount = new Map<string, string>(); // (iss\x00subH) → accountId
+  private readonly tokens = new Map<string, { accountId: string; expiresAt: string }>();
+  /** Reverse index: accountId → its current pending-invitation token, if any (§7.3 O(1)). */
+  private readonly accountToToken = new Map<string, string>();
 
-  async get(did: Did): Promise<Account | null> {
-    return this.accounts.get(did) ?? null;
+  async getByAgentDid(did: Did): Promise<Account | null> {
+    const accountId = this.agentToAccount.get(did);
+    if (accountId === undefined) return null;
+    const a = this.accounts.get(accountId);
+    return a ? { ...a, agents: [...a.agents] } : null;
+  }
+
+  async getById(accountId: string): Promise<Account | null> {
+    const a = this.accounts.get(accountId);
+    return a ? { ...a, agents: [...a.agents] } : null;
+  }
+
+  async findByPrincipal(iss: string, subH: string): Promise<Account | null> {
+    const accountId = this.principalToAccount.get(principalKey(iss, subH));
+    if (accountId === undefined) return null;
+    const a = this.accounts.get(accountId);
+    return a ? { ...a, agents: [...a.agents] } : null;
   }
 
   async findByPendingToken(token: string): Promise<Account | null> {
@@ -219,54 +320,97 @@ export class MemoryAccountStore implements SweepableAccountStore {
       this.tokens.delete(token);
       return null;
     }
-    return this.accounts.get(entry.did) ?? null;
+    const a = this.accounts.get(entry.accountId);
+    return a ? { ...a, agents: [...a.agents] } : null;
   }
 
-  async createUnclaimed(did: Did): Promise<Account> {
-    const existing = this.accounts.get(did);
-    if (existing) return existing;
-    const fresh: Account = {
-      did,
+  async signupAgent(input: {
+    did: Did;
+    principal?: { iss: string; subH: string };
+  }): Promise<SignupResult> {
+    const { did, principal } = input;
+    // Idempotent: a credential already attached returns its account.
+    const known = this.agentToAccount.get(did);
+    if (known !== undefined) {
+      return { account: { ...this.accounts.get(known)! }, attached: false };
+    }
+    // Group by principal when present.
+    if (principal) {
+      const pk = principalKey(principal.iss, principal.subH);
+      const existingId = this.principalToAccount.get(pk);
+      if (existingId !== undefined) {
+        const account = this.accounts.get(existingId)!;
+        account.agents.push({ did, addedAt: new Date().toISOString() });
+        this.agentToAccount.set(did, existingId);
+        return { account: { ...account, agents: [...account.agents] }, attached: true };
+      }
+    }
+    // Create a fresh account with `did` as its first credential.
+    const account: Account = {
+      accountId: generateAccountId(),
+      ...(principal ? { principal } : {}),
+      agents: [{ did, addedAt: new Date().toISOString() }],
       state: "UNCLAIMED",
       createdAt: new Date().toISOString(),
     };
-    this.accounts.set(did, fresh);
-    return fresh;
+    this.accounts.set(account.accountId, account);
+    this.agentToAccount.set(did, account.accountId);
+    if (principal) {
+      this.principalToAccount.set(principalKey(principal.iss, principal.subH), account.accountId);
+    }
+    return { account: { ...account, agents: [...account.agents] }, attached: false };
+  }
+
+  async attachAgent(accountId: string, did: Did, addedAt: string): Promise<Account> {
+    const account = this.accounts.get(accountId);
+    if (!account) {
+      throw new AFAuthError("unknown_account", 404, `account ${accountId} does not exist`);
+    }
+    if (!account.agents.some((a) => a.did === did)) {
+      account.agents.push({ did, addedAt });
+      this.agentToAccount.set(did, accountId);
+    }
+    return { ...account, agents: [...account.agents] };
+  }
+
+  async revokeAgent(did: Did, _revokedAt: string): Promise<Account> {
+    const accountId = this.agentToAccount.get(did);
+    if (accountId === undefined) {
+      throw new AFAuthError("unknown_account", 404, `no account for agent ${did}`);
+    }
+    const account = this.accounts.get(accountId)!;
+    const agent = account.agents.find((a) => a.did === did);
+    if (agent) agent.revoked = true;
+    return { ...account, agents: [...account.agents] };
   }
 
   async setPendingInvitation(
-    did: Did,
+    accountId: string,
     recipient: Recipient,
     token: string,
     expiresAt: string,
   ): Promise<Account> {
-    const account = this.accounts.get(did);
+    const account = this.accounts.get(accountId);
     if (!account) {
-      throw new AFAuthError("unknown_account", 404, `account ${did} does not exist`);
+      throw new AFAuthError("unknown_account", 404, `account ${accountId} does not exist`);
     }
     if (account.revoked) {
-      throw new AFAuthError("revoked_key", 401, `account ${did} is revoked`);
+      throw new AFAuthError("revoked_key", 401, `account ${accountId} is revoked`);
     }
     if (account.state === "CLAIMED") {
-      throw new AFAuthError(
-        "already_claimed",
-        409,
-        `account ${did} is already claimed`,
-      );
+      throw new AFAuthError("already_claimed", 409, `account ${accountId} is already claimed`);
     }
 
-    // §7.3 atomic replacement: invalidate any prior pending invitation
-    // for this DID before installing the new one. O(1) via reverse
-    // index instead of scanning the full token map.
-    const existing = this.didToToken.get(did);
+    // §7.3 atomic replacement: invalidate any prior pending invitation for
+    // this account before installing the new one. O(1) via reverse index.
+    const existing = this.accountToToken.get(accountId);
     if (existing !== undefined) this.tokens.delete(existing);
 
-    this.tokens.set(token, { did, expiresAt });
-    this.didToToken.set(did, token);
+    this.tokens.set(token, { accountId, expiresAt });
+    this.accountToToken.set(accountId, token);
     account.state = "INVITED";
     account.pendingRecipient = recipient;
-    this.accounts.set(did, account);
-    return { ...account };
+    return { ...account, agents: [...account.agents] };
   }
 
   async completeClaimByToken(
@@ -279,120 +423,92 @@ export class MemoryAccountStore implements SweepableAccountStore {
       this.tokens.delete(token);
       return null;
     }
-    const account = this.accounts.get(entry.did);
+    const account = this.accounts.get(entry.accountId);
     if (!account) return null;
 
-    const claimed: Account = {
-      did: account.did,
-      state: "CLAIMED",
-      createdAt: account.createdAt,
-      owner,
-      ...(account.revoked ? { revoked: account.revoked } : {}),
-    };
-    this.accounts.set(entry.did, claimed);
+    account.state = "CLAIMED";
+    account.owner = owner;
+    delete account.pendingRecipient;
     this.tokens.delete(token);
-    this.didToToken.delete(entry.did);
-    return claimed;
+    this.accountToToken.delete(entry.accountId);
+    return { ...account, agents: [...account.agents] };
   }
 
-  async rotateKey(oldDid: Did, newDid: Did, _rotatedAt: string): Promise<Account> {
-    const account = this.accounts.get(oldDid);
+  async rotateAgent(oldDid: Did, newDid: Did, _rotatedAt: string): Promise<Account> {
+    const accountId = this.agentToAccount.get(oldDid);
+    if (accountId === undefined) {
+      throw new AFAuthError("unknown_account", 404, `no account for agent ${oldDid}`);
+    }
+    const account = this.accounts.get(accountId)!;
+    const agent = account.agents.find((a) => a.did === oldDid);
+    if (agent) agent.did = newDid;
+    this.agentToAccount.delete(oldDid);
+    this.agentToAccount.set(newDid, accountId);
+    return { ...account, agents: [...account.agents] };
+  }
+
+  async revoke(accountId: string, _revokedAt: string): Promise<Account> {
+    const account = this.accounts.get(accountId);
     if (!account) {
-      throw new AFAuthError("unknown_account", 404, `account ${oldDid} does not exist`);
+      throw new AFAuthError("unknown_account", 404, `account ${accountId} does not exist`);
     }
-    const rotated: Account = { ...account, did: newDid };
-    this.accounts.delete(oldDid);
-    this.accounts.set(newDid, rotated);
-    // Migrate the pending-token reference (if any) atomically with
-    // the account-id swap. O(1) via reverse index.
-    const tok = this.didToToken.get(oldDid);
-    if (tok !== undefined) {
-      this.didToToken.delete(oldDid);
-      this.didToToken.set(newDid, tok);
-      const tokenEntry = this.tokens.get(tok);
-      if (tokenEntry) tokenEntry.did = newDid;
-    }
-    return rotated;
+    account.revoked = true;
+    return { ...account, agents: [...account.agents] };
   }
 
   async reKey(oldDid: Did, newDid: Did, _reKeyedAt: string): Promise<Account> {
-    const account = this.accounts.get(oldDid);
-    if (!account) {
-      throw new AFAuthError("unknown_account", 404, `account ${oldDid} does not exist`);
+    const accountId = this.agentToAccount.get(oldDid);
+    if (accountId === undefined) {
+      throw new AFAuthError("unknown_account", 404, `no account for agent ${oldDid}`);
     }
-    // Rotate + clear `revoked` atomically. Building the new record
-    // field-by-field (rather than spreading `account`) is deliberate:
-    // it OMITS `revoked`, which is exactly the carry-forward that
-    // rotateKey's spread leaves behind.
-    const rekeyed: Account = {
-      did: newDid,
-      state: account.state,
-      createdAt: account.createdAt,
-      ...(account.owner ? { owner: account.owner } : {}),
-      ...(account.pendingRecipient ? { pendingRecipient: account.pendingRecipient } : {}),
-    };
-    this.accounts.delete(oldDid);
-    this.accounts.set(newDid, rekeyed);
-    // Migrate the pending-token reference (if any), mirroring rotateKey.
-    const tok = this.didToToken.get(oldDid);
-    if (tok !== undefined) {
-      this.didToToken.delete(oldDid);
-      this.didToToken.set(newDid, tok);
-      const tokenEntry = this.tokens.get(tok);
-      if (tokenEntry) tokenEntry.did = newDid;
+    const account = this.accounts.get(accountId)!;
+    const agent = account.agents.find((a) => a.did === oldDid);
+    if (agent) {
+      agent.did = newDid;
+      delete agent.revoked;
     }
-    return rekeyed;
-  }
-
-  async revoke(did: Did, _revokedAt: string): Promise<Account> {
-    const account = this.accounts.get(did);
-    if (!account) {
-      throw new AFAuthError("unknown_account", 404, `account ${did} does not exist`);
-    }
-    account.revoked = true;
-    this.accounts.set(did, account);
-    return { ...account };
+    // Clear the whole-account revoke too — this is the resume step.
+    delete account.revoked;
+    this.agentToAccount.delete(oldDid);
+    this.agentToAccount.set(newDid, accountId);
+    return { ...account, agents: [...account.agents] };
   }
 
   async listOpenAccounts(): Promise<Account[]> {
     const out: Account[] = [];
     for (const account of this.accounts.values()) {
       if (account.state === "UNCLAIMED" || account.state === "INVITED") {
-        out.push({ ...account });
+        out.push({ ...account, agents: [...account.agents] });
       }
     }
     return out;
   }
 
-  async expire(did: Did, _expiredAt: string): Promise<Account> {
-    const account = this.accounts.get(did);
+  async expire(accountId: string, _expiredAt: string): Promise<Account> {
+    const account = this.accounts.get(accountId);
     if (!account) {
-      throw new AFAuthError("unknown_account", 404, `account ${did} does not exist`);
+      throw new AFAuthError("unknown_account", 404, `account ${accountId} does not exist`);
     }
     if (account.state === "CLAIMED") {
-      // Spec forbids CLAIMED → EXPIRED (Appendix A).
       throw new AFAuthError(
         "already_claimed",
         409,
-        `account ${did} is CLAIMED; the CLAIMED → EXPIRED transition is forbidden`,
+        `account ${accountId} is CLAIMED; the CLAIMED → EXPIRED transition is forbidden`,
       );
     }
     if (account.state === "EXPIRED") {
-      // Idempotent.
-      return { ...account };
+      return { ...account, agents: [...account.agents] }; // idempotent
     }
     account.state = "EXPIRED";
     // Drop the pending invitation (if any) — EXPIRED accounts have no
-    // operable surface, and the pending recipient is no longer
-    // bindable.
+    // operable surface, and the pending recipient is no longer bindable.
     if (account.pendingRecipient) delete account.pendingRecipient;
-    const tok = this.didToToken.get(did);
+    const tok = this.accountToToken.get(accountId);
     if (tok !== undefined) {
       this.tokens.delete(tok);
-      this.didToToken.delete(did);
+      this.accountToToken.delete(accountId);
     }
-    this.accounts.set(did, account);
-    return { ...account };
+    return { ...account, agents: [...account.agents] };
   }
 }
 
@@ -411,19 +527,11 @@ export interface SweepOptions {
    * Defaults to `() => new Date()`.
    */
   now?: () => Date;
-  /**
-   * §10.4.4: optional per-principal uniqueness store. When supplied, each
-   * account transitioned to EXPIRED also has its `(iss, sub_h)` slot
-   * released, so the principal can sign up afresh. Pass
-   * `server.subHUniquenessStore` here. Omit it and slots are never freed —
-   * the policy degrades to "one account per principal, ever".
-   */
-  subHUniqueness?: SubHUniquenessStore;
 }
 
 export interface SweepResult {
-  /** DIDs transitioned to EXPIRED in this run. */
-  expired: Did[];
+  /** Account ids transitioned to EXPIRED in this run. */
+  expired: string[];
   /** Total accounts considered (UNCLAIMED + INVITED). */
   scanned: number;
 }
@@ -476,19 +584,14 @@ export async function sweepExpiredAccounts(
   const expiredAt = now.toISOString();
 
   const candidates = await store.listOpenAccounts();
-  const expired: Did[] = [];
+  const expired: string[] = [];
 
   for (const account of candidates) {
     const createdMs = Date.parse(account.createdAt);
     if (!Number.isFinite(createdMs)) continue;
     if (createdMs <= cutoffMs) {
-      await store.expire(account.did, expiredAt);
-      // §10.4.4: the account is terminally gone — free its per-principal
-      // slot so the human can sign up again. Done after the EXPIRED
-      // transition commits; releasing a slot for a still-open account
-      // would re-open the Sybil hole.
-      if (opts.subHUniqueness) await opts.subHUniqueness.releaseByDid(account.did);
-      expired.push(account.did);
+      await store.expire(account.accountId, expiredAt);
+      expired.push(account.accountId);
     }
   }
 
@@ -1137,123 +1240,6 @@ export class AttestedSessionGate {
   }
 }
 
-// ---------- Per-principal uniqueness (§10.4.4) ----------
-//
-// §9.2 `attested_only` guarantees a signup carries a VALID attestation; it
-// does NOT, on its own, stop one human from minting many agent keypairs and
-// opening many free accounts. The anti-Sybil property the protocol leans on
-// is the pairwise human pseudonym `sub_h` (§10.4): every attestation the
-// trust attestor issues for the same human at the same service carries the
-// SAME `sub_h`, regardless of which agent DID presents it. A service turns
-// "same human, same bucket" into a real guarantee by keying a uniqueness
-// slot on `(iss, sub_h)` and refusing a second account for a slot already
-// held.
-//
-// This store is that slot. `Server` consults it at signup (when the verified
-// attestation carries a `sub_h`) and rejects a second principal with
-// `409 principal_already_registered`. Runtime-only attestations — no binding,
-// no `sub_h` (§10.4.1) — assert no human and bypass the gate. `defineService`
-// wires a `MemorySubHUniquenessStore` ON by default in `required` mode.
-//
-// Multi-attestor note: the slot is keyed on `(iss, sub_h)` — the §10.4.4
-// scoping. Different attestors derive independent pseudonym spaces for the
-// same human and so occupy independent slots; the spec does not (and cannot)
-// enforce uniqueness across attestors.
-
-export interface SubHClaimResult {
-  /** True iff the slot is now held by `did` (newly claimed, or already held by it). */
-  ok: boolean;
-  /**
-   * When `ok` is false, the account DID that currently holds the
-   * `(iss, sub_h)` slot — surfaced for the service's own logging / account
-   * merge logic. Intentionally NOT returned to the requester on the wire
-   * (it would leak one of the human's other agent DIDs to another).
-   */
-  existingDid?: Did;
-}
-
-export interface SubHUniquenessStore {
-  /**
-   * Atomically reserve the `(iss, sub_h)` slot for `did`:
-   *   - slot free            → bind to `did`, return `{ ok: true }`.
-   *   - slot already `did`   → idempotent, return `{ ok: true }`.
-   *   - slot held by another → return `{ ok: false, existingDid }`.
-   *
-   * MUST be atomic: a correct production impl (e.g. a UNIQUE index on
-   * `(iss, sub_h)`) decides a single winner under concurrent claims for the
-   * same slot with different DIDs. A non-atomic impl re-opens the very
-   * Sybil race this gate exists to close.
-   */
-  claim(iss: string, subH: string, did: Did): Promise<SubHClaimResult>;
-  /**
-   * Move the slot held by `oldDid` to `newDid`, following a key rotation
-   * (§8.1) or owner re-key (§8.2): the account is the same principal, only
-   * its DID changed. `sub_h` is keyed on the principal, not the key, so the
-   * slot must track the live DID. No-op if `oldDid` holds no slot.
-   */
-  rekey(oldDid: Did, newDid: Did): Promise<void>;
-  /**
-   * Release whatever slot `did` holds, so the principal can sign up afresh.
-   * Called when an account is terminally gone — the §6.1 EXPIRED transition,
-   * via `sweepExpiredAccounts`. No-op if `did` holds no slot.
-   *
-   * If a service never runs the sweep, slots are never released and the
-   * policy degrades to "one account per principal, ever" — still safe, just
-   * stricter than "one live account per principal".
-   */
-  releaseByDid(did: Did): Promise<void>;
-}
-
-/**
- * Single-process in-memory `SubHUniquenessStore`. Keeps a forward
- * `(iss,sub_h) → did` map and a `did → (iss,sub_h)` reverse index so
- * `rekey` / `releaseByDid` work from a DID alone. Suitable for tests and
- * single-process services; horizontally-scaled deployments need a shared,
- * atomic backend (e.g. `D1SubHUniquenessStore` in `@afauthhq/worker`, whose
- * UNIQUE index gives a cross-isolate atomic claim).
- *
- * Single-attestor assumption: a given `did` is tracked under one
- * `(iss,sub_h)` at a time. A DID that presents two different attestors'
- * tokens (rare — and a distinct principal per §10.4.4) keeps only its most
- * recently claimed slot in the reverse index.
- */
-export class MemorySubHUniquenessStore implements SubHUniquenessStore {
-  private readonly forward = new Map<string, Did>();
-  private readonly reverse = new Map<Did, string>();
-
-  private static key(iss: string, subH: string): string {
-    return `${iss}\x00${subH}`;
-  }
-
-  async claim(iss: string, subH: string, did: Did): Promise<SubHClaimResult> {
-    const key = MemorySubHUniquenessStore.key(iss, subH);
-    const held = this.forward.get(key);
-    if (held !== undefined && held !== did) {
-      return { ok: false, existingDid: held };
-    }
-    this.forward.set(key, did);
-    this.reverse.set(did, key);
-    return { ok: true };
-  }
-
-  async rekey(oldDid: Did, newDid: Did): Promise<void> {
-    const key = this.reverse.get(oldDid);
-    if (key === undefined) return;
-    this.reverse.delete(oldDid);
-    this.reverse.set(newDid, key);
-    this.forward.set(key, newDid);
-  }
-
-  async releaseByDid(did: Did): Promise<void> {
-    const key = this.reverse.get(did);
-    if (key === undefined) return;
-    this.reverse.delete(did);
-    // Only clear the forward entry if it still points at `did`: a
-    // concurrent re-claim by another DID must not be clobbered.
-    if (this.forward.get(key) === did) this.forward.delete(key);
-  }
-}
-
 // ---------- Rate limiter (§11.3 rate_limit_exceeded) ----------
 //
 // The protocol reserves `rate_limit_exceeded` (429) in §11.3 but takes
@@ -1727,20 +1713,6 @@ export interface ServerOptions extends VerifierOptions {
     /** Window length for `"extended"` mode (seconds). */
     sessionTtlSeconds?: number;
   };
-  /**
-   * §10.4.4: optional per-principal uniqueness gate. When set, an attested
-   * signup whose verified `(iss, sub_h)` already holds an account is
-   * rejected with `409 principal_already_registered` — enforcing "at most
-   * one account per human" ("same human, same bucket"). Consulted only when
-   * the attestation carries a `sub_h`; runtime-only attestations (no
-   * principal asserted) bypass it. Effective only alongside an `attestor`.
-   *
-   * `new Server({...})` does NOT default this — the low-level path makes no
-   * policy assumptions. `defineService` defaults a process-local
-   * `MemorySubHUniquenessStore` in `required` mode; supply a durable,
-   * atomic store (e.g. `D1SubHUniquenessStore`) in production.
-   */
-  subHUniqueness?: SubHUniquenessStore;
 }
 
 // Default invitation TTL: 24 hours (§7.3 says "service-defined";
@@ -1779,7 +1751,6 @@ export class Server {
   private readonly serviceDid: Did;
   private readonly ownerSessionMaxAgeSeconds: number;
   private readonly attestedGate?: AttestedSessionGate;
-  private readonly subHUniqueness?: SubHUniquenessStore;
 
   constructor(opts: ServerOptions) {
     // Verifier already defaults a missing revocationList to
@@ -1801,7 +1772,6 @@ export class Server {
     this.attestor = opts.attestor;
     this.serviceDid = opts.serviceDid;
     this.ownerSessionMaxAgeSeconds = opts.ownerSessionMaxAgeSeconds ?? 300;
-    this.subHUniqueness = opts.subHUniqueness;
 
     if (opts.attestedSession) {
       if (!this.attestor) {
@@ -1863,12 +1833,10 @@ export class Server {
    *     * if header present, validate; reject on invalid (`401 invalid_attestation`)
    *     * if header absent, silently allow
    *
-   * Returns the verified `AttestationClaims` (so the caller can apply the
-   * §10.4.4 per-principal uniqueness gate via `claimPrincipalSlot`), or
-   * `null` when no attestation was processed (absent header in a lax mode).
-   * Does NOT itself mutate any store — keeping the verify/claim split lets
-   * the caller order the slot claim AFTER rate-limiting, right before the
-   * account row is created.
+   * Returns the verified `AttestationClaims` (so the caller can pass the
+   * `(iss, sub_h)` principal to `AccountStore.signupAgent` for §10.4.4
+   * device grouping), or `null` when no attestation was processed (absent
+   * header in a lax mode). Does NOT itself mutate any store.
    */
   private async enforceAttestationOnSignup(
     req: Request,
@@ -1907,34 +1875,17 @@ export class Server {
   }
 
   /**
-   * §10.4.4 per-principal uniqueness gate. Given the verified attestation
-   * `claims` for an about-to-be-created account, reserve the `(iss, sub_h)`
-   * slot for `agentDid`. Throws `409 principal_already_registered` if the
-   * slot is already held by a different account ("same human, same bucket").
-   *
-   * No-op when no uniqueness store is configured, or when the attestation
-   * carries no `sub_h` (a runtime-only attestation asserts no principal, so
-   * there is nothing to dedupe on). Call this AFTER rate-limiting and
-   * IMMEDIATELY before `createUnclaimed`, so a rejected principal never
-   * leaves an account-row side-effect (mirrors the §9.2 "reject before any
-   * state transition" rule).
+   * §10.4.4 device grouping. Turn verified attestation `claims` into the
+   * `(iss, sub_h)` principal that `AccountStore.signupAgent` groups by — so
+   * a human's second agent attaches to their existing account instead of
+   * creating a new one. Returns `undefined` for runtime-only attestations
+   * (no `sub_h`) and lax-mode no-header signups, which get singleton accounts.
    */
-  private async claimPrincipalSlot(
+  private principalOf(
     claims: AttestationClaims | null,
-    agentDid: Did,
-  ): Promise<void> {
-    if (!this.subHUniqueness || !claims || typeof claims.sub_h !== "string") return;
-    const result = await this.subHUniqueness.claim(claims.iss, claims.sub_h, agentDid);
-    if (!result.ok) {
-      // Do NOT echo `result.existingDid` on the wire: it would reveal one
-      // of the principal's other agent DIDs at this service. The service
-      // MAY read it from the store for its own logging / account merge.
-      throw new AFAuthError(
-        "principal_already_registered",
-        409,
-        "an account already exists for this principal at this service (at most one account per human; §10.4.4)",
-      );
-    }
+  ): { iss: string; subH: string } | undefined {
+    if (!claims || typeof claims.sub_h !== "string") return undefined;
+    return { iss: claims.iss, subH: claims.sub_h };
   }
 
   /**
@@ -1967,16 +1918,6 @@ export class Server {
   // (e.g. account-introspection on GET).
   get verifierInstance(): Verifier {
     return this.verifier;
-  }
-
-  /**
-   * The §10.4.4 per-principal uniqueness store, if one is configured.
-   * Exposed so the operator can pass it to `sweepExpiredAccounts` (to
-   * release slots when accounts expire) — important for `defineService`
-   * deployments, where the default store is created internally.
-   */
-  get subHUniquenessStore(): SubHUniquenessStore | undefined {
-    return this.subHUniqueness;
   }
 
   // ----- Discovery (§4) -----
@@ -2105,18 +2046,21 @@ export class Server {
       );
     }
 
-    let account = await this.accounts.get(verified.agentDid);
+    let account = await this.accounts.getByAgentDid(verified.agentDid);
     if (!account) {
       if (!this.implicitSignup) {
         throw new AFAuthError("unknown_account", 404, "account does not exist (implicit signup disabled)");
       }
-      // §9.2 / §10.4.4: owner-invitation against an unknown account is an
-      // implicit signup too. Gate it on attestation and per-principal
-      // uniqueness exactly like introspection — otherwise `attested_only`
-      // (and the uniqueness slot) could be bypassed by inviting first.
+      // §9.2: owner-invitation against an unknown agent is an implicit signup
+      // too — gate it on attestation exactly like introspection, otherwise
+      // `attested_only` could be bypassed by inviting first. The agent's
+      // `(iss, sub_h)` groups it onto an existing account if its human
+      // already has one (§10.4.4).
       const claims = await this.enforceAttestationOnSignup(req, verified.agentDid);
-      await this.claimPrincipalSlot(claims, verified.agentDid);
-      account = await this.accounts.createUnclaimed(verified.agentDid);
+      ({ account } = await this.accounts.signupAgent({
+        did: verified.agentDid,
+        ...(this.principalOf(claims) ? { principal: this.principalOf(claims)! } : {}),
+      }));
     }
     if (account.revoked) {
       throw new AFAuthError("revoked_key", 401, "account key has been revoked");
@@ -2138,7 +2082,7 @@ export class Server {
 
     const token = generateInvitationToken();
     const expiresAt = new Date(Date.now() + this.invitationTtlSeconds * 1000).toISOString();
-    await this.accounts.setPendingInvitation(verified.agentDid, recipient, token, expiresAt);
+    await this.accounts.setPendingInvitation(account.accountId, recipient, token, expiresAt);
 
     // Compose the claim-page URL the recipient will be directed to.
     const claimPageUrl = new URL(disc.endpoints.claim_page, this.baseUrl).toString();
@@ -2232,7 +2176,7 @@ export class Server {
 
     return jsonResponse(
       {
-        account_did: updated.did,
+        account_id: updated.accountId,
         state: updated.state,
         owner: {
           identity: updated.owner!.identity,
@@ -2290,7 +2234,7 @@ export class Server {
       );
     }
 
-    const account = await this.accounts.get(verified.agentDid);
+    const account = await this.accounts.getByAgentDid(verified.agentDid);
     if (!account) {
       throw new AFAuthError("unknown_account", 404, "account not found");
     }
@@ -2304,6 +2248,10 @@ export class Server {
         410,
         "account exceeded unclaimed_ttl_seconds and is no longer operable",
       );
+    }
+    // Guard against a new DID that already names a credential anywhere.
+    if (await this.accounts.getByAgentDid(newDid)) {
+      throw new AFAuthError("already_claimed", 409, "new_account_did already names an existing credential");
     }
     // Pre-claim rotation only. Post-claim key changes are owner-binding
     // operations and cannot be driven by the agent signature alone — the
@@ -2322,17 +2270,17 @@ export class Server {
     }
 
     const rotatedAt = new Date().toISOString();
-    await this.accounts.rotateKey(verified.agentDid, newDid, rotatedAt);
+    // §8.1: swap the calling credential's DID within the account. The
+    // `account_id` is STABLE across rotation (the account is not the DID).
+    await this.accounts.rotateAgent(verified.agentDid, newDid, rotatedAt);
     // §8.3: register the old DID on the local revocation list so
     // subsequent requests signed by the old key are rejected.
     await this.revocationList.add(verified.agentDid, rotatedAt);
-    // §10.4.4: the per-principal slot is keyed on the principal, not the
-    // verification key — follow the rotation so the live DID holds it.
-    if (this.subHUniqueness) await this.subHUniqueness.rekey(verified.agentDid, newDid);
 
     return jsonResponse(
       {
-        account_did: newDid,
+        account_id: account.accountId,
+        agent_did: newDid,
         old_revoked_at: rotatedAt,
       },
       200,
@@ -2391,7 +2339,9 @@ export class Server {
       throw new AFAuthError("malformed_request", 400, `new_account_did is not a valid did:key: ${reason}`);
     }
 
-    const account = await this.accounts.get(currentDid);
+    // `current_account_did` names the credential (device) being re-keyed; it
+    // resolves to the account, which `account_id` stably identifies.
+    const account = await this.accounts.getByAgentDid(currentDid);
     if (!account) {
       throw new AFAuthError("unknown_account", 404, "account not found");
     }
@@ -2408,23 +2358,23 @@ export class Server {
     if (!account.owner || session.userId !== account.owner.userId) {
       throw new AFAuthError("owner_authentication_required", 403, "owner session does not own this account");
     }
-    // Collision guard: refuse a new DID that already names an account
+    // Collision guard: refuse a new DID that already names a credential
     // (Memory would silently clobber it; D1 would throw a raw PK error).
-    if (await this.accounts.get(newDid)) {
-      throw new AFAuthError("already_claimed", 409, "new_account_did already names an existing account");
+    if (await this.accounts.getByAgentDid(newDid)) {
+      throw new AFAuthError("already_claimed", 409, "new_account_did already names an existing credential");
     }
 
     const reKeyedAt = new Date().toISOString();
+    // §8.2: swap the credential DID and clear the account `revoked` flag
+    // atomically; `account_id` is stable.
     await this.accounts.reKey(currentDid, newDid, reKeyedAt);
-    // Lock out the old key for defense-in-depth (its account row is
-    // already gone, but listing it makes the old key fail fast at the
-    // Verifier).
+    // Lock out the old key for defense-in-depth.
     await this.revocationList.add(currentDid, reKeyedAt);
-    // §10.4.4: carry the per-principal slot to the new DID — the docstring
-    // above promises `sub_h` carries forward across the re-key.
-    if (this.subHUniqueness) await this.subHUniqueness.rekey(currentDid, newDid);
 
-    return jsonResponse({ account_did: newDid, old_revoked_at: reKeyedAt, state: "CLAIMED" }, 200);
+    return jsonResponse(
+      { account_id: account.accountId, agent_did: newDid, old_revoked_at: reKeyedAt, state: "CLAIMED" },
+      200,
+    );
   }
 
   // ----- Owner-initiated revocation (§8.4) -----
@@ -2443,14 +2393,15 @@ export class Server {
    * access to this method to owner-authenticated callers (for §8.4)
    * or to abuse-handling staff (for service-driven revocation).
    */
-  async revoke(did: Did): Promise<void> {
-    const account = await this.accounts.get(did);
+  async revoke(accountId: string): Promise<void> {
+    const account = await this.accounts.getById(accountId);
     if (!account) {
-      throw new AFAuthError("unknown_account", 404, `account ${did} not found`);
+      throw new AFAuthError("unknown_account", 404, `account ${accountId} not found`);
     }
     const revokedAt = new Date().toISOString();
-    await this.accounts.revoke(did, revokedAt);
-    await this.revocationList.add(did, revokedAt);
+    await this.accounts.revoke(accountId, revokedAt);
+    // Block every credential (device) of the account at the Verifier (§8.3).
+    for (const agent of account.agents) await this.revocationList.add(agent.did, revokedAt);
   }
 
   /**
@@ -2469,18 +2420,18 @@ export class Server {
     await this.enforceRateLimit("owner_key_operation", session.userId);
 
     const bodyBytes = new Uint8Array(await req.arrayBuffer());
-    let parsed: { account_did?: string };
+    let parsed: { account_id?: string };
     try {
       parsed = JSON.parse(new TextDecoder().decode(bodyBytes)) as typeof parsed;
     } catch {
       throw new AFAuthError("malformed_request", 400, "request body is not valid JSON");
     }
-    const accountDid = parsed.account_did;
-    if (typeof accountDid !== "string" || accountDid.length === 0) {
-      throw new AFAuthError("malformed_request", 400, "missing `account_did`");
+    const accountId = parsed.account_id;
+    if (typeof accountId !== "string" || accountId.length === 0) {
+      throw new AFAuthError("malformed_request", 400, "missing `account_id`");
     }
 
-    const account = await this.accounts.get(accountDid);
+    const account = await this.accounts.getById(accountId);
     if (!account) {
       throw new AFAuthError("unknown_account", 404, "account not found");
     }
@@ -2498,10 +2449,11 @@ export class Server {
     }
 
     const revokedAt = new Date().toISOString();
-    await this.accounts.revoke(accountDid, revokedAt);
-    await this.revocationList.add(accountDid, revokedAt);
+    await this.accounts.revoke(accountId, revokedAt);
+    // Block every credential (device) of the account at the Verifier (§8.3).
+    for (const agent of account.agents) await this.revocationList.add(agent.did, revokedAt);
 
-    return jsonResponse({ account_did: accountDid, revoked_at: revokedAt }, 200);
+    return jsonResponse({ account_id: accountId, revoked_at: revokedAt }, 200);
   }
 
   // ----- Account introspection (§6.5) -----
@@ -2518,7 +2470,7 @@ export class Server {
     });
     await this.enforceRateLimit("account_introspection", verified.agentDid);
 
-    let account = await this.accounts.get(verified.agentDid);
+    let account = await this.accounts.getByAgentDid(verified.agentDid);
     if (!account) {
       if (!this.implicitSignup) {
         throw new AFAuthError("unknown_account", 404, "account does not exist (implicit signup disabled)");
@@ -2530,17 +2482,21 @@ export class Server {
       // Implicit signup also goes through the `accounts` rate-limit
       // bucket since it creates an account row.
       await this.enforceRateLimit("accounts", verified.agentDid);
-      // §10.4.4 per-principal uniqueness — reserve the (iss, sub_h) slot
-      // before the row is created so a duplicate principal leaves no
-      // side-effect ("same human, same bucket").
-      await this.claimPrincipalSlot(claims, verified.agentDid);
-      account = await this.accounts.createUnclaimed(verified.agentDid);
+      // §10.4.4: group by the verified `(iss, sub_h)` principal — a known
+      // human's second agent attaches to their existing account ("same
+      // human, same account, many devices"); a no-`sub_h` agent gets a
+      // singleton account.
+      ({ account } = await this.accounts.signupAgent({
+        did: verified.agentDid,
+        ...(this.principalOf(claims) ? { principal: this.principalOf(claims)! } : {}),
+      }));
     }
 
     // §7.2 / §13.2: agent-signed responses MUST NOT expose pending fields.
     const disc = await this.resolveDiscovery();
     const body: Record<string, unknown> = {
-      account_did: account.did,
+      account_id: account.accountId,
+      agent_did: verified.agentDid,
       state: account.state,
       created_at: account.createdAt,
     };
@@ -2615,17 +2571,6 @@ export interface DefineServiceOptions {
    */
   attestor?: Attestor;
   /**
-   * §10.4.4 per-principal uniqueness ("at most one account per human",
-   * "same human, same bucket"). In `required` mode this defaults to a
-   * process-local `MemorySubHUniquenessStore` so the one-call recipe
-   * actually delivers the guarantee. Supply your own durable, atomic store
-   * (e.g. `D1SubHUniquenessStore`) for production. Set `false` to allow many
-   * agents per human (fleet operators) while still requiring attestation.
-   * Not defaulted in `optional` / `off` mode — pass a store explicitly to
-   * dedupe attested signups under `optional`.
-   */
-  subHUniqueness?: SubHUniquenessStore | false;
-  /**
    * Partial discovery overrides merged on top of the synthesized
    * document. Use this to customize endpoint paths, advertise extra
    * `accepted_attestors`, declare `limits`, etc.
@@ -2657,34 +2602,16 @@ export interface DefineServiceOptions {
  * Equivalent to wiring `unclaimed_mode: 'attested_only'`,
  * `accepted_attestors: ['afauth-trust']`, and `attestor: trustAttestor()`
  * by hand. Override `attestation: 'off'` to opt out.
+ *
+ * §10.4.4 device grouping ("one account, many devices") needs no option: it
+ * is intrinsic to every `AccountStore` — a second agent presenting the same
+ * verified `(iss, sub_h)` attaches to its human's existing account.
  */
-let warnedAboutDefaultUniqueness = false;
-
 export function defineService(opts: DefineServiceOptions): Server {
   const mode: AttestationMode = opts.attestation ?? "required";
 
   const attestor: Attestor | undefined =
     opts.attestor ?? (mode === "off" ? undefined : trustAttestor());
-
-  // §10.4.4: "same human, same bucket" is ON by default in `required` mode
-  // so the recommended path is actually Sybil-resistant. `optional` is the
-  // migration path (existing fleets may legitimately run many agents per
-  // human) and `off` has no attestor to key on, so neither defaults it.
-  let subHUniqueness: SubHUniquenessStore | undefined;
-  if (opts.subHUniqueness === false) {
-    subHUniqueness = undefined; // explicit opt-out (fleet operators)
-  } else if (opts.subHUniqueness) {
-    subHUniqueness = opts.subHUniqueness; // caller-supplied (durable) store
-  } else if (mode === "required") {
-    subHUniqueness = new MemorySubHUniquenessStore();
-    if (!warnedAboutDefaultUniqueness) {
-      warnedAboutDefaultUniqueness = true;
-      // eslint-disable-next-line no-console
-      console.warn(
-        "[afauth] defineService defaulted to MemorySubHUniquenessStore for per-principal uniqueness (§10.4.4; process-local, lost on restart, NOT atomic across instances). Supply DefineServiceOptions.subHUniqueness with a durable, atomic store (e.g. D1SubHUniquenessStore) for production, or pass `false` to allow many agents per human.",
-      );
-    }
-  }
 
   const discovery = synthesizeDiscovery({
     baseUrl: opts.baseUrl,
@@ -2710,7 +2637,6 @@ export function defineService(opts: DefineServiceOptions): Server {
     maxSignatureLifetimeSeconds: opts.maxSignatureLifetimeSeconds,
     now: opts.now,
     ...(attestor ? { attestor } : {}),
-    ...(subHUniqueness ? { subHUniqueness } : {}),
   });
 }
 
