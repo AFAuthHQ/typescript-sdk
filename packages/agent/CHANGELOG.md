@@ -1,5 +1,15 @@
 # @afauthhq/agent
 
+## 0.4.0
+
+### Minor Changes
+
+- Keyless trust mint — the agent authenticates `/v1/token` by signing the request with its account key (§3.1), not a bearer `binding_token`.
+
+  `TrustClient.token()` now signs the mint request per RFC 9421 (§5) with the agent key and sends no `Authorization: Bearer` header — the keypair is the sole credential, so there is no standing bearer secret to store or leak.
+
+  **Breaking (pre-1.0 minor):** `TrustBinding` no longer has a `binding_token` field; `linkPoll()` resolves to `{ binding_id, binding_token_expires_at }` (the binding's lifetime). Callers that persisted a `binding_token` should drop it — nothing else changes, because `token()` already held the agent key. Requires an attestor that accepts §5-signed mints; the default `afauth-trust` attestor does so as of this release.
+
 ## 0.3.0
 
 ### Minor Changes

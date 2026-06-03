@@ -1,6 +1,6 @@
 {
   "name": "@afauthhq/agent",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "AFAuth agent SDK — keypair, did:key, signed requests, protocol-aware builders",
   "license": "MIT",
   "type": "module",
