@@ -848,6 +848,16 @@ interface BaseAttestorOpts {
   iss: string;
   /** Function returning current unix-second time. Overridable for tests. */
   now?: () => number;
+  /**
+   * Optional hard ceiling on attestation lifetime (`exp - iat`), in
+   * seconds. When set, the verifier requires `iat` to be present and
+   * rejects any token whose `exp - iat` exceeds this value. The
+   * afauth-trust attestor pins this to 900s per §10.3.1 so a long-lived
+   * token from a compromised/misconfigured attestor key cannot outlive
+   * the §10.7 revocation window. Generic attestors leave it unset
+   * (§10.2 imposes no generic ceiling).
+   */
+  maxLifetimeSeconds?: number;
 }
 
 /**
@@ -860,11 +870,13 @@ export class HmacAttestor implements Attestor {
   private readonly key: Uint8Array;
   readonly iss: string;
   private readonly now: () => number;
+  private readonly maxLifetimeSeconds?: number;
 
   constructor(opts: BaseAttestorOpts & { secret: Uint8Array | string }) {
     this.iss = opts.iss;
     this.key = typeof opts.secret === "string" ? new TextEncoder().encode(opts.secret) : opts.secret;
     this.now = opts.now ?? (() => Math.floor(Date.now() / 1000));
+    this.maxLifetimeSeconds = opts.maxLifetimeSeconds;
   }
 
   async verify(jwt: string, agentDid: Did, opts: VerifyOptions = {}): Promise<AttestationClaims> {
@@ -883,7 +895,7 @@ export class HmacAttestor implements Attestor {
         `HmacAttestor: ${(err as Error).message}`,
       );
     }
-    return validateClaims(result.payload, this.iss, agentDid, opts.audience);
+    return validateClaims(result.payload, this.iss, agentDid, opts.audience, this.maxLifetimeSeconds);
   }
 }
 
@@ -900,6 +912,7 @@ export class JwksAttestor implements Attestor {
   readonly iss: string;
   private readonly now: () => number;
   private readonly algorithms: readonly string[];
+  private readonly maxLifetimeSeconds?: number;
 
   constructor(opts: BaseAttestorOpts & {
     /** URL of the attestor's JWKS document. MUST be https. */
@@ -914,6 +927,7 @@ export class JwksAttestor implements Attestor {
     this.jwks = createRemoteJWKSet(new URL(opts.jwksUrl));
     this.algorithms = opts.algorithms ?? ["ES256", "RS256", "EdDSA"];
     this.now = opts.now ?? (() => Math.floor(Date.now() / 1000));
+    this.maxLifetimeSeconds = opts.maxLifetimeSeconds;
   }
 
   async verify(jwt: string, agentDid: Did, opts: VerifyOptions = {}): Promise<AttestationClaims> {
@@ -932,7 +946,7 @@ export class JwksAttestor implements Attestor {
         `JwksAttestor: ${(err as Error).message}`,
       );
     }
-    return validateClaims(result.payload, this.iss, agentDid, opts.audience);
+    return validateClaims(result.payload, this.iss, agentDid, opts.audience, this.maxLifetimeSeconds);
   }
 }
 
@@ -963,11 +977,14 @@ export function trustAttestor(opts: {
   /** Override for staging / local dev. Defaults to the AFAP-pinned URL. */
   jwksUrl?: string;
   now?: () => number;
+  /** Override the §10.3.1 lifetime cap (default 900s). */
+  maxLifetimeSeconds?: number;
 } = {}): JwksAttestor {
   return new JwksAttestor({
     iss: AFAUTH_TRUST_ISS,
     jwksUrl: opts.jwksUrl ?? AFAUTH_TRUST_JWKS_URL,
     algorithms: ["EdDSA"],
+    maxLifetimeSeconds: opts.maxLifetimeSeconds ?? 900,
     now: opts.now,
   });
 }
@@ -1031,6 +1048,7 @@ function validateClaims(
   iss: string,
   agentDid: Did,
   audience?: string,
+  maxLifetimeSeconds?: number,
 ): AttestationClaims {
   if (!payload || typeof payload !== "object") {
     throw new AFAuthError("invalid_attestation", 401, "JWT payload is not an object");
@@ -1051,6 +1069,30 @@ function validateClaims(
   }
   if (typeof p.exp !== "number") {
     throw new AFAuthError("invalid_attestation", 401, "JWT missing exp claim");
+  }
+  // §10.3.1 — when the attestor bounds its token lifetime (afauth-trust:
+  // exp - iat ≤ 900s), `iat` MUST be present and `exp - iat` MUST NOT
+  // exceed the cap. This stops a long-lived token from a compromised or
+  // misconfigured attestor key from outliving the §10.7 attested-session
+  // revocation window. Generic attestors leave the cap unset (§10.2).
+  if (maxLifetimeSeconds !== undefined) {
+    if (typeof p.iat !== "number") {
+      throw new AFAuthError(
+        "invalid_attestation",
+        401,
+        "JWT missing iat claim (required when attestation lifetime is bounded, §10.3.1)",
+      );
+    }
+    if (p.exp < p.iat) {
+      throw new AFAuthError("invalid_attestation", 401, "attestation exp precedes iat");
+    }
+    if (p.exp - p.iat > maxLifetimeSeconds) {
+      throw new AFAuthError(
+        "invalid_attestation",
+        401,
+        `attestation lifetime ${p.exp - p.iat}s exceeds maximum ${maxLifetimeSeconds}s (§10.3.1)`,
+      );
+    }
   }
   // Belt-and-suspenders: jose's jwtVerify already enforces audience
   // when supplied. We re-check here so the post-verify return value
@@ -1492,9 +1534,41 @@ export class Verifier {
       throw new AFAuthError("expired_signature", 401, "signature has expired");
     }
 
-    // Content digest (when body is present).
+    // §5.2 / §5.5 step 7: the request body MUST be cryptographically
+    // bound to the signature. The verifier MUST NOT trust the signer to
+    // self-select whether `content-digest` is covered (same rationale as
+    // the @method/@target-uri presence check at parse time). Concretely:
+    //   - a request WITH a body MUST cover `content-digest`; otherwise
+    //     the body is unauthenticated and an on-path attacker can inject
+    //     or rewrite it under an otherwise-valid signature (the covered
+    //     LIST is bound via @signature-params, so the attacker can't add
+    //     coverage — only exploit its absence);
+    //   - a request WITHOUT a body MUST NOT carry a Content-Digest header
+    //     nor cover `content-digest` ("Content-Digest ... MUST be omitted
+    //     otherwise").
+    const hasBody =
+      req.body != null &&
+      (typeof req.body === "string" ? req.body.length > 0 : req.body.byteLength > 0);
+    const digestCovered = covered.includes("content-digest");
+    const digestHeaderPresent = req.headers.get("content-digest") != null;
+    if (hasBody && !digestCovered) {
+      throw new AFAuthError(
+        "invalid_signature",
+        401,
+        "request has a body but content-digest is not a covered component (§5.2)",
+      );
+    }
+    if (!hasBody && (digestCovered || digestHeaderPresent)) {
+      throw new AFAuthError(
+        "invalid_signature",
+        401,
+        "Content-Digest must be absent when the request has no body (§5.5 step 7)",
+      );
+    }
+
+    // Content digest (verified when covered; presence is enforced above).
     let contentDigest: string | undefined;
-    if (covered.includes("content-digest")) {
+    if (digestCovered) {
       contentDigest = req.headers.get("content-digest") ?? undefined;
       if (!contentDigest) {
         throw new AFAuthError(
