@@ -139,11 +139,11 @@ describe("createWorker — routing", () => {
     const signed = await agent.buildAccountIntrospection({ baseUrl: BASE_URL });
     const res = await fetch(await toRequest(signed));
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { account_did: string; state: string };
-    expect(body.account_did).toBe(agent.did);
+    const body = (await res.json()) as { account_id: string; agent_did: string; state: string };
+    expect(body.agent_did).toBe(agent.did);
     expect(body.state).toBe("UNCLAIMED");
     // implicit signup created the row
-    expect(await accounts.get(agent.did)).not.toBeNull();
+    expect(await accounts.getByAgentDid(agent.did)).not.toBeNull();
   });
 
   it("routes a signed owner-invitation POST through the recipient handler", async () => {
@@ -160,7 +160,7 @@ describe("createWorker — routing", () => {
     const body = (await res.json()) as { invitation_id: string; state: string };
     expect(body.invitation_id).toBeTruthy();
     expect(body.state).toBe("INVITED");
-    const account = await accounts.get(agent.did);
+    const account = await accounts.getByAgentDid(agent.did);
     expect(account?.state).toBe("INVITED");
   });
 
@@ -174,8 +174,8 @@ describe("createWorker — routing", () => {
     const res = await fetch(await toRequest(signed));
     expect(res.status).toBe(200);
 
-    expect(await accounts.get(oldAgent.did)).toBeNull();
-    const moved = await accounts.get(newAgent.did);
+    expect(await accounts.getByAgentDid(oldAgent.did)).toBeNull();
+    const moved = await accounts.getByAgentDid(newAgent.did);
     expect(moved?.state).toBe("UNCLAIMED");
   });
 
@@ -259,7 +259,7 @@ describe("createWorker — claim completion requires owner session", () => {
         new Request(`${BASE_URL}/afauth/v1/claim/${token}`, { method: "POST" }),
       );
       expect(res.status).toBe(200);
-      const account = await harness.accounts.get(agent.did);
+      const account = await harness.accounts.getByAgentDid(agent.did);
       expect(account?.state).toBe("CLAIMED");
     } finally {
       consoleErrorSpy.mockRestore();
@@ -381,8 +381,8 @@ describe("createWorker — owner-gated key endpoints (§8.2 re-key, §8.4 revoke
       }),
     );
     expect(res.status).toBe(200);
-    expect(await harness.accounts.get(agent.did)).toBeNull();
-    expect((await harness.accounts.get(newAgent.did))?.state).toBe("CLAIMED");
+    expect(await harness.accounts.getByAgentDid(agent.did)).toBeNull();
+    expect((await harness.accounts.getByAgentDid(newAgent.did))?.state).toBe("CLAIMED");
   });
 
   it("routes a revoke POST to the handler", async () => {
@@ -392,11 +392,11 @@ describe("createWorker — owner-gated key endpoints (§8.2 re-key, §8.4 revoke
       new Request(`${BASE_URL}/afauth/v1/accounts/me/keys/revoke`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ account_did: agent.did }),
+        body: JSON.stringify({ agent_did: agent.did }),
       }),
     );
     expect(res.status).toBe(200);
-    expect((await harness.accounts.get(agent.did))?.revoked).toBe(true);
+    expect((await harness.accounts.getByAgentDid(agent.did))?.revoked).toBe(true);
   });
 
   it("re-key / revoke with no owner session → 401 owner_authentication_required", async () => {

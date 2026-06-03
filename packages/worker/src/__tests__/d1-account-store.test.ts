@@ -1,16 +1,17 @@
 /**
- * D1AccountStore tests against an in-process D1 backend provided by
- * miniflare. The test miniflare instance is initialised once per test
- * with the v0.1 schema (migrations/0001_init.sql) applied.
+ * D1AccountStore tests against an in-process D1 backend (miniflare),
+ * initialised per test with the multi-agent schema (migrations/0001_init.sql).
  *
  * Coverage:
- *   - createUnclaimed: idempotent
- *   - setPendingInvitation: §7.3 atomic supersession (UNIQUE constraint)
+ *   - signupAgent: (iss, sub_h) grouping (one account, many devices), atomic;
+ *     no-principal singletons; idempotent on did
+ *   - setPendingInvitation: §7.3 atomic supersession
  *   - completeClaimByToken: state transition + invitation cleanup
- *   - rotateKey: did swap, pending invitation FK update
- *   - revoke: revoked flag persists
+ *   - rotateAgent: credential swap, account_id stable
+ *   - revoke (whole account) / revokeAgent (single device)
  *   - findByPendingToken: expiry drops stale entries
- *   - get: pendingRecipient surfaces when an invitation is open
+ *   - SweepableAccountStore: listOpenAccounts / expire
+ *   - reKey (§8.2 resume)
  */
 
 import fs from "node:fs";
@@ -40,11 +41,6 @@ beforeEach(async () => {
     d1Databases: { DB: ":memory:" },
   });
   const db = await mf.getD1Database("DB");
-  // miniflare's `exec` accepts a single statement; split the migration
-  // file on `;` boundaries (none of our statements contain a `;` inside
-  // a string literal, so a trivial split is safe). Strip `-- comments`
-  // line-by-line BEFORE collapsing newlines — otherwise a `--` comment
-  // runs into the rest of the statement after newlines are removed.
   const stripped = SCHEMA.split("\n")
     .map((line) => line.replace(/--.*$/, ""))
     .join("\n");
@@ -53,7 +49,6 @@ beforeEach(async () => {
     if (!s) continue;
     await db.exec(s.replace(/\n/g, " "));
   }
-  // D1AccountStore's `D1Database` type matches miniflare's binding.
   store = new D1AccountStore(db as unknown as D1Database);
 });
 
@@ -63,55 +58,71 @@ afterEach(async () => {
 
 const aliceEmail: Recipient = { type: "email", value: "alice@example.com" };
 const bobEmail: Recipient = { type: "email", value: "bob@example.com" };
+const SUB_H = "8f3cZ_K9qWmA-LpQ7tVnRsxBcD2yE0HfJgIuYpXoNkM";
 
-describe("D1AccountStore", () => {
-  it("createUnclaimed is idempotent and starts in UNCLAIMED", async () => {
-    const first = await store.createUnclaimed("did:key:zAgent");
-    expect(first.state).toBe("UNCLAIMED");
-    const second = await store.createUnclaimed("did:key:zAgent");
-    expect(second.did).toBe(first.did);
-    expect(second.state).toBe("UNCLAIMED");
+/** Seed a singleton account for `did`; returns its account_id. */
+async function seed(did: string): Promise<string> {
+  return (await store.signupAgent({ did })).account.accountId;
+}
+
+describe("D1AccountStore — multi-agent model", () => {
+  it("signupAgent: a second device sharing (iss, sub_h) joins the same account", async () => {
+    const P = { iss: "afauth-trust", subH: SUB_H };
+    const first = await store.signupAgent({ did: "did:key:zPc", principal: P });
+    expect(first.attached).toBe(false);
+    const second = await store.signupAgent({ did: "did:key:zPhone", principal: P });
+    expect(second.attached).toBe(true);
+    expect(second.account.accountId).toBe(first.account.accountId);
+    expect(second.account.agents.map((a) => a.did).sort()).toEqual(
+      ["did:key:zPc", "did:key:zPhone"].sort(),
+    );
+    expect((await store.getByAgentDid("did:key:zPc"))!.accountId).toBe(first.account.accountId);
+    expect((await store.getByAgentDid("did:key:zPhone"))!.accountId).toBe(first.account.accountId);
+    expect((await store.findByPrincipal(P.iss, P.subH))!.accountId).toBe(first.account.accountId);
   });
 
-  it("get returns null for an unknown did", async () => {
-    expect(await store.get("did:key:zNope")).toBeNull();
+  it("signupAgent: no-principal agents get distinct singletons; idempotent on did", async () => {
+    const a = await store.signupAgent({ did: "did:key:zA" });
+    const b = await store.signupAgent({ did: "did:key:zB" });
+    expect(a.account.accountId).not.toBe(b.account.accountId);
+    const again = await store.signupAgent({ did: "did:key:zA" });
+    expect(again.attached).toBe(false);
+    expect(again.account.accountId).toBe(a.account.accountId);
+  });
+
+  it("getByAgentDid returns null for an unknown did", async () => {
+    expect(await store.getByAgentDid("did:key:zNope")).toBeNull();
   });
 
   it("setPendingInvitation transitions to INVITED and stores recipient", async () => {
-    await store.createUnclaimed("did:key:zAgent");
+    const id = await seed("did:key:zAgent");
     const expiresAt = new Date(Date.now() + 3600_000).toISOString();
-    await store.setPendingInvitation("did:key:zAgent", aliceEmail, "token-1", expiresAt);
-    const a = await store.get("did:key:zAgent");
+    await store.setPendingInvitation(id, aliceEmail, "token-1", expiresAt);
+    const a = await store.getByAgentDid("did:key:zAgent");
     expect(a?.state).toBe("INVITED");
     expect(a?.pendingRecipient).toEqual(aliceEmail);
   });
 
   it("setPendingInvitation atomically supersedes a prior invitation (§7.3)", async () => {
-    await store.createUnclaimed("did:key:zAgent");
+    const id = await seed("did:key:zAgent");
     const expiresAt = new Date(Date.now() + 3600_000).toISOString();
-    await store.setPendingInvitation("did:key:zAgent", aliceEmail, "token-1", expiresAt);
-    await store.setPendingInvitation("did:key:zAgent", bobEmail, "token-2", expiresAt);
-
-    expect(await store.findByPendingToken("token-1")).toBeNull(); // superseded
-    const viaNew = await store.findByPendingToken("token-2");
-    expect(viaNew?.pendingRecipient).toEqual(bobEmail);
+    await store.setPendingInvitation(id, aliceEmail, "token-1", expiresAt);
+    await store.setPendingInvitation(id, bobEmail, "token-2", expiresAt);
+    expect(await store.findByPendingToken("token-1")).toBeNull();
+    expect((await store.findByPendingToken("token-2"))?.pendingRecipient).toEqual(bobEmail);
   });
 
   it("findByPendingToken drops expired entries", async () => {
-    await store.createUnclaimed("did:key:zAgent");
+    const id = await seed("did:key:zAgent");
     const past = new Date(Date.now() - 1000).toISOString();
-    // Insert directly through the public path; setPendingInvitation
-    // accepts past expiresAt without complaint (the SDK is responsible
-    // for validating freshness elsewhere).
-    await store.setPendingInvitation("did:key:zAgent", aliceEmail, "token-old", past);
+    await store.setPendingInvitation(id, aliceEmail, "token-old", past);
     expect(await store.findByPendingToken("token-old")).toBeNull();
   });
 
   it("completeClaimByToken transitions to CLAIMED and removes the invitation", async () => {
-    await store.createUnclaimed("did:key:zAgent");
+    const id = await seed("did:key:zAgent");
     const expiresAt = new Date(Date.now() + 3600_000).toISOString();
-    await store.setPendingInvitation("did:key:zAgent", aliceEmail, "token-1", expiresAt);
-
+    await store.setPendingInvitation(id, aliceEmail, "token-1", expiresAt);
     const owner: NonNullable<Account["owner"]> = {
       identity: aliceEmail,
       userId: "usr_alice",
@@ -120,183 +131,154 @@ describe("D1AccountStore", () => {
     const claimed = await store.completeClaimByToken("token-1", owner);
     expect(claimed?.state).toBe("CLAIMED");
     expect(claimed?.owner).toEqual(owner);
-    // The invitation row is gone.
     expect(await store.findByPendingToken("token-1")).toBeNull();
-    // The account row's pendingRecipient is not surfaced post-claim.
-    const fetched = await store.get("did:key:zAgent");
-    expect(fetched?.pendingRecipient).toBeUndefined();
+    expect((await store.getByAgentDid("did:key:zAgent"))?.pendingRecipient).toBeUndefined();
   });
 
-  it("rotateKey swaps the account DID and re-points any pending invitation", async () => {
-    await store.createUnclaimed("did:key:zOld");
+  it("rotateAgent swaps the credential DID; account_id stable, pending invitation preserved", async () => {
+    const id = await seed("did:key:zOld");
     const expiresAt = new Date(Date.now() + 3600_000).toISOString();
-    await store.setPendingInvitation("did:key:zOld", aliceEmail, "token-r", expiresAt);
-
-    await store.rotateKey("did:key:zOld", "did:key:zNew", new Date().toISOString());
-
-    expect(await store.get("did:key:zOld")).toBeNull();
-    const fresh = await store.get("did:key:zNew");
-    expect(fresh).not.toBeNull();
+    await store.setPendingInvitation(id, aliceEmail, "token-r", expiresAt);
+    const rotated = await store.rotateAgent("did:key:zOld", "did:key:zNew", new Date().toISOString());
+    expect(rotated.accountId).toBe(id); // stable across rotation
+    expect(await store.getByAgentDid("did:key:zOld")).toBeNull();
+    const fresh = await store.getByAgentDid("did:key:zNew");
     expect(fresh?.state).toBe("INVITED");
     expect(fresh?.pendingRecipient).toEqual(aliceEmail);
-
-    // The token still resolves; just points at the new DID now.
-    const viaToken = await store.findByPendingToken("token-r");
-    expect(viaToken?.did).toBe("did:key:zNew");
+    expect((await store.findByPendingToken("token-r"))?.accountId).toBe(id);
   });
 
-  it("revoke sets the revoked flag", async () => {
-    await store.createUnclaimed("did:key:zAgent");
-    await store.revoke("did:key:zAgent", new Date().toISOString());
-    const a = await store.get("did:key:zAgent");
-    expect(a?.revoked).toBe(true);
+  it("revoke sets the whole-account revoked flag", async () => {
+    const id = await seed("did:key:zAgent");
+    await store.revoke(id, new Date().toISOString());
+    expect((await store.getByAgentDid("did:key:zAgent"))?.revoked).toBe(true);
+  });
+
+  it("revokeAgent flags a single device; the account survives", async () => {
+    const P = { iss: "x", subH: SUB_H };
+    await store.signupAgent({ did: "did:key:zPc", principal: P });
+    await store.signupAgent({ did: "did:key:zPhone", principal: P });
+    const out = await store.revokeAgent("did:key:zPc", new Date().toISOString());
+    expect(out.revoked).toBeFalsy(); // account not revoked
+    expect(out.agents.find((a) => a.did === "did:key:zPc")?.revoked).toBe(true);
+    expect(out.agents.find((a) => a.did === "did:key:zPhone")?.revoked).toBeFalsy();
   });
 
   it("setPendingInvitation on a revoked account throws revoked_key", async () => {
-    await store.createUnclaimed("did:key:zAgent");
-    await store.revoke("did:key:zAgent", new Date().toISOString());
+    const id = await seed("did:key:zAgent");
+    await store.revoke(id, new Date().toISOString());
     const expiresAt = new Date(Date.now() + 3600_000).toISOString();
-    await expect(
-      store.setPendingInvitation("did:key:zAgent", aliceEmail, "t", expiresAt),
-    ).rejects.toThrow(/revoked/);
+    await expect(store.setPendingInvitation(id, aliceEmail, "t", expiresAt)).rejects.toThrow(/revoked/);
   });
 
   it("setPendingInvitation on a CLAIMED account throws already_claimed", async () => {
-    await store.createUnclaimed("did:key:zAgent");
+    const id = await seed("did:key:zAgent");
     const expiresAt = new Date(Date.now() + 3600_000).toISOString();
-    await store.setPendingInvitation("did:key:zAgent", aliceEmail, "t1", expiresAt);
+    await store.setPendingInvitation(id, aliceEmail, "t1", expiresAt);
     await store.completeClaimByToken("t1", {
       identity: aliceEmail,
       userId: "u",
       claimedAt: new Date().toISOString(),
     });
-    await expect(
-      store.setPendingInvitation("did:key:zAgent", aliceEmail, "t2", expiresAt),
-    ).rejects.toThrow(/already claimed/);
+    await expect(store.setPendingInvitation(id, aliceEmail, "t2", expiresAt)).rejects.toThrow(/already claimed/);
   });
 
   it("setPendingInvitation on an unknown account throws unknown_account", async () => {
     const expiresAt = new Date(Date.now() + 3600_000).toISOString();
-    await expect(
-      store.setPendingInvitation("did:key:zGhost", aliceEmail, "t", expiresAt),
-    ).rejects.toThrow(/does not exist/);
-  });
-
-  it("get surfaces pendingRecipient when an invitation is open", async () => {
-    await store.createUnclaimed("did:key:zAgent");
-    const expiresAt = new Date(Date.now() + 3600_000).toISOString();
-    await store.setPendingInvitation("did:key:zAgent", aliceEmail, "tt", expiresAt);
-    const fetched = await store.get("did:key:zAgent");
-    expect(fetched?.state).toBe("INVITED");
-    expect(fetched?.pendingRecipient).toEqual(aliceEmail);
+    await expect(store.setPendingInvitation("acct_ghost", aliceEmail, "t", expiresAt)).rejects.toThrow(/does not exist/);
   });
 
   describe("SweepableAccountStore", () => {
     it("listOpenAccounts returns UNCLAIMED + INVITED, omits CLAIMED", async () => {
-      await store.createUnclaimed("did:key:zUnclaimed");
-
-      await store.createUnclaimed("did:key:zInvited");
+      const u = await seed("did:key:zUnclaimed");
+      const i = await seed("did:key:zInvited");
       const expiresAt = new Date(Date.now() + 3600_000).toISOString();
-      await store.setPendingInvitation("did:key:zInvited", aliceEmail, "tok", expiresAt);
-
-      await store.createUnclaimed("did:key:zClaimed");
-      await store.setPendingInvitation("did:key:zClaimed", bobEmail, "tok2", expiresAt);
+      await store.setPendingInvitation(i, aliceEmail, "tok", expiresAt);
+      const c = await seed("did:key:zClaimed");
+      await store.setPendingInvitation(c, bobEmail, "tok2", expiresAt);
       await store.completeClaimByToken("tok2", {
         identity: bobEmail,
         userId: "u_b",
         claimedAt: new Date().toISOString(),
       });
-
       const open = await store.listOpenAccounts();
-      const dids = open.map((a) => a.did).sort();
-      expect(dids).toEqual(["did:key:zInvited", "did:key:zUnclaimed"]);
+      expect(open.map((a) => a.accountId).sort()).toEqual([i, u].sort());
     });
 
     it("expire flips state to EXPIRED and drops the pending invitation row", async () => {
-      await store.createUnclaimed("did:key:zStale");
+      const id = await seed("did:key:zStale");
       const expiresAt = new Date(Date.now() + 3600_000).toISOString();
-      await store.setPendingInvitation("did:key:zStale", aliceEmail, "stale-tok", expiresAt);
-
-      const expiredAt = new Date().toISOString();
-      const out = await store.expire("did:key:zStale", expiredAt);
+      await store.setPendingInvitation(id, aliceEmail, "stale-tok", expiresAt);
+      const out = await store.expire(id, new Date().toISOString());
       expect(out.state).toBe("EXPIRED");
-
-      // listOpenAccounts no longer surfaces it.
-      const open = await store.listOpenAccounts();
-      expect(open.map((a) => a.did)).not.toContain("did:key:zStale");
-
-      // The pending invitation has been dropped.
+      expect((await store.listOpenAccounts()).map((a) => a.accountId)).not.toContain(id);
       expect(await store.findByPendingToken("stale-tok")).toBeNull();
     });
 
     it("expire is idempotent on already-EXPIRED accounts", async () => {
-      await store.createUnclaimed("did:key:zAgent");
-      await store.expire("did:key:zAgent", new Date().toISOString());
-      const again = await store.expire("did:key:zAgent", new Date().toISOString());
-      expect(again.state).toBe("EXPIRED");
+      const id = await seed("did:key:zAgent");
+      await store.expire(id, new Date().toISOString());
+      expect((await store.expire(id, new Date().toISOString())).state).toBe("EXPIRED");
     });
 
     it("expire on CLAIMED throws already_claimed (Appendix A forbids the transition)", async () => {
-      await store.createUnclaimed("did:key:zClaimed");
+      const id = await seed("did:key:zClaimed");
       const expiresAt = new Date(Date.now() + 3600_000).toISOString();
-      await store.setPendingInvitation("did:key:zClaimed", bobEmail, "tk", expiresAt);
+      await store.setPendingInvitation(id, bobEmail, "tk", expiresAt);
       await store.completeClaimByToken("tk", {
         identity: bobEmail,
         userId: "u",
         claimedAt: new Date().toISOString(),
       });
-      await expect(
-        store.expire("did:key:zClaimed", new Date().toISOString()),
-      ).rejects.toThrow(/CLAIMED/);
+      await expect(store.expire(id, new Date().toISOString())).rejects.toThrow(/CLAIMED/);
     });
 
     it("expire on unknown account throws unknown_account", async () => {
-      await expect(store.expire("did:key:zNope", new Date().toISOString())).rejects.toThrow(
-        /does not exist/,
-      );
+      await expect(store.expire("acct_ghost", new Date().toISOString())).rejects.toThrow(/does not exist/);
     });
   });
 
   describe("reKey (§8.2 owner re-key resume)", () => {
-    async function claimedThenRevoked() {
+    async function claimedThenRevoked(): Promise<{
+      owner: NonNullable<Account["owner"]>;
+      accountId: string;
+    }> {
       const exp = new Date(Date.now() + 3600_000).toISOString();
-      await store.createUnclaimed("did:key:zOld");
-      await store.setPendingInvitation("did:key:zOld", aliceEmail, "tok", exp);
+      const accountId = (await store.signupAgent({ did: "did:key:zOld" })).account.accountId;
+      await store.setPendingInvitation(accountId, aliceEmail, "tok", exp);
       const owner: NonNullable<Account["owner"]> = {
         identity: aliceEmail,
         userId: "usr_alice",
         claimedAt: new Date().toISOString(),
       };
       await store.completeClaimByToken("tok", owner);
-      await store.revoke("did:key:zOld", new Date().toISOString());
-      return owner;
+      await store.revoke(accountId, new Date().toISOString());
+      return { owner, accountId };
     }
 
-    it("the bug reKey fixes: a plain rotateKey carries revoked=true onto the new DID", async () => {
+    it("a plain rotateAgent leaves the account flagged revoked", async () => {
       await claimedThenRevoked();
-      await store.rotateKey("did:key:zOld", "did:key:zRot", new Date().toISOString());
-      expect((await store.get("did:key:zRot"))?.revoked).toBe(true);
+      await store.rotateAgent("did:key:zOld", "did:key:zRot", new Date().toISOString());
+      expect((await store.getByAgentDid("did:key:zRot"))?.revoked).toBe(true);
     });
 
     it("reKey swaps the DID in one batch, clears revoked, preserves owner, drops the old DID", async () => {
-      const owner = await claimedThenRevoked();
+      const { owner, accountId } = await claimedThenRevoked();
       const out = await store.reKey("did:key:zOld", "did:key:zNew", new Date().toISOString());
-      expect(out.did).toBe("did:key:zNew");
+      expect(out.accountId).toBe(accountId); // stable
+      expect(out.agents.map((a) => a.did)).toContain("did:key:zNew");
       expect(out.state).toBe("CLAIMED");
-      // The row flag is cleared (the genuine carry-forward bug), in the
-      // SAME transaction as the swap — no window where the new DID exists
-      // but is still flagged revoked.
       expect(out.revoked).toBeFalsy();
-      const fresh = await store.get("did:key:zNew");
+      const fresh = await store.getByAgentDid("did:key:zNew");
       expect(fresh?.revoked).toBeFalsy();
       expect(fresh?.owner).toEqual(owner);
-      expect(await store.get("did:key:zOld")).toBeNull();
+      expect(await store.getByAgentDid("did:key:zOld")).toBeNull();
     });
 
     it("reKey on an unknown account throws unknown_account", async () => {
       await expect(
         store.reKey("did:key:zGhost", "did:key:zNew", new Date().toISOString()),
-      ).rejects.toThrow(/does not exist/);
+      ).rejects.toThrow(/does not exist|no account/);
     });
   });
 });

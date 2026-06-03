@@ -26,8 +26,7 @@ import {
   type AttestedFreshnessStore,
   type RevocationList,
   type ServerOptions,
-  type SubHUniquenessStore,
-  type SubHClaimResult,
+  type SignupResult,
 } from "@afauthhq/server";
 
 export interface WorkerOptions extends ServerOptions {
@@ -409,26 +408,18 @@ export class KvAttestedFreshnessStore implements AttestedFreshnessStore {
 
 // ---------- D1AccountStore (§6 storage) ----------
 //
-// Production-grade AccountStore backed by Cloudflare D1 (managed
-// SQLite). The schema lives at migrations/0001_init.sql and is
-// applied via `wrangler d1 migrations apply <db-name>`. The SQL is
-// portable to standard Postgres/MySQL with minor syntactic changes.
-//
-// Atomicity is provided by D1's `batch()`, which executes a sequence
-// of statements as a single transaction. The named atomic ops from
-// ADR-0004 each map to one batch:
-//   - setPendingInvitation → DELETE prior + INSERT new (the §7.3
-//     atomicity invariant; UNIQUE(account_did) backs it up at the
-//     storage layer in case batch is bypassed).
-//   - completeClaimByToken → UPDATE state + DELETE invitation.
-//   - rotateKey → UPDATE did + cascading FK update on invitation.
-//   - revoke → UPDATE revoked = 1.
-//
-// On schema migration: the v0.1 schema is the only published version;
-// future migrations land as 0002_*.sql, 0003_*.sql, etc.
+// Production-grade `AccountStore` backed by Cloudflare D1 (managed SQLite),
+// reworked for multi-agent accounts (§10.4.4): an account is keyed on an
+// opaque `account_id` and groups every agent credential (device) of one
+// human. Schema: migrations/0001_init.sql. The `(iss, sub_h)` UNIQUE index
+// makes `signupAgent` atomic — concurrent first-signups of the same human
+// converge on ONE account via `INSERT ... ON CONFLICT(iss, sub_h)`.
+// Multi-statement ops use D1's `batch()` for transactional grouping.
 
 interface AccountRow {
-  did: string;
+  account_id: string;
+  iss: string | null;
+  sub_h: string | null;
   state: AccountState;
   created_at: string;
   updated_at: string;
@@ -436,15 +427,41 @@ interface AccountRow {
   revoked: number;
 }
 
+interface AgentRow {
+  agent_did: string;
+  account_id: string;
+  added_at: string;
+  revoked: number;
+}
+
 interface InvitationRow {
   token: string;
-  account_did: string;
+  account_id: string;
   recipient_json: string;
   expires_at: string;
 }
 
-function rowToAccount(row: AccountRow, pending?: Recipient): Account {
-  const out: Account = { did: row.did, state: row.state, createdAt: row.created_at };
+/** Generate an opaque, service-local account id (mirrors the server store). */
+function generateAccountId(): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return "acct_" + btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function rowToAccount(row: AccountRow, agents: AgentRow[], pending?: Recipient): Account {
+  const out: Account = {
+    accountId: row.account_id,
+    agents: agents.map((a) => ({
+      did: a.agent_did,
+      addedAt: a.added_at,
+      ...(a.revoked ? { revoked: true } : {}),
+    })),
+    state: row.state,
+    createdAt: row.created_at,
+  };
+  if (row.iss && row.sub_h) out.principal = { iss: row.iss, subH: row.sub_h };
   if (row.revoked) out.revoked = true;
   if (row.owner_json) out.owner = JSON.parse(row.owner_json) as Account["owner"];
   if (pending) out.pendingRecipient = pending;
@@ -452,32 +469,63 @@ function rowToAccount(row: AccountRow, pending?: Recipient): Account {
 }
 
 /**
- * Cloudflare D1–backed `AccountStore`. The constructor takes a D1
- * database binding (the same `env.DB` shape `wrangler` injects).
+ * Cloudflare D1–backed `AccountStore` (multi-agent model).
  *
  *   new D1AccountStore(env.AFAUTH_DB)
  *
- * Schema: see migrations/0001_init.sql. Run `wrangler d1 migrations
- * apply <db-name>` before first use.
- *
- * Every atomic op uses `db.batch()` to run its statements as a single
- * transaction; race-free under concurrent invocations.
+ * Schema: migrations/0001_init.sql. Run `wrangler d1 migrations apply
+ * <db-name>` before first use.
  */
 export class D1AccountStore implements SweepableAccountStore {
   constructor(private readonly db: D1Database) {}
 
-  async get(did: Did): Promise<Account | null> {
+  private async loadAgents(accountId: string): Promise<AgentRow[]> {
+    const r = await this.db
+      .prepare("SELECT * FROM afauth_account_agents WHERE account_id = ? ORDER BY added_at ASC")
+      .bind(accountId)
+      .all<AgentRow>();
+    return r.results ?? [];
+  }
+
+  private async loadPending(accountId: string): Promise<Recipient | undefined> {
+    const invite = await this.db
+      .prepare("SELECT * FROM afauth_invitations WHERE account_id = ?")
+      .bind(accountId)
+      .first<InvitationRow>();
+    if (!invite) return undefined;
+    if (new Date(invite.expires_at).getTime() < Date.now()) return undefined;
+    return JSON.parse(invite.recipient_json) as Recipient;
+  }
+
+  async getById(accountId: string): Promise<Account | null> {
     const row = await this.db
-      .prepare("SELECT * FROM afauth_accounts WHERE did = ?")
-      .bind(did)
+      .prepare("SELECT * FROM afauth_accounts WHERE account_id = ?")
+      .bind(accountId)
       .first<AccountRow>();
     if (!row) return null;
-    const invite = await this.db
-      .prepare("SELECT * FROM afauth_invitations WHERE account_did = ?")
+    return rowToAccount(row, await this.loadAgents(accountId), await this.loadPending(accountId));
+  }
+
+  async getByAgentDid(did: Did): Promise<Account | null> {
+    const agent = await this.db
+      .prepare("SELECT account_id FROM afauth_account_agents WHERE agent_did = ?")
       .bind(did)
-      .first<InvitationRow>();
-    const pending = invite ? (JSON.parse(invite.recipient_json) as Recipient) : undefined;
-    return rowToAccount(row, pending);
+      .first<{ account_id: string }>();
+    if (!agent) return null;
+    return this.getById(agent.account_id);
+  }
+
+  async findByPrincipal(iss: string, subH: string): Promise<Account | null> {
+    const row = await this.db
+      .prepare("SELECT * FROM afauth_accounts WHERE iss = ? AND sub_h = ?")
+      .bind(iss, subH)
+      .first<AccountRow>();
+    if (!row) return null;
+    return rowToAccount(
+      row,
+      await this.loadAgents(row.account_id),
+      await this.loadPending(row.account_id),
+    );
   }
 
   async findByPendingToken(token: string): Promise<Account | null> {
@@ -487,78 +535,105 @@ export class D1AccountStore implements SweepableAccountStore {
       .first<InvitationRow>();
     if (!invite) return null;
     if (new Date(invite.expires_at).getTime() < Date.now()) {
-      // Drop expired invitations opportunistically (§7.3 says
-      // expired invitations transition the account back to UNCLAIMED;
-      // the actual transition runs elsewhere — here we just refuse
-      // to return a stale token).
       await this.db.prepare("DELETE FROM afauth_invitations WHERE token = ?").bind(token).run();
       return null;
     }
-    const row = await this.db
-      .prepare("SELECT * FROM afauth_accounts WHERE did = ?")
-      .bind(invite.account_did)
-      .first<AccountRow>();
-    if (!row) return null;
-    const pending = JSON.parse(invite.recipient_json) as Recipient;
-    return rowToAccount(row, pending);
+    return this.getById(invite.account_id);
   }
 
-  async createUnclaimed(did: Did): Promise<Account> {
-    const existing = await this.get(did);
-    if (existing) return existing;
-    const nowIso = new Date().toISOString();
+  async signupAgent(input: {
+    did: Did;
+    principal?: { iss: string; subH: string };
+  }): Promise<SignupResult> {
+    const { did, principal } = input;
+    // Idempotent: an already-attached credential returns its account.
+    const existing = await this.getByAgentDid(did);
+    if (existing) return { account: existing, attached: false };
+
+    const now = new Date().toISOString();
+    if (principal) {
+      const newId = generateAccountId();
+      // Atomic grouping: only one account per (iss, sub_h) survives.
+      await this.db
+        .prepare(
+          "INSERT INTO afauth_accounts (account_id, iss, sub_h, state, created_at, updated_at) VALUES (?, ?, ?, 'UNCLAIMED', ?, ?) ON CONFLICT (iss, sub_h) DO NOTHING",
+        )
+        .bind(newId, principal.iss, principal.subH, now, now)
+        .run();
+      const winner = await this.db
+        .prepare("SELECT account_id FROM afauth_accounts WHERE iss = ? AND sub_h = ?")
+        .bind(principal.iss, principal.subH)
+        .first<{ account_id: string }>();
+      const accountId = winner!.account_id;
+      await this.db
+        .prepare("INSERT INTO afauth_account_agents (agent_did, account_id, added_at) VALUES (?, ?, ?)")
+        .bind(did, accountId, now)
+        .run();
+      return { account: (await this.getById(accountId))!, attached: accountId !== newId };
+    }
+    // No principal → singleton account.
+    const accountId = generateAccountId();
+    await this.db.batch([
+      this.db
+        .prepare("INSERT INTO afauth_accounts (account_id, state, created_at, updated_at) VALUES (?, 'UNCLAIMED', ?, ?)")
+        .bind(accountId, now, now),
+      this.db
+        .prepare("INSERT INTO afauth_account_agents (agent_did, account_id, added_at) VALUES (?, ?, ?)")
+        .bind(did, accountId, now),
+    ]);
+    return { account: (await this.getById(accountId))!, attached: false };
+  }
+
+  async attachAgent(accountId: string, did: Did, addedAt: string): Promise<Account> {
+    const account = await this.getById(accountId);
+    if (!account) throw new AFAuthError("unknown_account", 404, `account ${accountId} does not exist`);
     await this.db
-      .prepare(
-        "INSERT INTO afauth_accounts (did, state, created_at, updated_at) VALUES (?, ?, ?, ?)",
-      )
-      .bind(did, "UNCLAIMED", nowIso, nowIso)
+      .prepare("INSERT OR IGNORE INTO afauth_account_agents (agent_did, account_id, added_at) VALUES (?, ?, ?)")
+      .bind(did, accountId, addedAt)
       .run();
-    return { did, state: "UNCLAIMED", createdAt: nowIso };
+    return (await this.getById(accountId))!;
+  }
+
+  async revokeAgent(did: Did, _revokedAt: string): Promise<Account> {
+    const account = await this.getByAgentDid(did);
+    if (!account) throw new AFAuthError("unknown_account", 404, `no account for agent ${did}`);
+    await this.db
+      .prepare("UPDATE afauth_account_agents SET revoked = 1 WHERE agent_did = ?")
+      .bind(did)
+      .run();
+    return (await this.getById(account.accountId))!;
   }
 
   async setPendingInvitation(
-    did: Did,
+    accountId: string,
     recipient: Recipient,
     token: string,
     expiresAt: string,
   ): Promise<Account> {
-    // Pre-check account state. §7.3's atomic supersession is the DELETE
-    // + INSERT batch; the state guard prevents inviting against a
-    // CLAIMED or revoked account.
-    const account = await this.get(did);
+    const account = await this.getById(accountId);
     if (!account) {
-      throw new AFAuthError("unknown_account", 404, `account ${did} does not exist`);
+      throw new AFAuthError("unknown_account", 404, `account ${accountId} does not exist`);
     }
     if (account.revoked) {
-      throw new AFAuthError("revoked_key", 401, `account ${did} is revoked`);
+      throw new AFAuthError("revoked_key", 401, `account ${accountId} is revoked`);
     }
     if (account.state === "CLAIMED") {
-      throw new AFAuthError(
-        "already_claimed",
-        409,
-        "account is already claimed; further owner-invitation is post-claim policy",
-      );
+      throw new AFAuthError("already_claimed", 409, `account ${accountId} is already claimed`);
     }
     const nowIso = new Date().toISOString();
-    // Atomic: DELETE any prior invitation for this account, then
-    // INSERT the new one, then UPDATE the account state to INVITED.
+    // §7.3 atomic supersession: DELETE prior + INSERT new + UPDATE state.
     await this.db.batch([
-      this.db.prepare("DELETE FROM afauth_invitations WHERE account_did = ?").bind(did),
+      this.db.prepare("DELETE FROM afauth_invitations WHERE account_id = ?").bind(accountId),
       this.db
         .prepare(
-          "INSERT INTO afauth_invitations (token, account_did, recipient_json, expires_at) VALUES (?, ?, ?, ?)",
+          "INSERT INTO afauth_invitations (token, account_id, recipient_json, expires_at) VALUES (?, ?, ?, ?)",
         )
-        .bind(token, did, JSON.stringify(recipient), expiresAt),
+        .bind(token, accountId, JSON.stringify(recipient), expiresAt),
       this.db
-        .prepare("UPDATE afauth_accounts SET state = ?, updated_at = ? WHERE did = ?")
-        .bind("INVITED", nowIso, did),
+        .prepare("UPDATE afauth_accounts SET state = 'INVITED', updated_at = ? WHERE account_id = ?")
+        .bind(nowIso, accountId),
     ]);
-    return {
-      did,
-      state: "INVITED",
-      createdAt: account.createdAt,
-      pendingRecipient: recipient,
-    };
+    return { ...account, state: "INVITED", pendingRecipient: recipient };
   }
 
   async completeClaimByToken(
@@ -574,97 +649,64 @@ export class D1AccountStore implements SweepableAccountStore {
       await this.db.prepare("DELETE FROM afauth_invitations WHERE token = ?").bind(token).run();
       return null;
     }
-    const accountDid = invite.account_did;
+    const accountId = invite.account_id;
     const nowIso = new Date().toISOString();
     await this.db.batch([
       this.db
-        .prepare(
-          "UPDATE afauth_accounts SET state = ?, owner_json = ?, updated_at = ? WHERE did = ?",
-        )
-        .bind("CLAIMED", JSON.stringify(owner), nowIso, accountDid),
+        .prepare("UPDATE afauth_accounts SET state = 'CLAIMED', owner_json = ?, updated_at = ? WHERE account_id = ?")
+        .bind(JSON.stringify(owner), nowIso, accountId),
       this.db.prepare("DELETE FROM afauth_invitations WHERE token = ?").bind(token),
     ]);
-    const row = await this.db
-      .prepare("SELECT * FROM afauth_accounts WHERE did = ?")
-      .bind(accountDid)
-      .first<AccountRow>();
-    if (!row) return null;
-    return rowToAccount(row);
+    return this.getById(accountId);
   }
 
-  async rotateKey(oldDid: Did, newDid: Did, rotatedAt: string): Promise<Account> {
-    const old = await this.db
-      .prepare("SELECT * FROM afauth_accounts WHERE did = ?")
+  async rotateAgent(oldDid: Did, newDid: Did, _rotatedAt: string): Promise<Account> {
+    const agent = await this.db
+      .prepare("SELECT account_id FROM afauth_account_agents WHERE agent_did = ?")
       .bind(oldDid)
-      .first<AccountRow>();
-    if (!old) {
-      throw new AFAuthError("unknown_account", 404, `account ${oldDid} does not exist`);
+      .first<{ account_id: string }>();
+    if (!agent) {
+      throw new AFAuthError("unknown_account", 404, `no account for agent ${oldDid}`);
     }
-    // Atomic: INSERT new row + UPDATE invitation FK (if any) +
-    // DELETE old row. Using INSERT-then-DELETE keeps the FK satisfied
-    // during the swap; the ON DELETE CASCADE doesn't fire because we
-    // re-point the invitation first.
-    await this.db.batch([
-      this.db
-        .prepare(
-          "INSERT INTO afauth_accounts (did, state, created_at, updated_at, owner_json, revoked) VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(newDid, old.state, old.created_at, rotatedAt, old.owner_json, old.revoked),
-      this.db
-        .prepare("UPDATE afauth_invitations SET account_did = ? WHERE account_did = ?")
-        .bind(newDid, oldDid),
-      this.db.prepare("DELETE FROM afauth_accounts WHERE did = ?").bind(oldDid),
-    ]);
-    const out: Account = { did: newDid, state: old.state, createdAt: old.created_at };
-    if (old.revoked) out.revoked = true;
-    if (old.owner_json) out.owner = JSON.parse(old.owner_json) as Account["owner"];
-    return out;
+    // Swap the credential DID; account_id is stable across rotation.
+    await this.db
+      .prepare("UPDATE afauth_account_agents SET agent_did = ? WHERE agent_did = ?")
+      .bind(newDid, oldDid)
+      .run();
+    return (await this.getById(agent.account_id))!;
+  }
+
+  async revoke(accountId: string, revokedAt: string): Promise<Account> {
+    const existing = await this.getById(accountId);
+    if (!existing) {
+      throw new AFAuthError("unknown_account", 404, `account ${accountId} does not exist`);
+    }
+    await this.db
+      .prepare("UPDATE afauth_accounts SET revoked = 1, updated_at = ? WHERE account_id = ?")
+      .bind(revokedAt, accountId)
+      .run();
+    return { ...existing, revoked: true };
   }
 
   async reKey(oldDid: Did, newDid: Did, reKeyedAt: string): Promise<Account> {
-    const old = await this.db
-      .prepare("SELECT * FROM afauth_accounts WHERE did = ?")
+    const agent = await this.db
+      .prepare("SELECT account_id FROM afauth_account_agents WHERE agent_did = ?")
       .bind(oldDid)
-      .first<AccountRow>();
-    if (!old) {
-      throw new AFAuthError("unknown_account", 404, `account ${oldDid} does not exist`);
+      .first<{ account_id: string }>();
+    if (!agent) {
+      throw new AFAuthError("unknown_account", 404, `no account for agent ${oldDid}`);
     }
-    // One batch() = one transaction: INSERT the new row with revoked
-    // cleared (0), re-point any invitation FK, DELETE the old row. Doing
-    // the clear in the SAME transaction as the rotate is what avoids the
-    // bricking window a rotateKey + separate clear would leave on a
-    // crash/interleave (each batch is its own D1 transaction).
+    // One batch (one transaction): swap credential DID + clear the per-agent
+    // and whole-account revoked flags. The atomic clear is the resume step.
     await this.db.batch([
       this.db
-        .prepare(
-          "INSERT INTO afauth_accounts (did, state, created_at, updated_at, owner_json, revoked) VALUES (?, ?, ?, ?, ?, 0)",
-        )
-        .bind(newDid, old.state, old.created_at, reKeyedAt, old.owner_json),
-      this.db
-        .prepare("UPDATE afauth_invitations SET account_did = ? WHERE account_did = ?")
+        .prepare("UPDATE afauth_account_agents SET agent_did = ?, revoked = 0 WHERE agent_did = ?")
         .bind(newDid, oldDid),
-      this.db.prepare("DELETE FROM afauth_accounts WHERE did = ?").bind(oldDid),
+      this.db
+        .prepare("UPDATE afauth_accounts SET revoked = 0, updated_at = ? WHERE account_id = ?")
+        .bind(reKeyedAt, agent.account_id),
     ]);
-    const out: Account = { did: newDid, state: old.state, createdAt: old.created_at };
-    // Note: `revoked` intentionally omitted — reKey clears it.
-    if (old.owner_json) out.owner = JSON.parse(old.owner_json) as Account["owner"];
-    return out;
-  }
-
-  async revoke(did: Did, revokedAt: string): Promise<Account> {
-    const existing = await this.db
-      .prepare("SELECT * FROM afauth_accounts WHERE did = ?")
-      .bind(did)
-      .first<AccountRow>();
-    if (!existing) {
-      throw new AFAuthError("unknown_account", 404, `account ${did} does not exist`);
-    }
-    await this.db
-      .prepare("UPDATE afauth_accounts SET revoked = 1, updated_at = ? WHERE did = ?")
-      .bind(revokedAt, did)
-      .run();
-    const row: AccountRow = { ...existing, revoked: 1, updated_at: revokedAt };
-    return rowToAccount(row);
+    return (await this.getById(agent.account_id))!;
   }
 
   async listOpenAccounts(): Promise<Account[]> {
@@ -673,107 +715,40 @@ export class D1AccountStore implements SweepableAccountStore {
         "SELECT * FROM afauth_accounts WHERE state IN ('UNCLAIMED', 'INVITED') ORDER BY created_at ASC",
       )
       .all<AccountRow>();
-    return (result.results ?? []).map((row) => rowToAccount(row));
+    const rows = result.results ?? [];
+    const out: Account[] = [];
+    for (const row of rows) {
+      out.push(rowToAccount(row, await this.loadAgents(row.account_id)));
+    }
+    return out;
   }
 
-  async expire(did: Did, expiredAt: string): Promise<Account> {
+  async expire(accountId: string, expiredAt: string): Promise<Account> {
     const existing = await this.db
-      .prepare("SELECT * FROM afauth_accounts WHERE did = ?")
-      .bind(did)
+      .prepare("SELECT * FROM afauth_accounts WHERE account_id = ?")
+      .bind(accountId)
       .first<AccountRow>();
     if (!existing) {
-      throw new AFAuthError("unknown_account", 404, `account ${did} does not exist`);
+      throw new AFAuthError("unknown_account", 404, `account ${accountId} does not exist`);
     }
     if (existing.state === "CLAIMED") {
-      // Spec forbids CLAIMED → EXPIRED (Appendix A).
       throw new AFAuthError(
         "already_claimed",
         409,
-        `account ${did} is CLAIMED; the CLAIMED → EXPIRED transition is forbidden`,
+        `account ${accountId} is CLAIMED; the CLAIMED → EXPIRED transition is forbidden`,
       );
     }
     if (existing.state === "EXPIRED") {
-      // Idempotent.
-      return rowToAccount(existing);
+      return rowToAccount(existing, await this.loadAgents(accountId)); // idempotent
     }
-    // Atomic: flip state to EXPIRED and DELETE any pending invitation.
-    // EXPIRED accounts have no operable surface, so the pending
-    // recipient cannot be bound; dropping it matches what
-    // `MemoryAccountStore.expire` does.
     await this.db.batch([
       this.db
-        .prepare("UPDATE afauth_accounts SET state = ?, updated_at = ? WHERE did = ?")
-        .bind("EXPIRED", expiredAt, did),
-      this.db.prepare("DELETE FROM afauth_invitations WHERE account_did = ?").bind(did),
+        .prepare("UPDATE afauth_accounts SET state = 'EXPIRED', updated_at = ? WHERE account_id = ?")
+        .bind(expiredAt, accountId),
+      this.db.prepare("DELETE FROM afauth_invitations WHERE account_id = ?").bind(accountId),
     ]);
     const row: AccountRow = { ...existing, state: "EXPIRED", updated_at: expiredAt };
-    return rowToAccount(row);
-  }
-}
-
-// ---------- D1SubHUniquenessStore (§10.4.4) ----------
-//
-// Production-grade `SubHUniquenessStore` backed by Cloudflare D1, living
-// in the SAME database as `D1AccountStore`. The schema is
-// migrations/0002_subh_uniqueness.sql; apply it after 0001.
-//
-// The composite PRIMARY KEY `(iss, sub_h)` is what makes `claim()` atomic:
-// `INSERT ... ON CONFLICT DO NOTHING` lets exactly one concurrent claimant
-// win the slot, so the cross-isolate Sybil race the gate exists to close
-// stays closed (unlike a KV get-then-put, which can let two writers both
-// observe an empty slot). This is why there is no `KvSubHUniquenessStore`:
-// per-principal uniqueness needs an atomic claim, and KV cannot provide one.
-
-interface SubHRow {
-  iss: string;
-  sub_h: string;
-  did: string;
-}
-
-/**
- * Cloudflare D1–backed `SubHUniquenessStore`. Construct with the same D1
- * binding as `D1AccountStore`:
- *
- *   new D1SubHUniquenessStore(env.AFAUTH_DB)
- *
- * Schema: migrations/0002_subh_uniqueness.sql. Run `wrangler d1 migrations
- * apply <db-name>` before first use.
- */
-export class D1SubHUniquenessStore implements SubHUniquenessStore {
-  constructor(private readonly db: D1Database) {}
-
-  async claim(iss: string, subH: string, did: Did): Promise<SubHClaimResult> {
-    const claimedAt = new Date().toISOString();
-    // Atomic reserve: ON CONFLICT DO NOTHING means the first writer for a
-    // given (iss, sub_h) wins; later writers no-op. We then read back the
-    // single surviving row to learn the winner.
-    await this.db
-      .prepare(
-        "INSERT INTO afauth_subh_uniqueness (iss, sub_h, did, claimed_at) VALUES (?, ?, ?, ?) ON CONFLICT (iss, sub_h) DO NOTHING",
-      )
-      .bind(iss, subH, did, claimedAt)
-      .run();
-    const row = await this.db
-      .prepare("SELECT did FROM afauth_subh_uniqueness WHERE iss = ? AND sub_h = ?")
-      .bind(iss, subH)
-      .first<Pick<SubHRow, "did">>();
-    // Row is guaranteed to exist (we just inserted or it pre-existed).
-    if (row && row.did === did) return { ok: true };
-    return { ok: false, existingDid: row?.did };
-  }
-
-  async rekey(oldDid: Did, newDid: Did): Promise<void> {
-    await this.db
-      .prepare("UPDATE afauth_subh_uniqueness SET did = ? WHERE did = ?")
-      .bind(newDid, oldDid)
-      .run();
-  }
-
-  async releaseByDid(did: Did): Promise<void> {
-    await this.db
-      .prepare("DELETE FROM afauth_subh_uniqueness WHERE did = ?")
-      .bind(did)
-      .run();
+    return rowToAccount(row, await this.loadAgents(accountId));
   }
 }
 
