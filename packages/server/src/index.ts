@@ -2744,11 +2744,20 @@ function synthesizeDiscovery(args: {
   override?: Partial<DiscoveryDocument>;
 }): DiscoveryDocument {
   const base = args.baseUrl.replace(/\/+$/, "");
+  // Canonical §4.1 / Appendix B paths. These MUST match the request paths
+  // the agent SDK builders construct (`@afauthhq/agent`'s
+  // buildAccountIntrospection / buildOwnerInvitation / buildKeyRotation),
+  // which `@afauthhq/worker` also derives its routes from — a service that
+  // synthesizes divergent paths 404s a default agent (the introspection
+  // route is `<accounts>/me`). Operators can still override any path via
+  // `discovery.endpoints`; a discovery-aware agent follows whatever is
+  // advertised.
   const endpoints = {
-    accounts: `${base}/accounts`,
-    owner_invitation: `${base}/owner-invitations`,
+    accounts: `${base}/afauth/v1/accounts`,
+    owner_invitation: `${base}/afauth/v1/accounts/me/owner-invitation`,
     claim_page: `${base}/claim`,
-    claim_completion: `${base}/claim/complete`,
+    claim_completion: `${base}/afauth/v1/claim`,
+    key_rotation: `${base}/afauth/v1/accounts/me/keys/rotate`,
     ...args.override?.endpoints,
   };
 

@@ -66,8 +66,15 @@ export async function fetch(req: Request): Promise<Response> {
   switch (url.pathname) {
     case "/.well-known/afauth":
       return server.handleDiscovery(req);
-    case "/accounts/me":
+    // These paths match the synthesized discovery doc (`endpoints.accounts`
+    // + "/me", and `endpoints.owner_invitation`) — i.e. the canonical §4.1
+    // paths the agent SDK builders sign. A router that diverges from the
+    // discovery it advertises 404s a default agent. (`@afauthhq/worker`
+    // derives these routes from the discovery doc automatically.)
+    case "/afauth/v1/accounts/me":
       return server.handleAccountIntrospection(req);
+    case "/afauth/v1/accounts/me/owner-invitation":
+      return server.handleOwnerInvitation(req);
     default:
       return new Response("not found", { status: 404 });
   }

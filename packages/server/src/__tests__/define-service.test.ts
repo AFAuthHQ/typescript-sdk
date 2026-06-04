@@ -77,10 +77,13 @@ describe("defineService — synthesized discovery doc", () => {
     expect(doc.afauth_version).toBe("0.1");
     expect(doc.service_did).toBe(SERVICE_DID);
     expect(doc.signature_algorithms).toContain("ed25519");
-    expect(doc.endpoints.accounts).toBe(`${BASE_URL}/accounts`);
-    expect(doc.endpoints.owner_invitation).toBe(`${BASE_URL}/owner-invitations`);
+    expect(doc.endpoints.accounts).toBe(`${BASE_URL}/afauth/v1/accounts`);
+    expect(doc.endpoints.owner_invitation).toBe(
+      `${BASE_URL}/afauth/v1/accounts/me/owner-invitation`,
+    );
     expect(doc.endpoints.claim_page).toBe(`${BASE_URL}/claim`);
-    expect(doc.endpoints.claim_completion).toBe(`${BASE_URL}/claim/complete`);
+    expect(doc.endpoints.claim_completion).toBe(`${BASE_URL}/afauth/v1/claim`);
+    expect(doc.endpoints.key_rotation).toBe(`${BASE_URL}/afauth/v1/accounts/me/keys/rotate`);
     expect(doc.billing?.unclaimed_mode).toBe("attested_only");
     expect(doc.billing?.accepted_attestors).toEqual([AFAUTH_TRUST_ISS]);
   });

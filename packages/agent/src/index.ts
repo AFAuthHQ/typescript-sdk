@@ -196,13 +196,24 @@ export class Agent {
   }
 
   // ---------- High-level builders for protocol endpoints ----------
+  //
+  // Each builder derives its request URL from the service's advertised
+  // discovery `endpoints` when an `opts.discovery` document is supplied
+  // (§4.3/§4.5 — a conforming agent honors the paths the service
+  // advertises, which MAY be absolute or relative to its origin). Pass the
+  // document you already fetched via `fetchDiscovery` so a service that
+  // mounts custom paths still resolves. Without one, the builders fall back
+  // to the canonical §4.1 paths.
 
   async buildOwnerInvitation(opts: {
     baseUrl: string;
     recipient: Recipient;
     redirectUrl?: string;
+    discovery?: DiscoveryDocument;
   }): Promise<SignedRequest> {
-    const url = `${trimTrailing(opts.baseUrl)}/afauth/v1/accounts/me/owner-invitation`;
+    const url = opts.discovery
+      ? endpointUrl(opts.baseUrl, opts.discovery.endpoints.owner_invitation)
+      : `${trimTrailing(opts.baseUrl)}/afauth/v1/accounts/me/owner-invitation`;
     const bodyObj: { recipient: Recipient; redirect_url?: string } = {
       recipient: opts.recipient,
     };
@@ -210,8 +221,14 @@ export class Agent {
     return this.signRequest({ method: "POST", url, body: JSON.stringify(bodyObj) });
   }
 
-  async buildKeyRotation(opts: { baseUrl: string; newDid: Did }): Promise<SignedRequest> {
-    const url = `${trimTrailing(opts.baseUrl)}/afauth/v1/accounts/me/keys/rotate`;
+  async buildKeyRotation(opts: {
+    baseUrl: string;
+    newDid: Did;
+    discovery?: DiscoveryDocument;
+  }): Promise<SignedRequest> {
+    const url = opts.discovery?.endpoints.key_rotation
+      ? endpointUrl(opts.baseUrl, opts.discovery.endpoints.key_rotation)
+      : `${trimTrailing(opts.baseUrl)}/afauth/v1/accounts/me/keys/rotate`;
     return this.signRequest({
       method: "POST",
       url,
@@ -219,8 +236,16 @@ export class Agent {
     });
   }
 
-  async buildAccountIntrospection(opts: { baseUrl: string }): Promise<SignedRequest> {
-    const url = `${trimTrailing(opts.baseUrl)}/afauth/v1/accounts/me`;
+  async buildAccountIntrospection(opts: {
+    baseUrl: string;
+    discovery?: DiscoveryDocument;
+  }): Promise<SignedRequest> {
+    // §6.5 introspection is `<accounts>/me`: the accounts-collection
+    // endpoint with the `/me` selector appended — mirrors how the worker
+    // router derives the route (`${accountsPath}/me`).
+    const url = opts.discovery
+      ? endpointUrl(opts.baseUrl, opts.discovery.endpoints.accounts, "/me")
+      : `${trimTrailing(opts.baseUrl)}/afauth/v1/accounts/me`;
     return this.signRequest({ method: "GET", url });
   }
 
@@ -237,6 +262,20 @@ export class Agent {
 
 function trimTrailing(s: string): string {
   return s.endsWith("/") ? s.slice(0, -1) : s;
+}
+
+/**
+ * Resolve a discovery `endpoints.*` value to an absolute request URL.
+ * Endpoint URLs MAY be absolute or relative to the document origin
+ * (§4.3); a relative value resolves against `baseUrl`, while an absolute
+ * one keeps its own origin. An optional `suffix` (e.g. `"/me"`) is
+ * appended to the path — used for the §6.5 introspection selector on the
+ * accounts-collection endpoint.
+ */
+function endpointUrl(baseUrl: string, endpoint: string, suffix = ""): string {
+  const u = new URL(endpoint, baseUrl);
+  if (suffix) u.pathname = `${u.pathname.replace(/\/+$/, "")}${suffix}`;
+  return u.toString();
 }
 
 // ---------- Discovery (§4) ----------
