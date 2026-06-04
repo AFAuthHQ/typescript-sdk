@@ -8,6 +8,7 @@
  *   - CLAIMED accounts are NEVER touched (Appendix A forbids
  *     CLAIMED → EXPIRED).
  *   - Idempotent under repeated invocation.
+ *   - Omitted TTL is a no-op — no expiry by default (§4.4).
  *   - Bad TTLs reject before mutating.
  *   - EXPIRED rejection in handleOwnerInvitation and handleKeyRotation
  *     — each returns 410 account_expired.
@@ -185,6 +186,25 @@ describe("sweepExpiredAccounts", () => {
       now: () => future,
     });
     expect(swept.expired).toEqual([acc.accountId]);
+  });
+
+  it("is a no-op when unclaimedTtlSeconds is omitted (no expiry by default)", async () => {
+    const accounts = new MemoryAccountStore();
+    const did = "did:key:zForever";
+    const acc = await accounts.signupAgent({ did }).then((r) => r.account);
+    // Make it ancient — it must still survive when no TTL is configured.
+    (acc as { createdAt: string }).createdAt = new Date(
+      Date.now() - 365 * 24 * 60 * 60 * 1000,
+    ).toISOString();
+
+    const omitted = await sweepExpiredAccounts(accounts, {});
+    expect(omitted).toEqual({ expired: [], scanned: 0 });
+
+    // Also valid with no opts argument at all.
+    const noOpts = await sweepExpiredAccounts(accounts);
+    expect(noOpts).toEqual({ expired: [], scanned: 0 });
+
+    expect((await accounts.getByAgentDid(did))?.state).toBe("UNCLAIMED");
   });
 
   it("rejects non-positive unclaimedTtlSeconds before mutating", async () => {
