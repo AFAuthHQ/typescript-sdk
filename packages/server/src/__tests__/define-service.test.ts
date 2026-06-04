@@ -25,7 +25,9 @@ import {
   HmacAttestor,
   MemoryAccountStore,
   MemoryNonceStore,
+  MultiAttestor,
   defineService,
+  trustAttestor,
   type DiscoveryDocument,
   type RecipientHandler,
 } from "../index.js";
@@ -123,6 +125,40 @@ describe("defineService — synthesized discovery doc", () => {
     expect(doc.billing?.unclaimed_mode).toBe("attested_only"); // still synthesized
     expect(doc.billing?.accepted_attestors).toEqual(["afauth-trust", "stripe-projects"]);
     expect(doc.limits?.unclaimed_ttl_seconds).toBe(3600);
+  });
+
+  it("derives accepted_attestors from the configured attestor (custom iss advertised)", async () => {
+    const server = defineService({
+      ...baseOpts(),
+      attestor: new MultiAttestor([
+        trustAttestor(),
+        new HmacAttestor({ iss: "acme-trust", secret: SECRET }),
+      ]),
+    });
+    const resp = await server.handleDiscovery(new Request("https://x/.well-known/afauth"));
+    const doc = (await resp.json()) as DiscoveryDocument;
+    expect(doc.billing?.accepted_attestors).toEqual([AFAUTH_TRUST_ISS, "acme-trust"]);
+  });
+
+  it("a single custom attestor is advertised by its own iss, not afauth-trust", async () => {
+    const server = defineService({
+      ...baseOpts(),
+      attestor: new HmacAttestor({ iss: "my-service", secret: SECRET }),
+    });
+    const resp = await server.handleDiscovery(new Request("https://x/.well-known/afauth"));
+    const doc = (await resp.json()) as DiscoveryDocument;
+    expect(doc.billing?.accepted_attestors).toEqual(["my-service"]);
+  });
+
+  it("explicit discovery.billing.accepted_attestors still overrides the derived list", async () => {
+    const server = defineService({
+      ...baseOpts(),
+      attestor: new HmacAttestor({ iss: "my-service", secret: SECRET }),
+      discovery: { billing: { accepted_attestors: ["my-service", "afauth-trust"] } },
+    });
+    const resp = await server.handleDiscovery(new Request("https://x/.well-known/afauth"));
+    const doc = (await resp.json()) as DiscoveryDocument;
+    expect(doc.billing?.accepted_attestors).toEqual(["my-service", "afauth-trust"]);
   });
 });
 

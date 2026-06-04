@@ -849,6 +849,16 @@ export interface Attestor {
    * `unsupported_attestor` code).
    */
   verify(jwt: string, agentDid: Did, opts?: VerifyOptions): Promise<AttestationClaims>;
+
+  /**
+   * The issuer identifier(s) this attestor accepts — each matches a JWT
+   * `iss`. `defineService` reads this to synthesize
+   * `billing.accepted_attestors`, so a custom attestor is advertised
+   * automatically. Optional: a bespoke `Attestor` that doesn't expose it
+   * simply isn't auto-advertised — declare `discovery.billing.accepted_attestors`
+   * explicitly in that case.
+   */
+  readonly issuers?: readonly string[];
 }
 
 interface BaseAttestorOpts {
@@ -885,6 +895,10 @@ export class HmacAttestor implements Attestor {
     this.key = typeof opts.secret === "string" ? new TextEncoder().encode(opts.secret) : opts.secret;
     this.now = opts.now ?? (() => Math.floor(Date.now() / 1000));
     this.maxLifetimeSeconds = opts.maxLifetimeSeconds;
+  }
+
+  get issuers(): readonly string[] {
+    return [this.iss];
   }
 
   async verify(jwt: string, agentDid: Did, opts: VerifyOptions = {}): Promise<AttestationClaims> {
@@ -936,6 +950,10 @@ export class JwksAttestor implements Attestor {
     this.algorithms = opts.algorithms ?? ["ES256", "RS256", "EdDSA"];
     this.now = opts.now ?? (() => Math.floor(Date.now() / 1000));
     this.maxLifetimeSeconds = opts.maxLifetimeSeconds;
+  }
+
+  get issuers(): readonly string[] {
+    return [this.iss];
   }
 
   async verify(jwt: string, agentDid: Did, opts: VerifyOptions = {}): Promise<AttestationClaims> {
@@ -1019,6 +1037,11 @@ export class MultiAttestor implements Attestor {
       }
       this.byIss.set(a.iss, a);
     }
+  }
+
+  /** Every issuer this composite accepts, in the order they were supplied. */
+  get issuers(): readonly string[] {
+    return [...this.byIss.keys()];
   }
 
   async verify(jwt: string, agentDid: Did, opts: VerifyOptions = {}): Promise<AttestationClaims> {
@@ -2672,7 +2695,9 @@ export interface DefineServiceOptions {
    * Override the default attestor. When omitted and `attestation` is
    * `'required'` or `'optional'`, this defaults to `trustAttestor()`.
    * Useful for pointing at a staging trust attestor, swapping in
-   * `MultiAttestor`, or layering an HMAC service-operator attestor.
+   * `MultiAttestor`, or layering an HMAC service-operator attestor. Its
+   * `issuers` populate `billing.accepted_attestors` in the synthesized
+   * discovery doc (unless you override that explicitly below).
    */
   attestor?: Attestor;
   /**
@@ -2704,9 +2729,11 @@ export interface DefineServiceOptions {
  *     accounts, recipients,
  *   });
  *
- * Equivalent to wiring `unclaimed_mode: 'attested_only'`,
- * `accepted_attestors: ['afauth-trust']`, and `attestor: trustAttestor()`
- * by hand. Override `attestation: 'off'` to opt out.
+ * Equivalent to wiring `unclaimed_mode: 'attested_only'` and
+ * `attestor: trustAttestor()` by hand. `billing.accepted_attestors` is
+ * derived from the configured attestor's `issuers`, so passing a custom
+ * `attestor` (e.g. a `MultiAttestor`) advertises its issuers automatically.
+ * Override `attestation: 'off'` to opt out.
  *
  * §10.4.4 device grouping ("one account, many devices") needs no option: it
  * is intrinsic to every `AccountStore` — a second agent presenting the same
@@ -2722,6 +2749,10 @@ export function defineService(opts: DefineServiceOptions): Server {
     baseUrl: opts.baseUrl,
     serviceDid: opts.serviceDid,
     mode,
+    // Advertise exactly what the configured attestor accepts (derived from
+    // its `issuers`), so a custom/MultiAttestor is auto-advertised. An
+    // explicit discovery.billing.accepted_attestors still overrides this.
+    acceptedAttestors: attestor?.issuers,
     override: opts.discovery,
   });
 
@@ -2749,6 +2780,8 @@ function synthesizeDiscovery(args: {
   baseUrl: string;
   serviceDid: Did;
   mode: AttestationMode;
+  /** Issuers the configured attestor accepts; advertised as accepted_attestors. */
+  acceptedAttestors?: readonly string[];
   override?: Partial<DiscoveryDocument>;
 }): DiscoveryDocument {
   const base = args.baseUrl.replace(/\/+$/, "");
@@ -2771,7 +2804,9 @@ function synthesizeDiscovery(args: {
 
   const billing: NonNullable<DiscoveryDocument["billing"]> = {
     ...(args.mode === "required" ? { unclaimed_mode: "attested_only" } : {}),
-    ...(args.mode !== "off" ? { accepted_attestors: [AFAUTH_TRUST_ISS] } : {}),
+    ...(args.mode !== "off" && args.acceptedAttestors && args.acceptedAttestors.length > 0
+      ? { accepted_attestors: args.acceptedAttestors }
+      : {}),
     ...args.override?.billing,
   };
 
