@@ -80,15 +80,17 @@ export async function fetch(req: Request): Promise<Response> {
   }
 }
 
-// --- Periodic expiry sweep (§6.1) -------------------------------------
+// --- Periodic expiry sweep (§6.1, OPTIONAL) ---------------------------
 //
-// Run from your scheduler (cron / Workers scheduled trigger / Lambda) to
-// transition unclaimed/invited accounts past their TTL to EXPIRED. When a
-// human's last device-account expires, their `(iss, sub_h)` is free again,
-// so a returning human starts a fresh account.
+// By default AFAuth accounts NEVER expire: an agent operates its account
+// indefinitely whether or not a human ever claims it, so most services do
+// not need this sweep at all. Reach for it only to garbage-collect
+// abandoned accounts or to honour a data-retention mandate — then
+// advertise an `unclaimed_ttl_seconds` limit (§4.4) and pass it here.
+// With no TTL configured, `sweepExpiredAccounts` is a no-op.
 export async function sweep(): Promise<void> {
   await sweepExpiredAccounts(accounts, {
-    unclaimedTtlSeconds: 24 * 60 * 60,
+    // unclaimedTtlSeconds: 30 * 24 * 60 * 60, // 30 days — opt in only if you must
   });
 }
 

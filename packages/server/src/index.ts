@@ -518,10 +518,12 @@ export interface SweepOptions {
   /**
    * Service's `unclaimed_ttl_seconds` from §4.4 — the maximum age
    * before an UNCLAIMED or INVITED account transitions to EXPIRED.
-   * Required (no sensible default — pick a value appropriate to the
-   * account's value).
+   * OMIT for no expiry: the default and recommended posture, under which
+   * unclaimed accounts operate indefinitely and this sweep is a no-op.
+   * Set it only to garbage-collect abandoned accounts or to meet a
+   * data-retention mandate; if set, it MUST be a positive number.
    */
-  unclaimedTtlSeconds: number;
+  unclaimedTtlSeconds?: number;
   /**
    * Function returning the current `Date`. Overridable for tests.
    * Defaults to `() => new Date()`.
@@ -539,23 +541,24 @@ export interface SweepResult {
 /**
  * Periodic sweep that transitions UNCLAIMED / INVITED accounts to
  * `EXPIRED` once they exceed `unclaimedTtlSeconds` from their
- * `createdAt`. Spec §6.1 / Appendix A make this transition mandatory;
- * the SDK does not run it automatically because *when* to sweep is
- * service policy.
+ * `createdAt`. Expiry is opt-in (§4.4): when `unclaimedTtlSeconds` is
+ * omitted — the default — unclaimed accounts never expire and this sweep
+ * is a no-op that scans nothing. The SDK never runs it automatically;
+ * *when* to sweep is service policy.
  *
  * USAGE
  *
- *   // Run every 15 minutes from your scheduler (cron / Workers
- *   // scheduled trigger / Lambda EventBridge rule).
+ *   // Only services that opt into a TTL need this. Passing the discovery
+ *   // value straight through is safe: undefined → no-op.
  *   const result = await sweepExpiredAccounts(accountStore, {
- *     unclaimedTtlSeconds: discovery.limits!.unclaimed_ttl_seconds!,
+ *     unclaimedTtlSeconds: discovery.limits?.unclaimed_ttl_seconds,
  *   });
  *   console.log(`expired ${result.expired.length} of ${result.scanned}`);
  *
  * SCOPE
  *
- *   - Sweeps UNCLAIMED → EXPIRED and INVITED → EXPIRED. Both transitions
- *     are spec-mandated (Appendix A).
+ *   - Sweeps UNCLAIMED → EXPIRED and INVITED → EXPIRED (Appendix A),
+ *     only when a TTL is configured.
  *   - Does NOT sweep INVITED → UNCLAIMED (the per-invitation TTL
  *     transition). That transition is purely cosmetic — the account
  *     remains operable, and the next owner-invitation atomically
@@ -572,8 +575,13 @@ export interface SweepResult {
  */
 export async function sweepExpiredAccounts(
   store: SweepableAccountStore,
-  opts: SweepOptions,
+  opts: SweepOptions = {},
 ): Promise<SweepResult> {
+  // Expiry is opt-in (§4.4). With no TTL configured — the default — an
+  // unclaimed account never expires, so the sweep scans nothing.
+  if (opts.unclaimedTtlSeconds == null) {
+    return { expired: [], scanned: 0 };
+  }
   if (!Number.isFinite(opts.unclaimedTtlSeconds) || opts.unclaimedTtlSeconds <= 0) {
     throw new Error(
       `sweepExpiredAccounts: unclaimedTtlSeconds must be a positive number; got ${opts.unclaimedTtlSeconds}`,
