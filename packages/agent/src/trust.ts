@@ -50,9 +50,12 @@ export interface TrustLinkStart {
 export interface TrustBinding {
   binding_id: string;
   /**
-   * Unix seconds when the binding expires; the agent must re-link after
-   * this. There is no bearer token — the agent authenticates mints by
-   * signing `/v1/token` with its account key (§3.1 keyless mint).
+   * Unix seconds when the binding lapses if left unused. The attestor
+   * re-arms this on every successful mint (the inactivity window), and
+   * token() refreshes this field from the mint response — so an
+   * actively-minting agent's binding does not expire. There is no bearer
+   * token: the agent authenticates mints by signing `/v1/token` with its
+   * account key (§3.1 keyless mint).
    */
   binding_token_expires_at: number;
 }
@@ -62,6 +65,13 @@ export interface TrustToken {
   jwt: string;
   expires_at: number;
   verification: "email" | "oauth" | "payment";
+  /**
+   * Unix seconds when the binding lapses if left unused, as re-armed by
+   * this mint (the inactivity window). Present from attestors that slide
+   * binding expiry on use; absent from older servers. When present,
+   * token() refreshes the client's binding expiry from it.
+   */
+  binding_expires_at?: number;
 }
 
 export interface TrustClientOptions {
@@ -206,6 +216,14 @@ export class TrustClient {
     await this.ensureOk(r, path);
     const body = (await r.json()) as TrustToken;
     this.cache.set(serviceDid, { ...body });
+    // The attestor re-arms the binding's expiry on each mint (inactivity
+    // window). Refresh our cached binding so isLinked() — and anything the
+    // caller persists from getBinding() — tracks the live expiry instead
+    // of the link-time deadline. Guarded so an older server (no field) is
+    // a no-op.
+    if (this.binding && typeof body.binding_expires_at === "number") {
+      this.binding.binding_token_expires_at = body.binding_expires_at;
+    }
     return body;
   }
 
