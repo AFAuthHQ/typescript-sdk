@@ -17,7 +17,7 @@
 
 import type { Did } from "@afauthhq/core";
 import type { Agent, SignOptions } from "./index.js";
-import type { TrustClient } from "./trust.js";
+import { assertAttestorAccepted, type TrustClient, type TrustToken } from "./trust.js";
 
 export interface AttestedFetcherOptions {
   /** Signs each request. Its DID MUST equal the TrustClient's agent DID. */
@@ -35,6 +35,14 @@ export interface AttestedFetcherOptions {
    * Default `false` (reactive, the §10.7 baseline).
    */
   proactive?: boolean;
+  /**
+   * The service's §4.4 `billing.accepted_attestors` (read from its discovery
+   * document). When set, a minted attestation whose issuer isn't on this
+   * list is rejected locally — throwing {@link AttestorNotAcceptedError}
+   * BEFORE the token is sent — instead of letting the service reject an
+   * unrecognized attestor. Omit (or pass an empty list) to skip the check.
+   */
+  acceptedAttestors?: readonly string[];
 }
 
 export class AttestedFetcher {
@@ -43,6 +51,7 @@ export class AttestedFetcher {
   private readonly serviceDid: Did;
   private readonly fetchImpl: typeof globalThis.fetch;
   private readonly proactive: boolean;
+  private readonly acceptedAttestors: readonly string[] | undefined;
 
   constructor(opts: AttestedFetcherOptions) {
     if (opts.trust.agentDid !== opts.agent.did) {
@@ -56,6 +65,7 @@ export class AttestedFetcher {
     this.serviceDid = opts.serviceDid;
     this.fetchImpl = opts.fetch ?? globalThis.fetch.bind(globalThis);
     this.proactive = opts.proactive ?? false;
+    this.acceptedAttestors = opts.acceptedAttestors;
   }
 
   /**
@@ -77,7 +87,7 @@ export class AttestedFetcher {
     const first = await this.send(
       req,
       signOpts,
-      this.proactive ? (await this.trust.token(this.serviceDid)).jwt : undefined,
+      this.proactive ? (await this.mint()).jwt : undefined,
     );
     if (first.status !== 401 || !(await isAttestationRequired(first))) {
       return first;
@@ -87,8 +97,21 @@ export class AttestedFetcher {
     // retry exactly once with a fresh signature (new nonce, so the
     // §5.6 replay set accepts it).
     this.trust.clearTokenCache(this.serviceDid);
-    const fresh = await this.trust.token(this.serviceDid); // throws TrustHttpError if the binding is gone
+    const fresh = await this.mint(); // throws TrustHttpError if the binding is gone
     return this.send(req, signOpts, fresh.jwt);
+  }
+
+  /**
+   * Mint an attestation for `serviceDid` and reconcile its issuer against
+   * `acceptedAttestors` (§4.4) before returning. An unaccepted attestor
+   * throws {@link AttestorNotAcceptedError} here — locally, before the token
+   * is sent — rather than being rejected by the service. When
+   * `acceptedAttestors` is unset the check is a no-op.
+   */
+  private async mint(): Promise<TrustToken> {
+    const tok = await this.trust.token(this.serviceDid);
+    assertAttestorAccepted(tok, this.acceptedAttestors);
+    return tok;
   }
 
   private async send(

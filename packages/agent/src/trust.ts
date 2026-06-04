@@ -66,6 +66,14 @@ export interface TrustToken {
   expires_at: number;
   verification: "email" | "oauth" | "payment";
   /**
+   * The attestor's issuer identifier (`iss`), decoded from `jwt`. This is
+   * exactly what a service lists in `billing.accepted_attestors` (§4.4), so
+   * compare against it before sending — see `assertAttestorAccepted` or
+   * `AttestedFetcher`'s `acceptedAttestors`. Undefined only when the JWT
+   * payload can't be parsed.
+   */
+  iss?: string;
+  /**
    * Unix seconds when the binding lapses if left unused, as re-armed by
    * this mint (the inactivity window). Present from attestors that slide
    * binding expiry on use; absent from older servers. When present,
@@ -93,6 +101,7 @@ interface CachedToken {
   jwt: string;
   expires_at: number;
   verification: TrustToken["verification"];
+  iss?: string;
 }
 
 export class TrustClient {
@@ -202,6 +211,7 @@ export class TrustClient {
         jwt: cached.jwt,
         expires_at: cached.expires_at,
         verification: cached.verification,
+        iss: cached.iss,
       };
     }
 
@@ -215,6 +225,10 @@ export class TrustClient {
     });
     await this.ensureOk(r, path);
     const body = (await r.json()) as TrustToken;
+    // The attestor's /v1/token response carries no `iss`; decode it from the
+    // minted JWT so callers can reconcile against a service's
+    // accepted_attestors (§4.4) before sending. Never a trust decision.
+    body.iss = attestationIssuer(body.jwt);
     this.cache.set(serviceDid, { ...body });
     // The attestor re-arms the binding's expiry on each mint (inactivity
     // window). Refresh our cached binding so isLinked() — and anything the
@@ -324,6 +338,65 @@ export class TrustHttpError extends AFAuthError {
   }
   isVerificationRequired(): boolean {
     return this.upstreamCode === "verification_required";
+  }
+}
+
+/**
+ * Decode the `iss` (attestor identifier) from a JWT payload WITHOUT
+ * verifying its signature. Used only to learn which attestor minted a
+ * token — for §4.4 reconciliation against a service's accepted_attestors —
+ * never as a trust decision. Returns undefined when the token can't be
+ * parsed.
+ */
+export function attestationIssuer(jwt: string): string | undefined {
+  const payload = jwt.split(".")[1];
+  if (!payload) return undefined;
+  try {
+    const b64 = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64.padEnd(b64.length + ((4 - (b64.length % 4)) % 4), "=");
+    const claims = JSON.parse(atob(padded)) as { iss?: unknown };
+    return typeof claims.iss === "string" ? claims.iss : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Thrown when a minted attestation's issuer isn't in a service's §4.4
+ * `billing.accepted_attestors`. Surfaced BEFORE the attestation is sent so
+ * the agent gets an actionable error instead of an opaque server rejection.
+ * Carries `issuer` and `accepted` for programmatic handling.
+ */
+export class AttestorNotAcceptedError extends Error {
+  constructor(
+    readonly issuer: string,
+    readonly accepted: readonly string[],
+  ) {
+    super(
+      `attestor "${issuer}" is not accepted by this service ` +
+        `(it accepts: ${accepted.join(", ") || "none"}). ` +
+        `Link this agent to an accepted attestor — e.g. ` +
+        `new TrustClient({ baseUrl }) pointed at one — or ask the service ` +
+        `to add "${issuer}" to billing.accepted_attestors.`,
+    );
+    this.name = "AttestorNotAcceptedError";
+  }
+}
+
+/**
+ * Reconcile a minted token against a service's `accepted_attestors` (§4.4).
+ * No-op when the service didn't constrain attestors (empty/undefined list)
+ * or the issuer can't be determined; throws {@link AttestorNotAcceptedError}
+ * on a known mismatch. Pass the discovery doc's `billing.accepted_attestors`.
+ */
+export function assertAttestorAccepted(
+  token: { jwt: string; iss?: string },
+  acceptedAttestors: readonly string[] | undefined,
+): void {
+  if (!acceptedAttestors || acceptedAttestors.length === 0) return;
+  const iss = token.iss ?? attestationIssuer(token.jwt);
+  if (iss && !acceptedAttestors.includes(iss)) {
+    throw new AttestorNotAcceptedError(iss, acceptedAttestors);
   }
 }
 

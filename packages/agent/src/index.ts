@@ -33,6 +33,9 @@ export type { DiscoveryDocument };
 export {
   TrustClient,
   TrustHttpError,
+  AttestorNotAcceptedError,
+  attestationIssuer,
+  assertAttestorAccepted,
   AFAUTH_TRUST_DEFAULT_BASE,
   type TrustBinding,
   type TrustClientOptions,

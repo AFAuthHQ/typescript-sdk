@@ -1,5 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { TrustClient, AFAUTH_TRUST_DEFAULT_BASE } from "../trust.js";
+import {
+  TrustClient,
+  AFAUTH_TRUST_DEFAULT_BASE,
+  attestationIssuer,
+  assertAttestorAccepted,
+  AttestorNotAcceptedError,
+} from "../trust.js";
+
+/** A syntactically valid JWT carrying `iss` (signature is a placeholder). */
+function jwtWithIss(iss: string): string {
+  const b64url = (o: unknown) =>
+    btoa(JSON.stringify(o)).replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
+  return `${b64url({ alg: "EdDSA", typ: "JWT" })}.${b64url({ iss, aud: "did:web:svc.example", exp: 9_999_999_999 })}.sig`;
+}
 
 /**
  * Mock fetch that records calls and returns scripted responses.
@@ -167,5 +180,55 @@ describe("TrustClient", () => {
   it("token() refuses when the agent has not linked", async () => {
     const c = new TrustClient();
     await expect(c.token("did:web:svc.example")).rejects.toThrow(/not linked/);
+  });
+
+  it("token() exposes the attestor iss decoded from the minted JWT", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const { impl } = mockFetch([
+      { path: "/v1/token", body: { jwt: jwtWithIss("acme-trust"), expires_at: now + 900, verification: "email" } },
+    ]);
+    const c = new TrustClient({ fetch: impl, binding: { binding_id: "b", binding_token_expires_at: now + 100_000 } });
+    const tok = await c.token("did:web:svc.example");
+    expect(tok.iss).toBe("acme-trust");
+  });
+});
+
+describe("attestationIssuer", () => {
+  it("decodes the iss claim without verifying the signature", () => {
+    expect(attestationIssuer(jwtWithIss("afauth-trust"))).toBe("afauth-trust");
+  });
+  it("returns undefined for unparseable tokens", () => {
+    for (const bad of ["", "nodots", "only.two", "a.%%%.c"]) {
+      expect(attestationIssuer(bad)).toBeUndefined();
+    }
+  });
+});
+
+describe("assertAttestorAccepted", () => {
+  const tok = { jwt: jwtWithIss("acme-trust"), iss: "acme-trust" };
+
+  it("passes when the issuer is accepted", () => {
+    expect(() => assertAttestorAccepted(tok, ["afauth-trust", "acme-trust"])).not.toThrow();
+  });
+  it("is a no-op when the service advertises no list", () => {
+    expect(() => assertAttestorAccepted(tok, undefined)).not.toThrow();
+    expect(() => assertAttestorAccepted(tok, [])).not.toThrow();
+  });
+  it("throws AttestorNotAcceptedError naming the issuer and accepted set", () => {
+    try {
+      assertAttestorAccepted(tok, ["afauth-trust"]);
+      throw new Error("expected a throw");
+    } catch (e) {
+      expect(e).toBeInstanceOf(AttestorNotAcceptedError);
+      expect((e as AttestorNotAcceptedError).issuer).toBe("acme-trust");
+      expect((e as AttestorNotAcceptedError).accepted).toEqual(["afauth-trust"]);
+      expect((e as Error).message).toContain("acme-trust");
+      expect((e as Error).message).toContain("billing.accepted_attestors");
+    }
+  });
+  it("falls back to decoding iss from the jwt when not precomputed", () => {
+    expect(() => assertAttestorAccepted({ jwt: jwtWithIss("acme-trust") }, ["afauth-trust"])).toThrow(
+      AttestorNotAcceptedError,
+    );
   });
 });

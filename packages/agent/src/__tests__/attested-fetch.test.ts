@@ -15,7 +15,7 @@
 import { describe, expect, it } from "vitest";
 import { Agent } from "../index.js";
 import { AttestedFetcher } from "../attested-fetch.js";
-import { TrustClient, TrustHttpError } from "../trust.js";
+import { TrustClient, TrustHttpError, AttestorNotAcceptedError } from "../trust.js";
 
 const SERVICE_DID = "did:web:svc.example";
 const SERVICE_URL = "https://svc.example/api/thing";
@@ -71,6 +71,38 @@ async function setup(trustOpts: { fail?: { status: number; code: string } } = {}
     fetch: tf.impl,
   });
   return { agent, trust, mints: tf.mints };
+}
+
+/** A syntactically valid JWT carrying `iss` (signature is a placeholder). */
+function jwtWithIss(iss: string): string {
+  const b64url = (o: unknown) =>
+    btoa(JSON.stringify(o)).replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
+  return `${b64url({ alg: "EdDSA", typ: "JWT" })}.${b64url({ iss, aud: SERVICE_DID, exp: 9_999_999_999 })}.sig`;
+}
+
+/** A trust-attestor fetch that mints a token whose JWT carries `iss`. */
+function trustFetchIss(iss: string) {
+  return (async (url: string | URL | Request) => {
+    if (String(url).endsWith("/v1/token")) {
+      return new Response(
+        JSON.stringify({ jwt: jwtWithIss(iss), expires_at: Math.floor(Date.now() / 1000) + 900, verification: "oauth" }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+    throw new Error(`unexpected trust path: ${String(url)}`);
+  }) as unknown as typeof globalThis.fetch;
+}
+
+async function setupIss(iss: string) {
+  const agent = await Agent.generate();
+  const trust = new TrustClient({
+    agentDid: agent.did,
+    agentPublicKey: agent.publicKey,
+    agentPrivateKey: agent.exportPrivateKey(),
+    binding: { binding_id: "bind-1", binding_token_expires_at: Math.floor(Date.now() / 1000) + 100_000 },
+    fetch: trustFetchIss(iss),
+  });
+  return { agent, trust };
 }
 
 const challenge401 = () =>
@@ -168,5 +200,70 @@ describe("AttestedFetcher (§10.7 refresh-on-challenge)", () => {
     expect(
       () => new AttestedFetcher({ agent: otherAgent, trust, serviceDid: SERVICE_DID, fetch: trustFetch().impl }),
     ).toThrow(/same key/);
+  });
+});
+
+describe("AttestedFetcher attestor reconciliation (§4.4 accepted_attestors)", () => {
+  it("proactive: an accepted attestor is sent normally", async () => {
+    const { agent, trust } = await setupIss("afauth-trust");
+    const svc = serviceFetch(({ attestation }) => (attestation ? new Response("ok", { status: 200 }) : challenge401()));
+    const fetcher = new AttestedFetcher({
+      agent,
+      trust,
+      serviceDid: SERVICE_DID,
+      fetch: svc.impl,
+      proactive: true,
+      acceptedAttestors: ["afauth-trust", "acme-trust"],
+    });
+
+    const res = await fetcher.fetch({ method: "GET", url: SERVICE_URL });
+
+    expect(res.status).toBe(200);
+    expect(svc.calls).toHaveLength(1);
+    expect(svc.calls[0]!.attestation).toBe(jwtWithIss("afauth-trust"));
+  });
+
+  it("proactive: an unaccepted attestor throws AttestorNotAcceptedError BEFORE any request is sent", async () => {
+    const { agent, trust } = await setupIss("afauth-trust");
+    const svc = serviceFetch(() => new Response("ok", { status: 200 }));
+    const fetcher = new AttestedFetcher({
+      agent,
+      trust,
+      serviceDid: SERVICE_DID,
+      fetch: svc.impl,
+      proactive: true,
+      acceptedAttestors: ["acme-trust"],
+    });
+
+    await expect(fetcher.fetch({ method: "GET", url: SERVICE_URL })).rejects.toBeInstanceOf(AttestorNotAcceptedError);
+    expect(svc.calls).toHaveLength(0); // never sent
+  });
+
+  it("reactive: an unaccepted attestor throws on the §10.7 retry; the doomed attested request is never sent", async () => {
+    const { agent, trust } = await setupIss("afauth-trust");
+    const svc = serviceFetch(({ attestation }) => (attestation ? new Response("ok", { status: 200 }) : challenge401()));
+    const fetcher = new AttestedFetcher({
+      agent,
+      trust,
+      serviceDid: SERVICE_DID,
+      fetch: svc.impl,
+      acceptedAttestors: ["acme-trust"],
+    });
+
+    await expect(fetcher.fetch({ method: "GET", url: SERVICE_URL })).rejects.toBeInstanceOf(AttestorNotAcceptedError);
+    // Only the initial unattested probe went out; the attested retry was withheld.
+    expect(svc.calls).toHaveLength(1);
+    expect(svc.calls.every((c) => c.attestation === null)).toBe(true);
+  });
+
+  it("without acceptedAttestors the minted token is sent regardless of issuer (unchanged behavior)", async () => {
+    const { agent, trust } = await setupIss("some-random-attestor");
+    const svc = serviceFetch(({ attestation }) => (attestation ? new Response("ok", { status: 200 }) : challenge401()));
+    const fetcher = new AttestedFetcher({ agent, trust, serviceDid: SERVICE_DID, fetch: svc.impl, proactive: true });
+
+    const res = await fetcher.fetch({ method: "GET", url: SERVICE_URL });
+
+    expect(res.status).toBe(200);
+    expect(svc.calls[0]!.attestation).toBe(jwtWithIss("some-random-attestor"));
   });
 });
