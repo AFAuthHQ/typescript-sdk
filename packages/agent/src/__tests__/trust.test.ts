@@ -131,6 +131,39 @@ describe("TrustClient", () => {
     expect(calls.length).toBe(1);
   });
 
+  it("token() refreshes the binding expiry from the mint response (sliding inactivity window)", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const near = now + 100; // binding was close to its old deadline
+    const slid = now + 90 * 24 * 60 * 60; // attestor re-arms to ~90d out
+    const { impl } = mockFetch([
+      {
+        path: "/v1/token",
+        body: { jwt: "jwt-1", expires_at: now + 900, verification: "email", binding_expires_at: slid },
+      },
+    ]);
+    const c = new TrustClient({
+      fetch: impl,
+      binding: { binding_id: "bind-1", binding_token_expires_at: near },
+    });
+    await c.token("did:web:svc.example");
+    expect(c.getBinding()?.binding_token_expires_at).toBe(slid);
+    expect(c.isLinked()).toBe(true);
+  });
+
+  it("token() leaves the binding expiry untouched when the server omits binding_expires_at (older attestor)", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const orig = now + 3600;
+    const { impl } = mockFetch([
+      { path: "/v1/token", body: { jwt: "jwt-1", expires_at: now + 900, verification: "email" } },
+    ]);
+    const c = new TrustClient({
+      fetch: impl,
+      binding: { binding_id: "bind-1", binding_token_expires_at: orig },
+    });
+    await c.token("did:web:svc.example");
+    expect(c.getBinding()?.binding_token_expires_at).toBe(orig);
+  });
+
   it("token() refuses when the agent has not linked", async () => {
     const c = new TrustClient();
     await expect(c.token("did:web:svc.example")).rejects.toThrow(/not linked/);
