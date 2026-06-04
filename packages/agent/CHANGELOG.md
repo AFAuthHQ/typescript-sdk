@@ -1,5 +1,14 @@
 # @afauthhq/agent
 
+## 0.5.0
+
+### Minor Changes
+
+- Align `defineService` discovery paths with the agent's request builders so a default `@afauthhq/agent` interoperates with a default `defineService` service out of the box. Previously the two diverged — the agent signed canonical `/afauth/v1/...` paths while `defineService` synthesized different ones — so a default agent received a 404.
+
+  - **server:** `synthesizeDiscovery` now advertises the canonical §4.1 endpoints (`/afauth/v1/accounts`, `/afauth/v1/accounts/me/owner-invitation`, `/afauth/v1/claim`, and `key_rotation`), matching the agent builders, the spec examples, the reference server, and `examples/worker`.
+  - **agent:** `buildAccountIntrospection`, `buildOwnerInvitation`, and `buildKeyRotation` now accept an optional `discovery` document and resolve their request URLs from the service's advertised `endpoints` (§4.3/§4.5), so the agent also interoperates with services that mount custom paths. The canonical §4.1 paths remain the fallback when no discovery document is passed, so existing callers are unaffected.
+
 ## 0.4.0
 
 ### Minor Changes

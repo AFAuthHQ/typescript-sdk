@@ -1,5 +1,19 @@
 # @afauthhq/server
 
+## 0.6.0
+
+### Minor Changes
+
+- Align `defineService` discovery paths with the agent's request builders so a default `@afauthhq/agent` interoperates with a default `defineService` service out of the box. Previously the two diverged — the agent signed canonical `/afauth/v1/...` paths while `defineService` synthesized different ones — so a default agent received a 404.
+
+  - **server:** `synthesizeDiscovery` now advertises the canonical §4.1 endpoints (`/afauth/v1/accounts`, `/afauth/v1/accounts/me/owner-invitation`, `/afauth/v1/claim`, and `key_rotation`), matching the agent builders, the spec examples, the reference server, and `examples/worker`.
+  - **agent:** `buildAccountIntrospection`, `buildOwnerInvitation`, and `buildKeyRotation` now accept an optional `discovery` document and resolve their request URLs from the service's advertised `endpoints` (§4.3/§4.5), so the agent also interoperates with services that mount custom paths. The canonical §4.1 paths remain the fallback when no discovery document is passed, so existing callers are unaffected.
+
+- Harden `Verifier.verify` against two attestation / body-binding gaps:
+
+  - **Body-binding (§5.2 / §5.5 step 7):** the verifier now requires `content-digest` to be a covered signature component whenever a request carries a body, and requires `Content-Digest` to be absent when it does not. Previously a signer could omit `content-digest` from the covered set and present an attacker-controlled body under an otherwise-valid signature (for example, rewriting an owner-invitation recipient to hijack the §7 claim link). The covered component list is bound via `@signature-params`, so an on-path attacker can only exploit a missing coverage — never add one.
+  - **Attestation lifetime cap (§10.3.1):** `HmacAttestor` and `JwksAttestor` now accept an optional `maxLifetimeSeconds`. `trustAttestor()` pins it to 900s and requires `iat`, rejecting any attestation whose `exp - iat` exceeds the cap so a long-lived token from a compromised or misconfigured attestor key cannot outlive the §10.7 attested-session revocation window. Generic attestors stay uncapped unless you opt in (§10.2 imposes no generic ceiling).
+
 ## 0.5.0
 
 ### Minor Changes
