@@ -15,7 +15,7 @@
  * (reactive, the default) or pre-emptively (`proactive`).
  */
 
-import type { Did } from "@afauthhq/core";
+import { parseChallenge, type AFAuthChallenge, type Did } from "@afauthhq/core";
 import type { Agent, SignOptions } from "./index.js";
 import { assertAttestorAccepted, type TrustClient, type TrustToken } from "./trust.js";
 
@@ -95,9 +95,12 @@ export class AttestedFetcher {
     // §10.7 challenge: the attested session lapsed. Drop the cached
     // token the service just rejected, mint a genuinely fresh one, and
     // retry exactly once with a fresh signature (new nonce, so the
-    // §5.6 replay set accepts it).
+    // §5.6 replay set accepts it). If the §5.7 challenge advertised an
+    // `attestors` set and the caller didn't supply one, reconcile the
+    // minted token against it before sending.
+    const challengeAttestors = challengeOf(first)?.attestors;
     this.trust.clearTokenCache(this.serviceDid);
-    const fresh = await this.mint(); // throws TrustHttpError if the binding is gone
+    const fresh = await this.mint(challengeAttestors); // throws TrustHttpError if the binding is gone
     return this.send(req, signOpts, fresh.jwt);
   }
 
@@ -108,9 +111,11 @@ export class AttestedFetcher {
    * is sent — rather than being rejected by the service. When
    * `acceptedAttestors` is unset the check is a no-op.
    */
-  private async mint(): Promise<TrustToken> {
+  private async mint(challengeAttestors?: readonly string[]): Promise<TrustToken> {
     const tok = await this.trust.token(this.serviceDid);
-    assertAttestorAccepted(tok, this.acceptedAttestors);
+    // The caller-supplied list (from discovery) wins; otherwise fall back to
+    // the set advertised in the §5.7 `WWW-Authenticate` challenge, if any.
+    assertAttestorAccepted(tok, this.acceptedAttestors ?? challengeAttestors);
     return tok;
   }
 
@@ -133,12 +138,22 @@ export class AttestedFetcher {
   }
 }
 
+/** Parse the §5.7 `WWW-Authenticate: AFAuth` challenge from a response, if present. */
+function challengeOf(res: Response): AFAuthChallenge | null {
+  const h = res.headers.get("WWW-Authenticate");
+  return h ? parseChallenge(h) : null;
+}
+
 /**
- * True iff `res` is a §10.7 `401 attestation_required` challenge.
- * Reads a clone so the original `res` stays consumable by the caller.
+ * True iff `res` is an `attestation_required` challenge (§9.2 / §10.7).
+ * Prefers the §5.7 `WWW-Authenticate` challenge (no body read); falls back to
+ * the error envelope for services that predate the challenge header. Reads a
+ * clone so the original `res` stays consumable by the caller.
  */
 async function isAttestationRequired(res: Response): Promise<boolean> {
   if (res.status !== 401) return false;
+  const ch = challengeOf(res);
+  if (ch?.error) return ch.error === "attestation_required";
   try {
     const j = (await res.clone().json()) as { error?: { code?: string } };
     return j?.error?.code === "attestation_required";

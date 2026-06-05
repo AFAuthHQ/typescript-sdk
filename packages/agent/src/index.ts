@@ -46,6 +46,9 @@ export {
 // §10.7 attested-session client (refresh-on-challenge loop).
 export { AttestedFetcher, type AttestedFetcherOptions } from "./attested-fetch.js";
 
+// §5.7 WWW-Authenticate challenge helpers (re-exported from core).
+export { parseChallenge, formatChallenge, type AFAuthChallenge } from "@afauthhq/core";
+
 export interface SignedRequest {
   method: string;
   url: string;

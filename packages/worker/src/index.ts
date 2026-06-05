@@ -37,6 +37,13 @@ export interface WorkerOptions extends ServerOptions {
    * `401 owner_authentication_required`.
    */
   extractOwnerSession: (req: Request) => Promise<OwnerSession | null>;
+  /**
+   * Emit a §5.7 `WWW-Authenticate: AFAuth` challenge on authentication 401s.
+   * Default `true` — this is the AFAuth-first reference server. Set `false` to
+   * keep AFAuth silent (e.g. when fronting a multi-scheme service that composes
+   * its own `WWW-Authenticate` challenges and treats AFAuth as secondary).
+   */
+  advertiseChallenge?: boolean;
 }
 
 interface Resolved {
@@ -67,6 +74,7 @@ function pathOf(endpoint: string): string {
 /** Cloudflare Worker handler. Routes the five AFAuth endpoints; 404 otherwise. */
 export function createWorker(opts: WorkerOptions): ExportedHandler {
   const server = new Server(opts);
+  const advertiseChallenge = opts.advertiseChallenge ?? true;
 
   let resolvedPromise: Promise<Resolved> | null = null;
   async function resolve(): Promise<Resolved> {
@@ -164,7 +172,15 @@ export function createWorker(opts: WorkerOptions): ExportedHandler {
 
         return new Response("Not Found", { status: 404 });
       } catch (err) {
-        if (err instanceof AFAuthError) return err.toResponse();
+        if (err instanceof AFAuthError) {
+          // §5.7: advertise AFAuth on authentication 401s so a cold agent can
+          // self-bootstrap (discovery) and route recovery (error/attestors).
+          // Passing `req` keeps AFAuth a polite citizen — a request that didn't
+          // attempt AFAuth gets a bare advertisement, not an `error`. Disable
+          // entirely with `advertiseChallenge: false`.
+          const challenge = advertiseChallenge ? await server.challengeFor(err, req) : undefined;
+          return err.toResponse(challenge ? { "WWW-Authenticate": challenge } : undefined);
+        }
         // Unknown failure — log and return a generic 500.
         console.error("[afauth] unhandled error in worker handler:", err);
         return new Response(

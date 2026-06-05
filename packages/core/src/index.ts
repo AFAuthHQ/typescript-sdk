@@ -447,17 +447,121 @@ export class AFAuthError extends Error {
     this.extraHeaders = extraHeaders;
   }
 
-  /** Serialises to a §11.1 error envelope Response. */
-  toResponse(): Response {
+  /**
+   * Serialises to a §11.1 error envelope Response. Optional `extraHeaders` are
+   * merged last — used to attach a §5.7 `WWW-Authenticate` challenge to a `401`
+   * without the error itself needing to know the service's discovery URL.
+   */
+  toResponse(extraHeaders?: Record<string, string>): Response {
     const body: { error: { code: AFAuthErrorCode; message: string; details?: unknown } } = {
       error: { code: this.code, message: this.message },
     };
     if (this.details !== undefined) body.error.details = this.details;
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (this.extraHeaders) Object.assign(headers, this.extraHeaders);
+    if (extraHeaders) Object.assign(headers, extraHeaders);
     return new Response(JSON.stringify(body), {
       status: this.status,
       headers,
     });
   }
+}
+
+// ---------- §5.7 WWW-Authenticate: AFAuth challenge ----------------------
+
+/** The `auth-scheme` token AFAuth uses in `WWW-Authenticate` challenges (§5.7). */
+export const AFAUTH_AUTH_SCHEME = "AFAuth" as const;
+
+/**
+ * Parsed/serialisable form of an AFAuth authentication challenge (§5.7),
+ * carried in a `WWW-Authenticate` response header on a `401`.
+ */
+export interface AFAuthChallenge {
+  /** Absolute URL of the service's `/.well-known/afauth` document (bootstrap pointer). */
+  discovery?: string;
+  /** Reserved error code (§11.3); mirrors the body's `error.code`. */
+  error?: string;
+  /** Accepted attestor identifiers (§10.3); equivalent to `billing.accepted_attestors`. */
+  attestors?: readonly string[];
+  /** URL a human owner visits to authenticate (owner-binding failures). */
+  ownerLogin?: string;
+  /** RFC 9110 realm; conventionally the service's `service_did`. */
+  realm?: string;
+}
+
+// RFC 9110 token = 1*tchar. Values that are not a valid token must be quoted.
+const AUTH_TOKEN_RE = /^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$/;
+const isAuthTokenChar = (ch: string): boolean => AUTH_TOKEN_RE.test(ch);
+
+function quoteAuthParam(value: string): string {
+  if (value.length > 0 && AUTH_TOKEN_RE.test(value)) return value;
+  return `"${value.replace(/(["\\])/g, "\\$1")}"`;
+}
+
+/**
+ * Serialise an {@link AFAuthChallenge} into a `WWW-Authenticate` header value
+ * per §5.7 / [RFC9110] §11. Values that are not valid tokens are quoted.
+ */
+export function formatChallenge(challenge: AFAuthChallenge): string {
+  const params: string[] = [];
+  if (challenge.realm !== undefined) params.push(`realm=${quoteAuthParam(challenge.realm)}`);
+  if (challenge.discovery !== undefined) params.push(`discovery=${quoteAuthParam(challenge.discovery)}`);
+  if (challenge.error !== undefined) params.push(`error=${quoteAuthParam(challenge.error)}`);
+  if (challenge.attestors && challenge.attestors.length > 0) {
+    params.push(`attestors=${quoteAuthParam(challenge.attestors.join(" "))}`);
+  }
+  if (challenge.ownerLogin !== undefined) params.push(`owner_login=${quoteAuthParam(challenge.ownerLogin)}`);
+  return params.length > 0 ? `${AFAUTH_AUTH_SCHEME} ${params.join(", ")}` : AFAUTH_AUTH_SCHEME;
+}
+
+/**
+ * Parse the AFAuth challenge out of a `WWW-Authenticate` header value (§5.7).
+ * Tolerant of other auth-schemes sharing the header, quoted-string values, and
+ * comma/whitespace separation. Returns `null` if no `AFAuth` challenge is found;
+ * an empty object `{}` means the scheme was advertised with no parameters.
+ * Unknown `auth-param`s are ignored.
+ */
+export function parseChallenge(headerValue: string): AFAuthChallenge | null {
+  const scheme = /(?:^|[\s,])AFAuth(?=\s|$)/i.exec(headerValue);
+  if (!scheme) return null;
+  const s = headerValue.slice(scheme.index + scheme[0].length);
+  const out: Record<string, string> = {};
+  let pos = 0;
+  const n = s.length;
+  // `charAt` returns "" past the end, so all the checks below stay well-typed
+  // under noUncheckedIndexedAccess and safe at the boundary.
+  while (pos < n) {
+    while (pos < n && /[\s,]/.test(s.charAt(pos))) pos++; // skip OWS + commas
+    if (pos >= n) break;
+    const nameStart = pos;
+    while (pos < n && isAuthTokenChar(s.charAt(pos))) pos++;
+    const name = s.slice(nameStart, pos);
+    if (!name) break;
+    while (pos < n && /\s/.test(s.charAt(pos))) pos++;
+    if (s.charAt(pos) !== "=") break; // bare token w/o '=' → start of a different scheme; stop
+    pos++; // consume '='
+    while (pos < n && /\s/.test(s.charAt(pos))) pos++;
+    let value = "";
+    if (s.charAt(pos) === '"') {
+      pos++; // opening quote
+      while (pos < n && s.charAt(pos) !== '"') {
+        if (s.charAt(pos) === "\\" && pos + 1 < n) pos++; // unescape
+        value += s.charAt(pos);
+        pos++;
+      }
+      pos++; // closing quote
+    } else {
+      const valStart = pos;
+      while (pos < n && isAuthTokenChar(s.charAt(pos))) pos++;
+      value = s.slice(valStart, pos);
+    }
+    out[name.toLowerCase()] = value;
+  }
+  const challenge: AFAuthChallenge = {};
+  if (out.discovery) challenge.discovery = out.discovery;
+  if (out.error) challenge.error = out.error;
+  if (out.attestors) challenge.attestors = out.attestors.split(/\s+/).filter(Boolean);
+  if (out.owner_login) challenge.ownerLogin = out.owner_login;
+  if (out.realm) challenge.realm = out.realm;
+  return challenge;
 }
