@@ -4,7 +4,7 @@ import {
   formatChallenge,
   parseChallenge,
   type AFAuthChallenge,
-} from "../index";
+} from "../index.js";
 
 const DISCOVERY = "https://api.example.com/.well-known/afauth";
 
