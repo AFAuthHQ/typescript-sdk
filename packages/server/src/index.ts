@@ -33,8 +33,10 @@ import {
   decodeDidKey,
   deriveInvitationId,
   DidKeyResolver,
+  formatChallenge,
   normaliseRecipient,
   sha256ContentDigest,
+  type AFAuthChallenge,
   type CoveredComponent,
   type Did,
   type DidResolver,
@@ -43,6 +45,25 @@ import {
   type Recipient,
   type SignatureParams,
 } from "@afauthhq/core";
+
+// Re-export the §5.7 challenge helpers so edge integrators (Appendix E) can
+// build/parse `WWW-Authenticate: AFAuth` challenges without importing core.
+export { formatChallenge, parseChallenge } from "@afauthhq/core";
+export type { AFAuthChallenge } from "@afauthhq/core";
+
+/**
+ * Whether a request attempted AFAuth — i.e. it carried a `Signature-Input`
+ * (§5) or an `AFAuth-Attestation` (§10). Two uses:
+ *   - multi-scheme services voice the §5.7 challenge only to clients that
+ *     actually tried AFAuth, so a client using another scheme never sees an
+ *     AFAuth `error`;
+ *   - anonymous-allowed endpoints verify only when AFAuth was attempted (see
+ *     {@link Verifier.verifyOptional}).
+ * Accepts anything with `headers` — a `Request` or a verifier req object.
+ */
+export function afauthAttempted(req: { headers: Headers }): boolean {
+  return req.headers.has("signature-input") || req.headers.has("afauth-attestation");
+}
 
 // Re-export DiscoveryDocument so server consumers don't need to also
 // import from @afauthhq/core for this type.
@@ -1509,6 +1530,36 @@ export class Verifier {
     this.now = opts.now ?? (() => Math.floor(Date.now() / 1000));
   }
 
+  /**
+   * Optional verification for endpoints that allow anonymous (unauthenticated)
+   * calls but grant more to an AFAuth-authenticated agent — the "optional auth"
+   * / progressive-enhancement pattern. Verifies only when the request actually
+   * presents AFAuth credentials:
+   *
+   *   - no `Signature-Input` / `AFAuth-Attestation` → `{ authenticated: false }`.
+   *     The caller is anonymous: serve the public response, do NOT return `401`
+   *     (and therefore no §5.7 challenge — the request was not rejected).
+   *   - credentials present and valid → `{ authenticated: true, request }`.
+   *   - credentials present but invalid → throws `AFAuthError`. The agent tried
+   *     AFAuth and should be told it failed; pair with `Server.challengeFor(err,
+   *     req)` to emit a §5.7 error challenge rather than silently downgrading to
+   *     anonymous (catch and treat as anonymous only if you deliberately want
+   *     lenient behaviour).
+   *
+   * This is the correct entry point for anonymous-allowed endpoints — calling
+   * {@link Verifier.verify} directly would reject every anonymous caller with a
+   * `401`.
+   */
+  async verifyOptional(req: {
+    method: string;
+    url: string;
+    headers: Headers;
+    body: string | Uint8Array | null;
+  }): Promise<{ authenticated: false } | { authenticated: true; request: VerifiedRequest }> {
+    if (!afauthAttempted(req)) return { authenticated: false };
+    return { authenticated: true, request: await this.verify(req) };
+  }
+
   async verify(req: {
     method: string;
     url: string;
@@ -2052,6 +2103,59 @@ export class Server {
 
   private async resolveDiscovery(): Promise<DiscoveryDocument> {
     return typeof this.discovery === "function" ? this.discovery() : this.discovery;
+  }
+
+  /**
+   * Build the §5.7 `WWW-Authenticate: AFAuth` challenge string for a thrown
+   * error, or `undefined` when the error is not a `401` (the challenge is only
+   * defined for authentication failures). Integrations attach the result to the
+   * response — e.g.
+   *
+   * ```ts
+   * const ch = await server.challengeFor(err, req);
+   * return err.toResponse(ch ? { "WWW-Authenticate": ch } : undefined);
+   * ```
+   *
+   * Pass `req` so AFAuth stays a polite multi-scheme citizen: `error` is set
+   * only when the request actually attempted AFAuth (carried a `Signature-Input`
+   * or `AFAuth-Attestation`). A bare `invalid_signature` from a request that
+   * used another scheme — or none — yields a discovery-only *advertisement*, not
+   * an "your AFAuth signature failed" claim on a 401 AFAuth doesn't own. Omit
+   * `req` only when you already know the caller attempted AFAuth.
+   *
+   * `discovery` always points at this service's `/.well-known/afauth`;
+   * `attestors` is added for attestation failures (from
+   * `billing.accepted_attestors`); `owner_login` for
+   * `owner_authentication_required` when the discovery doc declares a claim page.
+   */
+  async challengeFor(err: unknown, req?: Request): Promise<string | undefined> {
+    if (!(err instanceof AFAuthError) || err.status !== 401) return undefined;
+    const challenge: AFAuthChallenge = {
+      discovery: new URL("/.well-known/afauth", this.baseUrl).toString(),
+    };
+    // §5.7: a bare `invalid_signature` from a request that carried no AFAuth
+    // credentials is not a failed AFAuth attempt — it's a client using another
+    // scheme (or none). Emit a discovery-only advertisement rather than stamp an
+    // error onto a 401 AFAuth doesn't own. Every other code implies an
+    // AFAuth-flow request and keeps its error. (When `req` is omitted we assume
+    // the caller knows it was an AFAuth attempt.)
+    const attempted = req ? afauthAttempted(req) : true;
+    if (!attempted && err.code === "invalid_signature") {
+      return formatChallenge(challenge);
+    }
+
+    challenge.error = err.code;
+    // Resolve discovery lazily — only attestation/owner failures need fields
+    // from it. Signature failures (the hot path) avoid re-invoking a
+    // function-form discovery on every rejection.
+    if (err.code === "attestation_required" || err.code === "invalid_attestation") {
+      const attestors = (await this.resolveDiscovery()).billing?.accepted_attestors;
+      if (attestors && attestors.length > 0) challenge.attestors = attestors;
+    } else if (err.code === "owner_authentication_required") {
+      const claimPage = (await this.resolveDiscovery()).endpoints?.claim_page;
+      if (claimPage) challenge.ownerLogin = new URL(claimPage, this.baseUrl).toString();
+    }
+    return formatChallenge(challenge);
   }
 
   /**

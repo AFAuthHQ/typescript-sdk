@@ -13,7 +13,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { Agent } from "../index.js";
+import { Agent, formatChallenge } from "../index.js";
 import { AttestedFetcher } from "../attested-fetch.js";
 import { TrustClient, TrustHttpError, AttestorNotAcceptedError } from "../trust.js";
 
@@ -265,5 +265,53 @@ describe("AttestedFetcher attestor reconciliation (§4.4 accepted_attestors)", (
 
     expect(res.status).toBe(200);
     expect(svc.calls[0]!.attestation).toBe(jwtWithIss("some-random-attestor"));
+  });
+});
+
+describe("AttestedFetcher — §5.7 WWW-Authenticate challenge", () => {
+  const DISCOVERY_URL = "https://svc.example/.well-known/afauth";
+
+  it("detects attestation_required from the §5.7 header even when the body isn't JSON", async () => {
+    const { agent, trust } = await setupIss("afauth-trust");
+    const wwwAuth = formatChallenge({
+      discovery: DISCOVERY_URL,
+      error: "attestation_required",
+      attestors: ["afauth-trust"],
+    });
+    const svc = serviceFetch(({ attestation }) =>
+      attestation
+        ? new Response("ok", { status: 200 })
+        : new Response("not json", { status: 401, headers: { "WWW-Authenticate": wwwAuth } }),
+    );
+    const fetcher = new AttestedFetcher({ agent, trust, serviceDid: SERVICE_DID, fetch: svc.impl });
+
+    const res = await fetcher.fetch({ method: "GET", url: SERVICE_URL });
+
+    // Header-first detection drives the mint + retry; the body was never JSON.
+    expect(res.status).toBe(200);
+    expect(svc.calls).toHaveLength(2);
+    expect(svc.calls[1]!.attestation).toBe(jwtWithIss("afauth-trust"));
+  });
+
+  it("reconciles the minted attestor against the challenge's attestors when none was supplied", async () => {
+    const { agent, trust } = await setupIss("rogue-attestor");
+    const wwwAuth = formatChallenge({
+      discovery: DISCOVERY_URL,
+      error: "attestation_required",
+      attestors: ["afauth-trust"], // the service accepts only afauth-trust
+    });
+    const svc = serviceFetch(({ attestation }) =>
+      attestation
+        ? new Response("ok", { status: 200 })
+        : new Response("", { status: 401, headers: { "WWW-Authenticate": wwwAuth } }),
+    );
+    // No acceptedAttestors passed — the fetcher learns the accepted set from
+    // the challenge and rejects the rogue token locally, before sending it.
+    const fetcher = new AttestedFetcher({ agent, trust, serviceDid: SERVICE_DID, fetch: svc.impl });
+
+    await expect(fetcher.fetch({ method: "GET", url: SERVICE_URL })).rejects.toBeInstanceOf(
+      AttestorNotAcceptedError,
+    );
+    expect(svc.calls).toHaveLength(1); // doomed attested retry withheld
   });
 });

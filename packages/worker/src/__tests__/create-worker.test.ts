@@ -25,6 +25,7 @@ import {
   MemoryAccountStore,
   MemoryNonceStore,
   MemoryRevocationList,
+  parseChallenge,
   type DiscoveryDocument,
   type OwnerSession,
 } from "@afauthhq/server";
@@ -286,6 +287,57 @@ describe("createWorker — error envelope passthrough", () => {
     // envelope shape is present.
     expect(body.error.code).toBeTruthy();
     expect(typeof body.error.code).toBe("string");
+  });
+
+  it("emits a bare advertisement (no error) when the request did not attempt AFAuth", async () => {
+    const { fetch } = buildWorker();
+    // Unsigned GET → no Signature-Input → AFAuth wasn't attempted. The 401
+    // advertises AFAuth (discovery) but MUST NOT claim invalid_signature.
+    const res = await fetch(new Request(`${BASE_URL}/afauth/v1/accounts/me`));
+    expect(res.status).toBe(401);
+    const c = parseChallenge(res.headers.get("WWW-Authenticate")!);
+    expect(c?.discovery).toBe(`${BASE_URL}/.well-known/afauth`);
+    expect(c?.error).toBeUndefined();
+  });
+
+  it("sets error=invalid_signature only when an AFAuth signature was actually presented", async () => {
+    const { fetch } = buildWorker();
+    const res = await fetch(
+      new Request(`${BASE_URL}/afauth/v1/accounts/me`, {
+        headers: { "signature-input": "garbage" }, // malformed but present → an AFAuth attempt
+      }),
+    );
+    expect(res.status).toBe(401);
+    expect(parseChallenge(res.headers.get("WWW-Authenticate")!)?.error).toBe("invalid_signature");
+  });
+
+  it("does not attach a challenge to a non-auth 404", async () => {
+    const { fetch } = buildWorker();
+    const res = await fetch(new Request(`${BASE_URL}/not/a/route`));
+    expect(res.status).toBe(404);
+    expect(res.headers.get("WWW-Authenticate")).toBeNull();
+  });
+
+  it("advertiseChallenge:false keeps AFAuth silent on 401s", async () => {
+    const worker = createWorker({
+      nonceStore: new MemoryNonceStore(),
+      revocationList: new MemoryRevocationList(),
+      serviceDid: DISCOVERY.service_did,
+      accounts: new MemoryAccountStore(),
+      recipients: { email: consoleEmailHandler },
+      discovery: DISCOVERY,
+      baseUrl: BASE_URL,
+      extractOwnerSession: async () => null,
+      advertiseChallenge: false,
+    });
+    const dispatch = worker.fetch! as (req: Request, env: unknown, ctx: unknown) => Promise<Response>;
+    const res = await dispatch(
+      new Request(`${BASE_URL}/afauth/v1/accounts/me`, { headers: { "signature-input": "garbage" } }),
+      {} as never,
+      {} as never,
+    );
+    expect(res.status).toBe(401);
+    expect(res.headers.get("WWW-Authenticate")).toBeNull();
   });
 
   it("unexpected errors fall back to a 500 with a generic envelope", async () => {
