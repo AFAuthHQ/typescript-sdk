@@ -4,8 +4,8 @@ import type { TrustClient } from "../trust.js";
 
 const BASE = "https://api.example.com";
 
-function discoveryDoc(attestedOnly: boolean) {
-  return {
+function discoveryDoc(attestedOnly: boolean, withBilling = true) {
+  const doc: Record<string, unknown> = {
     afauth_version: "0.1",
     service_did: "did:web:api.example.com",
     endpoints: {
@@ -15,10 +15,13 @@ function discoveryDoc(attestedOnly: boolean) {
       claim_completion: "/afauth/v1/claim",
     },
     signature_algorithms: ["ed25519"],
-    billing: attestedOnly
-      ? { unclaimed_mode: "attested_only", accepted_attestors: ["afauth-trust"] }
-      : { unclaimed_mode: "free" },
   };
+  if (withBilling) {
+    doc.billing = attestedOnly
+      ? { unclaimed_mode: "attested_only", accepted_attestors: ["afauth-trust"] }
+      : { unclaimed_mode: "free" };
+  }
+  return doc;
 }
 
 interface Call {
@@ -27,18 +30,24 @@ interface Call {
   headers: unknown;
 }
 
-function makeFetch(opts: { attestedOnly: boolean; introStatus?: number; introBody?: unknown }) {
+function makeFetch(opts: {
+  attestedOnly: boolean;
+  introStatus?: number;
+  introBody?: unknown;
+  withBilling?: boolean;
+  introRaw?: string;
+}) {
   const calls: Call[] = [];
   const fetch = (async (url: string | URL, init?: RequestInit) => {
     const u = String(url);
     calls.push({ url: u, method: init?.method ?? "GET", headers: init?.headers });
     if (u.endsWith("/.well-known/afauth")) {
-      return new Response(JSON.stringify(discoveryDoc(opts.attestedOnly)), {
+      return new Response(JSON.stringify(discoveryDoc(opts.attestedOnly, opts.withBilling ?? true)), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
     }
-    return new Response(JSON.stringify(opts.introBody ?? { ok: true }), {
+    return new Response(opts.introRaw ?? JSON.stringify(opts.introBody ?? { ok: true }), {
       status: opts.introStatus ?? 200,
       headers: { "content-type": "application/json" },
     });
@@ -141,5 +150,22 @@ describe("signup", () => {
     await expect(
       signup({ agent, baseUrl: BASE, fetch, trust: stubTrust, onLink: () => {}, pollIntervalMs: 1, now }),
     ).rejects.toThrow(/expired/);
+  });
+
+  it("works when discovery carries no billing block (treated as not attested_only)", async () => {
+    const { fetch } = makeFetch({ attestedOnly: false, withBilling: false, introBody: { account_did: "n" } });
+    const agent = await Agent.generate();
+    const res = await signup({ agent, baseUrl: BASE, fetch });
+    expect(res.status).toBe(200);
+    expect(res.account).toEqual({ account_did: "n" });
+    expect(res.trust).toBeUndefined();
+  });
+
+  it("tolerates a non-JSON success body (account = null)", async () => {
+    const { fetch } = makeFetch({ attestedOnly: false, introRaw: "OK (not json)" });
+    const agent = await Agent.generate();
+    const res = await signup({ agent, baseUrl: BASE, fetch });
+    expect(res.status).toBe(200);
+    expect(res.account).toBeNull();
   });
 });
