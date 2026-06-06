@@ -119,4 +119,27 @@ describe("signup", () => {
     expect(res.binding).toEqual({ binding_id: "bnd_new", binding_token_expires_at: exp });
     expect(res.account).toEqual({ account_did: "z" });
   });
+
+  it("throws on a non-2xx signup response", async () => {
+    const { fetch } = makeFetch({ attestedOnly: false, introStatus: 403, introBody: { error: "nope" } });
+    const agent = await Agent.generate();
+    await expect(signup({ agent, baseUrl: BASE, fetch })).rejects.toThrow(/signup failed/);
+  });
+
+  it("throws when the human doesn't confirm before the link expires", async () => {
+    const agent = await Agent.generate();
+    const stubTrust = {
+      agentDid: agent.did,
+      isLinked: () => false,
+      getBinding: () => undefined,
+      linkStart: async () => ({ req_id: "r", link_url: "https://trust.afauth.org/link?x", poll_url: "p", expires_in: 1 }),
+      linkPoll: async () => undefined, // never confirms
+    } as unknown as TrustClient;
+    const { fetch } = makeFetch({ attestedOnly: true });
+    let n = 0;
+    const now = () => (n++ === 0 ? 1000 : 999_999); // 1st call sets the deadline, 2nd is past it
+    await expect(
+      signup({ agent, baseUrl: BASE, fetch, trust: stubTrust, onLink: () => {}, pollIntervalMs: 1, now }),
+    ).rejects.toThrow(/expired/);
+  });
 });

@@ -7,6 +7,7 @@ import {
   loadAgent,
   saveAgent,
   loadOrCreateAgent,
+  readSharedAgent,
   loadBinding,
   saveBinding,
   defaultKeyPath,
@@ -195,5 +196,62 @@ describe("default paths", () => {
       if (prev === undefined) delete process.env.AFAUTH_HOME;
       else process.env.AFAUTH_HOME = prev;
     }
+  });
+});
+
+describe("key store — validation", () => {
+  it("rejects an unsupported algorithm", async () => {
+    await writeFile(keyPath, JSON.stringify({ version: 1, algorithm: "rsa", did_key: RFC_DID, public_key_hex: RFC_PUB, private_key_seed_hex: RFC_SEED }));
+    await expect(loadAgent(keyPath)).rejects.toThrow(/algorithm/);
+  });
+
+  it("rejects a did_key that doesn't match the public key", async () => {
+    const other = await Agent.generate();
+    await writeFile(keyPath, JSON.stringify({ version: 1, algorithm: "ed25519", did_key: other.did, public_key_hex: RFC_PUB, private_key_seed_hex: RFC_SEED }));
+    await expect(loadAgent(keyPath)).rejects.toThrow(/did_key/);
+  });
+
+  it("rejects a malformed seed", async () => {
+    await writeFile(keyPath, JSON.stringify({ version: 1, algorithm: "ed25519", did_key: RFC_DID, public_key_hex: RFC_PUB, private_key_seed_hex: "nothex" }));
+    await expect(loadAgent(keyPath)).rejects.toThrow(/seed/);
+  });
+
+  it("saveAgent overwrite leaves a 0600 file", async () => {
+    const a = await Agent.generate();
+    await saveAgent(a, keyPath);
+    const b = await Agent.generate();
+    await saveAgent(b, keyPath, { overwrite: true });
+    expect((await stat(keyPath)).mode & 0o777).toBe(0o600);
+    expect((await loadAgent(keyPath))!.did).toBe(b.did);
+  });
+
+  it("readSharedAgent reads the shared home — null, then the created identity", async () => {
+    const prev = process.env.AFAUTH_HOME;
+    try {
+      process.env.AFAUTH_HOME = dir; // empty temp home
+      expect(await readSharedAgent()).toBeNull();
+      const { agent } = await loadOrCreateAgent();
+      expect((await readSharedAgent())?.did).toBe(agent.did);
+    } finally {
+      if (prev === undefined) delete process.env.AFAUTH_HOME;
+      else process.env.AFAUTH_HOME = prev;
+    }
+  });
+});
+
+describe("trust store — matching", () => {
+  const did = RFC_DID;
+  const future = Math.floor(Date.now() / 1000) + 86_400;
+
+  it("finds a binding by iss as well as base_url", async () => {
+    await saveBinding({ agentDid: did, baseUrl: "https://trust.afauth.org", binding: { binding_id: "bnd_1", binding_token_expires_at: future }, iss: "afauth-trust", path: trustPath });
+    expect(await loadBinding({ agentDid: did, baseUrl: "afauth-trust", path: trustPath })).toMatchObject({ binding_id: "bnd_1" });
+  });
+
+  it("preserves a prior verification when re-saved without one", async () => {
+    await saveBinding({ agentDid: did, baseUrl: "https://trust.afauth.org", binding: { binding_id: "bnd_1", binding_token_expires_at: future }, iss: "afauth-trust", verification: "email", path: trustPath });
+    await saveBinding({ agentDid: did, baseUrl: "https://trust.afauth.org", binding: { binding_id: "bnd_2", binding_token_expires_at: future }, path: trustPath });
+    const onDisk = JSON.parse(await readFile(trustPath, "utf8"));
+    expect(onDisk.bindings[0]).toMatchObject({ binding_id: "bnd_2", iss: "afauth-trust", verification: "email" });
   });
 });
