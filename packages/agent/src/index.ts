@@ -46,6 +46,9 @@ export {
 // §10.7 attested-session client (refresh-on-challenge loop).
 export { AttestedFetcher, type AttestedFetcherOptions } from "./attested-fetch.js";
 
+// High-level signup orchestration (discover → link-if-attested → signup).
+export { signup, type SignupOptions, type SignupResult } from "./signup.js";
+
 // §5.7 WWW-Authenticate challenge helpers (re-exported from core).
 export { parseChallenge, formatChallenge, type AFAuthChallenge } from "@afauthhq/core";
 
@@ -290,10 +293,17 @@ function endpointUrl(baseUrl: string, endpoint: string, suffix = ""): string {
  * Unsigned GET of `/.well-known/afauth`. Validates the response shape
  * per §4.1 and §4.3, and enforces the §4.5 agent obligation to honor
  * the advertised `signature_algorithms` (requires `ed25519`).
+ *
+ * Pass `opts.fetch` to supply a custom transport (tests, proxies); it
+ * defaults to the global `fetch`.
  */
-export async function fetchDiscovery(baseUrl: string): Promise<DiscoveryDocument> {
+export async function fetchDiscovery(
+  baseUrl: string,
+  opts: { fetch?: typeof globalThis.fetch } = {},
+): Promise<DiscoveryDocument> {
+  const fetchImpl = opts.fetch ?? globalThis.fetch.bind(globalThis);
   const url = `${trimTrailing(baseUrl)}/.well-known/afauth`;
-  const res = await fetch(url, { headers: { accept: "application/json" } });
+  const res = await fetchImpl(url, { headers: { accept: "application/json" } });
   if (!res.ok) {
     throw new AFAuthError(
       "malformed_request",
