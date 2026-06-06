@@ -255,3 +255,36 @@ describe("trust store — matching", () => {
     expect(onDisk.bindings[0]).toMatchObject({ binding_id: "bnd_2", iss: "afauth-trust", verification: "email" });
   });
 });
+
+describe("invalid files", () => {
+  it("rejects an invalid JSON key file", async () => {
+    await writeFile(keyPath, "{ not json");
+    await expect(loadAgent(keyPath)).rejects.toThrow(/invalid JSON/);
+  });
+
+  it("rejects an invalid JSON trust file (surfaced on save)", async () => {
+    await writeFile(trustPath, "{ not json");
+    await expect(
+      saveBinding({
+        agentDid: RFC_DID,
+        binding: { binding_id: "b", binding_token_expires_at: Math.floor(Date.now() / 1000) + 1000 },
+        path: trustPath,
+      }),
+    ).rejects.toThrow(/invalid JSON/);
+  });
+
+  it("rethrows a non-ENOENT read error (e.g. path is a directory)", async () => {
+    await expect(loadAgent(dir)).rejects.toThrow();
+  });
+});
+
+describe("trust store — injected clock", () => {
+  const did = RFC_DID;
+
+  it("honours opts.now for save + expiry", async () => {
+    const t = 1_000_000;
+    await saveBinding({ agentDid: did, baseUrl: "https://trust.afauth.org", binding: { binding_id: "b", binding_token_expires_at: t + 100 }, path: trustPath, now: () => t });
+    expect(await loadBinding({ agentDid: did, baseUrl: "https://trust.afauth.org", path: trustPath, now: () => t + 50 })).toMatchObject({ binding_id: "b" });
+    expect(await loadBinding({ agentDid: did, baseUrl: "https://trust.afauth.org", path: trustPath, now: () => t + 200 })).toBeNull();
+  });
+});

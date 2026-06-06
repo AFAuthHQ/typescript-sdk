@@ -82,7 +82,7 @@ async function readJson(res: Response): Promise<unknown> {
 export async function signup(opts: SignupOptions): Promise<SignupResult> {
   const fetchImpl = opts.fetch ?? globalThis.fetch.bind(globalThis);
   const now = opts.now ?? (() => Date.now());
-  const disc = await fetchDiscovery(opts.baseUrl, opts.fetch ? { fetch: opts.fetch } : {});
+  const disc = await fetchDiscovery(opts.baseUrl, { fetch: opts.fetch });
   const billing = billingOf(disc);
   const attestedOnly = billing.unclaimed_mode === "attested_only";
 
@@ -103,9 +103,9 @@ export async function signup(opts: SignupOptions): Promise<SignupResult> {
       agentDid: opts.agent.did,
       agentPublicKey: opts.agent.publicKey,
       agentPrivateKey: opts.agent.exportPrivateKey(),
-      ...(opts.trustBaseUrl ? { baseUrl: opts.trustBaseUrl } : {}),
-      ...(opts.binding ? { binding: opts.binding } : {}),
-      ...(opts.fetch ? { fetch: opts.fetch } : {}),
+      baseUrl: opts.trustBaseUrl,
+      binding: opts.binding,
+      fetch: opts.fetch,
     });
 
   let binding = opts.binding ?? trust.getBinding();
@@ -125,13 +125,12 @@ export async function signup(opts: SignupOptions): Promise<SignupResult> {
     }
   }
 
-  const acceptedAttestors = opts.acceptedAttestors ?? billing.accepted_attestors;
   const af = new AttestedFetcher({
     agent: opts.agent,
     trust,
     serviceDid: disc.service_did,
-    ...(acceptedAttestors ? { acceptedAttestors } : {}),
-    ...(opts.fetch ? { fetch: opts.fetch } : {}),
+    acceptedAttestors: opts.acceptedAttestors ?? billing.accepted_attestors,
+    fetch: opts.fetch,
   });
   const res = await af.fetch({ method: probe.method, url: probe.url });
   const account = await readJson(res);
