@@ -1,6 +1,6 @@
 {
   "name": "@afauthhq/example-cli",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "description": "Reference service-distributed CLI built on @afauthhq/agent — shared identity, self-provisioning signup, deferred claim",
   "license": "MIT",
   "private": true,

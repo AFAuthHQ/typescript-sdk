@@ -1,5 +1,25 @@
 # @afauthhq/server
 
+## 0.7.0
+
+### Minor Changes
+
+- End-to-end support for non-default attestors.
+
+  Agent (`@afauthhq/agent`): `TrustToken` now carries the attestor `iss`
+  (decoded from the minted JWT); new exports `attestationIssuer`,
+  `assertAttestorAccepted`, and `AttestorNotAcceptedError`. `AttestedFetcher`
+  accepts an optional `acceptedAttestors` (a service's §4.4
+  `billing.accepted_attestors`); when set, a minted attestation whose issuer
+  isn't on the list is rejected locally — before the token is sent.
+
+  Server (`@afauthhq/server`): the `Attestor` interface gains an optional
+  `issuers` (implemented by `HmacAttestor`, `JwksAttestor`, `MultiAttestor`),
+  and `defineService` now derives `billing.accepted_attestors` from the
+  configured attestor's `issuers` instead of hardcoding `["afauth-trust"]`.
+  Passing a custom/`MultiAttestor` now advertises its issuers automatically;
+  an explicit `discovery.billing.accepted_attestors` still overrides.
+
 ## 0.6.0
 
 ### Minor Changes

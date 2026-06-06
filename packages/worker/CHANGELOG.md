@@ -1,5 +1,12 @@
 # @afauthhq/worker
 
+## 0.5.2
+
+### Patch Changes
+
+- Updated dependencies
+  - @afauthhq/server@0.7.0
+
 ## 0.5.1
 
 ### Patch Changes

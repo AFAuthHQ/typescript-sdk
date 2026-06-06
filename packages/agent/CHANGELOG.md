@@ -1,5 +1,33 @@
 # @afauthhq/agent
 
+## 0.6.0
+
+### Minor Changes
+
+- Add `@afauthhq/agent/node` and a high-level `signup()` — the pieces a service-distributed CLI (or any Node client) needs to provision an agent with no human bottleneck.
+
+  - **`@afauthhq/agent/node`** (new Node-only subpath): persistence for the shared agent home, in the exact on-disk formats the reference `afauth` CLI uses (pinned by the spec's `schemas/key-store.json` + `schemas/trust-store.json`). `loadAgent` / `saveAgent` / `loadOrCreateAgent` / `readSharedAgent` read & write `$AFAUTH_HOME/key.json` (mode 0600, with derived-key and `did:key` consistency checks); `loadBinding` / `saveBinding` manage the multi-attestor `$AFAUTH_HOME/trust.json` (sibling-binding preservation, orphan + expiry checks, v1→v2 migration); plus `agentHome` / `defaultKeyPath` / `defaultTrustPath`. Sharing these files lets a human link an agent **once** and have every AFAuth client on the machine — this SDK, the Go CLI, your CLI — reuse that identity and link. The subpath is isolated from the runtime-agnostic main entry, which still runs on Workers/Deno/Bun.
+
+  - **`signup()`**: one call that fetches discovery, links to a human when the service is `attested_only` and the agent isn't linked yet (surfacing the link URL via an `onLink` callback and polling to completion), then sends the implicit-signup signed request with an auto-minted attestation. Returns the binding it used so a Node caller can persist it.
+
+  - **`fetchDiscovery()`** now accepts an optional `fetch` override (for tests and custom transports); the default remains the global `fetch`. Backwards compatible.
+
+- End-to-end support for non-default attestors.
+
+  Agent (`@afauthhq/agent`): `TrustToken` now carries the attestor `iss`
+  (decoded from the minted JWT); new exports `attestationIssuer`,
+  `assertAttestorAccepted`, and `AttestorNotAcceptedError`. `AttestedFetcher`
+  accepts an optional `acceptedAttestors` (a service's §4.4
+  `billing.accepted_attestors`); when set, a minted attestation whose issuer
+  isn't on the list is rejected locally — before the token is sent.
+
+  Server (`@afauthhq/server`): the `Attestor` interface gains an optional
+  `issuers` (implemented by `HmacAttestor`, `JwksAttestor`, `MultiAttestor`),
+  and `defineService` now derives `billing.accepted_attestors` from the
+  configured attestor's `issuers` instead of hardcoding `["afauth-trust"]`.
+  Passing a custom/`MultiAttestor` now advertises its issuers automatically;
+  an explicit `discovery.billing.accepted_attestors` still overrides.
+
 ## 0.5.0
 
 ### Minor Changes
