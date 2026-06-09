@@ -13,7 +13,7 @@
  * runs on Workers/Deno/Bun. Import from `@afauthhq/agent/node` only in Node.
  */
 
-import { readFile, writeFile, mkdir, rename, chmod } from "node:fs/promises";
+import { readFile, writeFile, mkdir, rename, chmod, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { Agent, AFAUTH_TRUST_DEFAULT_BASE, type TrustBinding } from "./index.js";
@@ -86,6 +86,10 @@ export async function loadAgent(path: string = defaultKeyPath()): Promise<Agent 
   }
   const seed = new Uint8Array(Buffer.from(raw.private_key_seed_hex, "hex"));
   const agent = await Agent.fromPrivateKey(seed);
+  // fromPrivateKey copied the seed into the agent; drop our decode buffer so
+  // the only live copy is the one a caller can later agent.destroy(). The
+  // immutable `raw.private_key_seed_hex` string remains beyond our reach.
+  seed.fill(0);
   if (agent.publicKeyHex() !== raw.public_key_hex) {
     throw new Error(`key store ${path}: persisted public_key_hex does not match the key derived from the seed`);
   }
@@ -118,6 +122,18 @@ export async function saveAgent(
   if (opts.overwrite) {
     const tmp = `${path}.tmp`;
     await writeFile(tmp, data, { mode: 0o600 });
+    // Preserve the prior key as a sibling `.bak` before installing the new
+    // one, so a rotation the service later disputes is recoverable. (The Go
+    // CLI's Replace does the same.) Unlike the CLI's timestamped backups
+    // this is a single rolling backup — all the "revert the last rotation"
+    // case needs, and it avoids the unbounded pile of live private keys that
+    // accumulating backups create. `afauth keys forget-backup` can shred it.
+    try {
+      await stat(path);
+      await rename(path, `${path}.bak`);
+    } catch (err) {
+      if (!isENOENT(err)) throw err;
+    }
     await rename(tmp, path);
     await chmod(path, 0o600);
     return;

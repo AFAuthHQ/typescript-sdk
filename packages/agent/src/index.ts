@@ -100,6 +100,7 @@ export class Agent {
   readonly did: Did;
   readonly publicKey: Ed25519PublicKey;
   private readonly secretKey: Ed25519PrivateKey;
+  private destroyed = false;
 
   private constructor(did: Did, publicKey: Ed25519PublicKey, secretKey: Ed25519PrivateKey) {
     this.did = did;
@@ -122,8 +123,11 @@ export class Agent {
         `Ed25519 seed must be 32 bytes, got ${privateKey.length}`,
       );
     }
-    const publicKey = ed25519.getPublicKey(privateKey);
-    return new Agent(encodeDidKey(publicKey), publicKey, privateKey);
+    // Copy the seed so a caller that wipes its own buffer (e.g. after
+    // decoding it from disk) doesn't blank this agent's signing key.
+    const secret = privateKey.slice();
+    const publicKey = ed25519.getPublicKey(secret);
+    return new Agent(encodeDidKey(publicKey), publicKey, secret);
   }
 
   /**
@@ -134,6 +138,9 @@ export class Agent {
     req: { method: string; url: string; body?: string | Uint8Array | null },
     opts: SignOptions = {},
   ): Promise<SignedRequest> {
+    if (this.destroyed) {
+      throw new Error("agent key has been destroyed; create a new Agent to sign");
+    }
     const body = req.body ?? null;
     const hasBody =
       body !== null && (typeof body === "string" ? body !== "" : body.byteLength !== 0);
@@ -261,6 +268,23 @@ export class Agent {
   /** Export the raw seed — for keypair persistence. Treat as secret material. */
   exportPrivateKey(): Ed25519PrivateKey {
     return this.secretKey.slice();
+  }
+
+  /**
+   * Best-effort wipe of the in-memory private seed. Call it once the agent
+   * is no longer needed — most valuable in a long-lived process (a daemon
+   * holding the key for hours); a short-lived CLI frees the page on exit
+   * anyway. After destroy() the agent can no longer sign.
+   *
+   * Best-effort only: JavaScript strings are immutable, so any seed that
+   * passed through a hex string (e.g. the on-disk `private_key_seed_hex`)
+   * leaves a copy we cannot reach, and the GC may already have moved the
+   * backing buffer. This zeros the one Uint8Array we control, shrinking the
+   * window the seed sits in recoverable memory (swap, heap/core dumps).
+   */
+  destroy(): void {
+    this.secretKey.fill(0);
+    this.destroyed = true;
   }
 
   /** Hex form of the raw public key — useful for diagnostics. */
