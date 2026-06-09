@@ -1,5 +1,12 @@
 # @afauthhq/agent
 
+## 0.6.1
+
+### Patch Changes
+
+- Updated dependencies
+  - @afauthhq/core@0.3.0
+
 ## 0.6.0
 
 ### Minor Changes

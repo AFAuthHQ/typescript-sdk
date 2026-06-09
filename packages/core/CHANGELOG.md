@@ -1,5 +1,11 @@
 # @afauthhq/core
 
+## 0.3.0
+
+### Minor Changes
+
+- Export the §5.7 `WWW-Authenticate` challenge helpers — `parseChallenge`, `formatChallenge`, and the `AFAuthChallenge` type. These landed in source when the challenge work shipped but were never released, so `@afauthhq/agent` (which re-exports them) failed to load against a registry-installed `@afauthhq/core@0.2.0` with `does not provide an export named 'formatChallenge'`. This publishes them and unbreaks `@afauthhq/agent` on a clean install.
+
 ## 0.2.0
 
 ### Minor Changes

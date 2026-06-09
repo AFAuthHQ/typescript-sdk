@@ -1,6 +1,6 @@
 {
   "name": "@afauthhq/example-recipes",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "description": "Focused, copy-paste-ready examples for each AFAuth SDK surface: verify, rotate, revoke, rate-limit, attestor.",
   "license": "MIT",
   "private": true,

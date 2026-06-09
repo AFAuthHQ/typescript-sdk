@@ -1,5 +1,13 @@
 # @afauthhq/worker
 
+## 0.5.3
+
+### Patch Changes
+
+- Updated dependencies
+  - @afauthhq/core@0.3.0
+  - @afauthhq/server@0.7.1
+
 ## 0.5.2
 
 ### Patch Changes

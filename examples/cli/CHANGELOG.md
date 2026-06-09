@@ -1,5 +1,11 @@
 # @afauthhq/example-cli
 
+## 0.0.2
+
+### Patch Changes
+
+- @afauthhq/agent@0.6.1
+
 ## 0.0.1
 
 ### Patch Changes
