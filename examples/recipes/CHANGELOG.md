@@ -1,5 +1,14 @@
 # @afauthhq/example-recipes
 
+## 0.0.8
+
+### Patch Changes
+
+- Updated dependencies
+  - @afauthhq/core@0.3.0
+  - @afauthhq/agent@0.6.1
+  - @afauthhq/server@0.7.1
+
 ## 0.0.7
 
 ### Patch Changes

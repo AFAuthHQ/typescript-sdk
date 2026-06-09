@@ -1,6 +1,6 @@
 {
   "name": "@afauthhq/example-worker",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "description": "Reference Cloudflare Worker composing @afauthhq/server + @afauthhq/worker",
   "license": "MIT",
   "private": true,
