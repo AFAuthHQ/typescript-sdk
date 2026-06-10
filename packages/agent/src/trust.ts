@@ -315,7 +315,8 @@ export class TrustClient {
  * Surface trust-attestor HTTP failures with the upstream error code
  * intact so callers can distinguish, for example, `binding_expired`
  * ("re-link the agent") from `binding_revoked` ("ask the human") from
- * `verification_required` ("send the human to upgrade their account").
+ * `verification_required` ("send the human to upgrade their account"), or
+ * `service_suspended` ("the owner revoked this service for this agent").
  *
  * Falls back to `invalid_attestation` for compatibility with the core
  * AFAuthError taxonomy when no upstream code is available.
@@ -338,6 +339,15 @@ export class TrustHttpError extends AFAuthError {
   }
   isVerificationRequired(): boolean {
     return this.upstreamCode === "verification_required";
+  }
+  /**
+   * §10.3.1 — the human owner has revoked minting for this (agent DID,
+   * service) pair from trust.afauth.org/account. Terminal for this `aud`:
+   * the agent MUST NOT retry until the owner restores it. Other services are
+   * unaffected, so the caller can keep using the agent elsewhere.
+   */
+  isServiceSuspended(): boolean {
+    return this.upstreamCode === "service_suspended";
   }
 }
 

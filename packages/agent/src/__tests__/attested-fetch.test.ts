@@ -194,6 +194,23 @@ describe("AttestedFetcher (§10.7 refresh-on-challenge)", () => {
     expect(svc.calls.every((c) => c.attestation === null)).toBe(true);
   });
 
+  it("a suspended service surfaces as a terminal TrustHttpError, not an unbounded retry", async () => {
+    const { agent, trust } = await setup({ fail: { status: 403, code: "service_suspended" } });
+    const svc = serviceFetch(() => challenge401());
+    const fetcher = new AttestedFetcher({ agent, trust, serviceDid: SERVICE_DID, fetch: svc.impl });
+
+    await expect(fetcher.fetch({ method: "GET", url: SERVICE_URL })).rejects.toBeInstanceOf(TrustHttpError);
+    try {
+      await fetcher.fetch({ method: "GET", url: SERVICE_URL });
+    } catch (e) {
+      expect(e).toBeInstanceOf(TrustHttpError);
+      expect((e as TrustHttpError).isServiceSuspended()).toBe(true);
+      expect((e as TrustHttpError).isBindingRevoked()).toBe(false);
+    }
+    // The service was challenged but never retried-with-attestation (mint failed).
+    expect(svc.calls.every((c) => c.attestation === null)).toBe(true);
+  });
+
   it("constructor rejects an agent/trust key mismatch", async () => {
     const { trust } = await setup();
     const otherAgent = await Agent.generate();
