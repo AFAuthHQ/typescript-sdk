@@ -131,6 +131,25 @@ const server = new Server({
   `consoleEmailHandler` for local development (logs the magic link
   to `console.error`).
 
+## Sign in with AFAuth (relying party)
+
+`trust.afauth.org` is also an **OpenID Provider**, so the human behind an agent
+can **Sign in with AFAuth** and land in the very account this Server provisioned
+for them — the `(iss, sub_h)` account from per-principal uniqueness (§10.4.4)
+above is exactly an OIDC `(issuer, subject)`. There is **no SDK helper for this
+yet**: a relying party hand-wires the OIDC Authorization-Code + PKCE callback
+(≈ a "Sign in with Google" route), verifies the `id_token` against the trust
+JWKS, and resolves the account by `(iss, sub_h)`.
+
+One rule the SDK does *not* enforce for you: the `id_token`'s `iss` is the URL
+`https://trust.afauth.org`, while the attestation `iss` is the bare string
+`afauth-trust`. Canonicalize both to one issuer before lookup, or the human
+lands in a new account ([spec §10.8.4](https://github.com/AFAuthHQ/spec/blob/main/spec/core.md#1084-issuer-canonicalization-convergence-requirement)).
+A reusable `OidcRpHandler` is planned for this package.
+
+- Concept + guide: [Sign in with AFAuth](https://docs.afauth.org/concepts/human-oidc-signin), [Add Sign in with AFAuth](https://docs.afauth.org/guides/add-sign-in-with-afauth).
+- Spec: [`core.md` §10.8](https://github.com/AFAuthHQ/spec/blob/main/spec/core.md#108-human-sign-in-via-the-trust-attestor-openid-provider) (AFAP-0008).
+
 ## See also
 
 - [`AFAuthHQ/spec`](https://github.com/AFAuthHQ/spec) — protocol spec.
